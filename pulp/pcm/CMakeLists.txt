@@ -1,15 +1,14 @@
+# CMakeLists.txt sitting in: .../pcm/
+# Layout assumed:
+#   pcm/
+#     src/pcm.cpp
+#     include/pcm.hpp
+#     pcm.py
+
 get_filename_component(MOD_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
 
-set(PCM_SRCS
-    "${MOD_ROOT}/src/pcm_hwpe.cpp"
-    "${MOD_ROOT}/src/pcm_hwpe_engine.cpp"
-    "${MOD_ROOT}/src/pcm_hwpe_streamer.cpp"
-    "${MOD_ROOT}/src/pcm_hwpe_fsm.cpp"
-    )
-set(PCM_HDRS
-  "${MOD_ROOT}/include/pcm_hwpe_archi.hpp"
-  "${MOD_ROOT}/include/pcm.hpp"
-  )
+set(PCM_SRCS "${MOD_ROOT}/src/pcm.cpp")
+set(PCM_HDRS "${MOD_ROOT}/include/pcm.hpp")
 
 # Sanity checks so we fail with a clear message if paths are wrong
 foreach(f IN LISTS PCM_SRCS PCM_HDRS)
