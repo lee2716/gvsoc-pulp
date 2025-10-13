@@ -1,0 +1,205 @@
+#include <pcm.hpp>
+
+Pcm_HWPE_Engine::Pcm_HWPE_Engine(Pcm_HWPE* pcm){
+    this->pcm = pcm;
+
+    this->ext_ctrl_addr = 0;
+    this->ext_ctrl = NULL;
+    this->ext_write_ctrl = false;
+    this->ext_addr = 0;
+    this->ext_write = false;
+    this->ext_data_in_shift = false;
+    this->ext_data_in = 0;
+    this->ext_data_out = 0;
+}
+
+Pcm_HWPE_Engine::Pcm_HWPE_Engine() {
+	this->pcm = (Pcm_HWPE *) NULL;
+}
+
+void Pcm_HWPE_Engine::compute_mvm(Pcm_HWPE *pcm) {
+    this->pcm = pcm;
+
+    int32_t full_prec_res[512];
+    uint8_t layer;
+    uint8_t active_sectors[4] = {0, 0, 0, 0};
+    
+    // Initialize accumulators
+    for (uint32_t i=0; i<512; i++){
+        std::fill(full_prec_res, full_prec_res+512, 0);
+    }
+
+    // Detect active sectors
+    for (uint8_t sec=0; sec<4; sec++){
+        active_sectors[sec] = (this->user_registers[1]>>(8+sec*4)) & 0x0F;
+        pcm->trace.msg(vp::TraceLevel::DEBUG, "sector[%d] = %x\n", sec, active_sectors[sec]);
+    }
+
+    // Detect active layer
+    layer = (this->user_registers[2] & 0x000000FF);
+    
+    // Initialize Xi, just for first debugging - REMOVE
+    for (uint32_t i=0; i<512; i++)
+        this->Xi[i] = 0x1;
+
+    // Compute MVM - only signed MVM implemented
+    for (uint32_t j=0; j<512; j++){
+        for (uint32_t sec=0; sec<4; sec++){
+            if (active_sectors[sec] != 0){
+                for(uint32_t i=0; i<128; i++){
+                    full_prec_res[j] += (int32_t)this->Xi[i]*(int32_t)this->weights[layer*512+512*sec*i+j];
+                    //pcm->trace.msg(vp::TraceLevel::DEBUG, "Intermediate Yi[%d] = %d\n", j , pcm->Yi[j]);
+                }
+            }
+        }
+    }
+
+    // Just for first debug purposes - REMOVE!!
+    /* for (uint32_t i=0; i<512; i++){
+        pcm->trace.msg(vp::TraceLevel::DEBUG, "full_prec_res[%d] = %d\n", i, full_prec_res[i]);
+    } */
+
+    // Cast full precision results to 8 bit 
+    for (uint32_t i=0; i<512; i++){
+        this->Yi[i] = std::max(-128, std::min(full_prec_res[i], 127));
+    }
+
+    pcm->trace.msg(vp::TraceLevel::DEBUG, "Finished MVM computation\n");
+}
+
+vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
+    Pcm_HWPE        *pcm,
+    uint8_t         ext_addr,
+    bool            ext_write,
+    bool            ext_data_in_shift,
+    uint64_t        ext_data_in,
+    uint64_t        ext_data_out,
+    int             *latency
+){     
+    this->pcm = pcm;
+
+    int8_t Xi_buf[512];
+    
+    // Initial fill of the Xi buffer
+    this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Filling Xi buffer\n");
+    for (int8_t i = 0; i<8; i++)
+        *latency += this->pcm->inp_stream.rw_data(64, (void *)(Xi_buf+i*64), -1);
+
+    // Read Xi buffer - just for debugging
+    /* for (int i = 0; i < 512; i++)
+    {
+        this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] = 0x%x\n", i, (int8_t)Xi_buf[i]);
+    } */
+    
+
+    // MVM (+ stream in/out overlap)
+    this->compute_mvm(this->pcm);
+    *latency += 150;
+
+    this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Streaming out results...\n");
+    for (uint32_t i=0; i<8; i++)
+        this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
+   
+    return vp::IO_REQ_OK;
+}
+
+int Pcm_HWPE_Engine::handle_config(
+    Pcm_HWPE    *pcm,
+    uint32_t    ext_ctrl_addr,
+    uint32_t    *ext_ctrl,
+    bool        ext_write_ctrl
+){
+    this->pcm = pcm;
+    this->ext_ctrl_addr = ext_ctrl_addr;
+    this->ext_ctrl = ext_ctrl;
+    this-> ext_write_ctrl = ext_write_ctrl;
+    uint8_t cmd;
+
+    int latency = 0;
+
+    this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Configuration handler\n");
+
+    // Initialize weights
+    js::Config *stim_file_conf = this->pcm->get_js_config()->get("stim_file");
+    if (stim_file_conf != NULL)
+    {
+        string path = stim_file_conf->get_str();
+        if (path != "")
+        {
+            this->pcm->trace.msg("Preloading Memory with stimuli file (path: %s)\n", path.c_str());
+
+            FILE *file = fopen(path.c_str(), "rb");
+            if (file == NULL)
+            {
+                this->pcm->trace.fatal("Unable to open stim file: %s, %s\n", path.c_str(), strerror(errno));
+            }
+            if (fread(this->weights, 1, 8*512*512, file) == 0)
+            {
+                this->pcm->trace.fatal("Failed to read stim file: %s, %s\n", path.c_str(), strerror(errno));
+            }
+        }
+        else
+        {
+            this->pcm->trace.msg(vp::TraceLevel::DEBUG, "No path specified, preloading PCM weights with all ones\n");
+            std::fill(this->weights, this->weights+(8*512*512), 1);
+        }
+    }
+    
+    if(this->ext_write_ctrl){
+        if (this->ext_ctrl_addr == STATUS_REGISTER){
+            this->pcm->trace.fatal("Trying to write RO User Register 0!!\n");
+            return 0;
+        } else if (this->ext_ctrl_addr == CMD_REGISTER) {
+            this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Setting command register to 0x%x\n", *ext_ctrl);
+            this->user_registers[1] = *ext_ctrl;
+
+            cmd = ((this->user_registers[1]) >> 24) & 0xFF;
+
+            this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Set command: 0x%x\n", cmd);
+
+            if (cmd == COMPUTE_CMD)
+            {                
+                this->handle_compute(
+                    this->pcm,
+                    this->ext_addr,
+                    this->ext_write,
+                    this->ext_data_in_shift,
+                    this->ext_data_in,
+                    this->ext_data_out,
+                    &latency
+                );
+
+                return latency;
+            } else if (cmd == ABORT_CMD)
+            {
+                // ABORT command still not implemented
+                this->pcm->trace.fatal("ABORT command not implemented!!\n");
+                return 0;
+            } else
+            {
+                return 0;
+            }
+        } else {
+            this->pcm->trace.fatal("Trying to access invalid address!!\n");
+            return 0;
+        }
+    } else {
+        switch (this->ext_ctrl_addr)
+        {
+        case STATUS_REGISTER:
+            this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Reading Engine status register, value: 0x%x\n", this->user_registers[0]);
+            *(uint32_t *)this->ext_ctrl = this->user_registers[0];
+            break;
+        case CMD_REGISTER:
+            this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Reading Engine status register, value: 0x%x\n", this->user_registers[0]);
+            *(uint32_t *)this->ext_ctrl = this->user_registers[1];
+            break;
+        default:
+            this->pcm->trace.fatal("Trying to access invalid address!!\n");
+            return vp::IO_REQ_INVALID;
+            break;
+        }
+
+        return 0;
+    }
+}
