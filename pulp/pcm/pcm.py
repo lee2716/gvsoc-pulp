@@ -18,8 +18,8 @@ class Pcm(gvsoc.systree.Component):
             "stim_file": stim_file
         })
 
-    def i_CTRL_EXT(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'ext_ctrl', signature='io')
+    def i_hwpe_slv(self) -> gvsoc.systree.SlaveItf:
+        return gvsoc.systree.SlaveItf(self, 'hwpe_slv')
 
-    def i_EXT(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, 'ext', signature='io')
+    def o_stream_mst(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('stream_mst', itf, signature='io')
