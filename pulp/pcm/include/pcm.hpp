@@ -36,6 +36,7 @@ class Pcm_HWPE_Engine {
         Pcm_HWPE_Engine(Pcm_HWPE* pcm);
         Pcm_HWPE_Engine();
         void compute_mvm(Pcm_HWPE* pcm);
+        int8_t Xi_buf[512];
         int handle_config(
             Pcm_HWPE    *pcm,
             uint32_t    ext_ctrl_addr,
@@ -66,6 +67,7 @@ class Pcm_HWPE_Engine {
         int8_t          Xi[512]             ;
         int8_t          weights[8*512*512]  ;
         int8_t          Yi[512]             ;
+        uint32_t        mvm_latency         ;
 };
 
 class Pcm_HWPE_Streamer {
@@ -127,6 +129,9 @@ public:
 
     void reset(bool active);
 
+    // HWPE RF
+    uint32_t register_file[56];
+
     // Streamer master port
     vp::IoMaster stream_mst;
 
@@ -154,8 +159,6 @@ private:
     int fsm();
 
     Pcm_HWPE_Engine engine;
-
-    uint32_t register_file[56];
 
     vp::ClockEvent *fsm_start_event;
     vp::ClockEvent *fsm_event;

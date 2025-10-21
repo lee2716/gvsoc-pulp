@@ -49,7 +49,7 @@ void Pcm_HWPE_Streamer::configure(
 	this->d3_stride	= d3_stride	;
     this->pos       = 0			;
 
-	this->pcm->trace.msg("base addr %x\ntot len %d\nd0 len %x\nd0 stride %x\nd1 len %x\nd1 stride %x\nd2 stride %x\nd3 stride%x\n",
+	this->pcm->trace.msg("base addr %x\ntot len %d\nd0 len %x\nd0 stride %x\nd1 len %x\nd1 stride %x\nd2 stride %x\nd3 stride %x\n",
 		this->base_addr	,
 		this->tot_len  	,
 		this->d0_len   	,
@@ -221,6 +221,8 @@ int Pcm_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
 			max_latency = latency > max_latency ? latency : max_latency;
 		}
 	}
+
+	//this->pcm->trace.msg(vp::TraceLevel::DEBUG, "d0_iters = %d\n d1_iters = %d\n, tot_iters = %d\n", this->d0_iters, this->d1_iters, this->tot_iters);
 
 	this->pos += this->d0_stride;
 	this->d0_iters++;
