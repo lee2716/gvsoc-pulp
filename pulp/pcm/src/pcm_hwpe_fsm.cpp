@@ -44,6 +44,8 @@ void Pcm_HWPE::fsm_handler(vp::Block *__this, vp::ClockEvent *event) {
 void Pcm_HWPE::fsm_end_handler(vp::Block *__this, vp::ClockEvent *event){
     Pcm_HWPE* _this = (Pcm_HWPE *) __this;
     _this->state.set(IDLE);
+    //_this->trace.msg(vp::TraceLevel::DEBUG, "Setting state to IDLE...\n");
+    _this->register_file[PCM_HWPE_STATUS>>2] = 0x1;
 }
 
 void Pcm_HWPE::fsm_loop() {
@@ -72,10 +74,6 @@ int Pcm_HWPE::fsm() {
     {
     case WRITE_RF:
         next_state = CONFIG;
-<<<<<<< HEAD
-=======
-        latency++;
->>>>>>> c8f9d1b ([WIP]: first HWPE wrapper, timings to be fixed)
         break;
 
     case CONFIG:

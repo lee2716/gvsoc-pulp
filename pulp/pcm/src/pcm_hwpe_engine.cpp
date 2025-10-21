@@ -11,6 +11,7 @@ Pcm_HWPE_Engine::Pcm_HWPE_Engine(Pcm_HWPE* pcm){
     this->ext_data_in_shift = false;
     this->ext_data_in = 0;
     this->ext_data_out = 0;
+    this->mvm_latency = this->pcm->get_js_config()->get_child_int("mvm_latency");
 }
 
 Pcm_HWPE_Engine::Pcm_HWPE_Engine() {
@@ -78,12 +79,15 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
 ){     
     this->pcm = pcm;
 
-    int8_t Xi_buf[512];
+    // Clear HWPE status register
+    this->pcm->register_file[PCM_HWPE_STATUS>>2] = 0x0;
+
+    this->pcm->trace.msg(vp::TraceLevel::DEBUG, "HWPE_STATUS = 0x%x\n", this->pcm->register_file[PCM_HWPE_STATUS>>2]);
     
     // Initial fill of the Xi buffer
     this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Filling Xi buffer\n");
     for (int8_t i = 0; i<8; i++)
-        *latency += this->pcm->inp_stream.rw_data(64, (void *)(Xi_buf+i*64), -1);
+        *latency += this->pcm->inp_stream.rw_data(64, (void *)(this->Xi_buf+i*64), -1);
 
     // Read Xi buffer - just for debugging
     /* for (int i = 0; i < 512; i++)
@@ -92,13 +96,47 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
     } */
     
 
-    // MVM (+ stream in/out overlap)
+    /********************************************************************************************
+    *                                   COMPUTE PIPELINE                                        *
+    * We assume that, when the pipeline is full, the stream in/out is masked by the latency for *
+    * the MVM computation so we pay only the latency related to the actual computation of each  *
+    * MVM.                                                                                      *
+    ********************************************************************************************/
     this->compute_mvm(this->pcm);
-    *latency += 150;
+    *latency += this->mvm_latency;
 
     this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Streaming out results...\n");
-    for (uint32_t i=0; i<8; i++)
+    for (uint32_t i=0; i<8; i++) {
         this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
+    }
+
+    for(uint32_t j=1; j<(this->pcm->register_file[PCM_HWPE_TOTAL_LENGTH >> 2]/8); j++) {
+        // Refill Xi buffer
+        for (int8_t i = 0; i<8; i++) {
+            this->pcm->inp_stream.rw_data(64, (void *)(this->Xi_buf+i*64), -1);
+        }
+
+        // Compute MVM
+        this->compute_mvm(this->pcm);
+        *latency += mvm_latency;
+
+        // Stream outputs (we take into account the latency for the last stream out)
+        if(j<(this->pcm->register_file[PCM_HWPE_TOTAL_LENGTH >> 2]/8)-1) {
+            for (uint32_t i=0; i<8; i++) {
+            this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
+            }
+        }
+    }
+
+    if((this->pcm->register_file[PCM_HWPE_TOTAL_LENGTH >> 2] % 8) != 0) {
+        this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Total length = %d, total_length % 8 = %d\n", (this->pcm->register_file[PCM_HWPE_TOTAL_LENGTH >> 2]), (this->pcm->register_file[PCM_HWPE_TOTAL_LENGTH >> 2] % 8));
+        this->pcm->trace.fatal("Leftovers still not implemented!! Please zero-pad your inputs/outputs\n");
+    }
+
+    // Last stream out: we take into account the latency for this data movement
+    for (uint32_t i=0; i<8; i++) {
+    *latency+=this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
+    }
    
     return vp::IO_REQ_OK;
 }
@@ -202,4 +240,6 @@ int Pcm_HWPE_Engine::handle_config(
 
         return 0;
     }
+
+    return 0;
 }
