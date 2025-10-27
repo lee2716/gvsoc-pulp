@@ -16,7 +16,7 @@
 
 import gvsoc.systree
 import cpu.iss.riscv
-from pulp.chips.archytas.archytas_isa import *
+from pulp.chips.democritos.democritos_isa import *
 from cpu.iss.isa_gen.isa_smallfloats import *
 
 # RV32 core with X-if

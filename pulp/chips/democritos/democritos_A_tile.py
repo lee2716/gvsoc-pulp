@@ -24,25 +24,25 @@ import pulp.cpu.iss.pulp_cores as iss
 from pulp.cluster.l1_interleaver import L1_interleaver
 from pulp.light_redmule.hwpe_interleaver import HWPEInterleaver
 from pulp.snitch.snitch_cluster.dma_interleaver import DmaInterleaver
-from pulp.chips.archytas.hierarchical_cache import Hierarchical_cache
+from pulp.chips.democritos.hierarchical_cache import Hierarchical_cache
 
-from pulp.chips.archytas.archytas_arch import ArchytasArch
-from pulp.chips.archytas.archytas_core import CV32CoreTest
+from pulp.chips.democritos.democritos_arch import DemocritosArch
+from pulp.chips.democritos.democritos_core import CV32CoreTest
 from pulp.pcm.pcm import Pcm
 from pulp.idma.snitch_dma import SnitchDma
-from pulp.xif_decoder.xif_decoder import XifDecoder
-from pulp.magia_idma_ctrl.magia_idma_ctrl import Magia_iDMA_Ctrl
+from pulp.chips.magia.xif_decoder.xif_decoder import XifDecoder
+from pulp.chips.magia.idma_ctrl.idma_ctrl import Magia_iDMA_Ctrl
 
 
 # adapted from snitch cluster model
 # interface i_INPUT -> interleaver -> banks
-class Archytas_A_TileTcdm(gvsoc.systree.Component):
+class Democritos_A_TileTcdm(gvsoc.systree.Component):
     def __init__(self, parent, name, parser):
         super().__init__(parent, name)
 
         # TODO: for early tests only. Move to json later
-        nb_banks = ArchytasArch.N_MEM_BANKS
-        bank_size = ArchytasArch.N_WORDS_BANK * ArchytasArch.BYTES_PER_WORD
+        nb_banks = DemocritosArch.N_MEM_BANKS
+        bank_size = DemocritosArch.N_WORDS_BANK * DemocritosArch.BYTES_PER_WORD
 
         # 1 master: OBI, iDMA0, iDMA1
         L1_masters = 3
@@ -88,7 +88,7 @@ class Archytas_A_TileTcdm(gvsoc.systree.Component):
     def i_PCM_HWPE_INPUT(self) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, f'PCM_HWPE_input', signature='io')
 
-class Archytas_A_Tile(gvsoc.systree.Component):
+class Democritos_A_Tile(gvsoc.systree.Component):
     def __init__(self, parent, name, parser, tid: int=0):
         super().__init__(parent, name)
 
@@ -99,7 +99,7 @@ class Archytas_A_Tile(gvsoc.systree.Component):
         i_cache = Hierarchical_cache(self, f'tile-{tid}-i-cache', nb_cores=1, has_cc=0, l1_line_size_bits=7)
 
         # Data scratchpad
-        l1_tcdm = Archytas_A_TileTcdm(self, f'tile-{tid}-l1-tcdm', parser)
+        l1_tcdm = Democritos_A_TileTcdm(self, f'tile-{tid}-l1-tcdm', parser)
 
         # Temporary test interconnects (use OBI to access TCDM), to be refined later
         tile_xbar = router.Router(self, f'tile-{tid}-xbar', bandwidth=4, latency=2)
@@ -109,8 +109,8 @@ class Archytas_A_Tile(gvsoc.systree.Component):
         idma_ctrl = Magia_iDMA_Ctrl(self, f'tile-{tid}-idma-ctrl')
 
         # iDMA
-        idma0 = SnitchDma(self, f'tile-{tid}-idma0', loc_base=tid*ArchytasArch.L1_TILE_OFFSET, loc_size=ArchytasArch.L1_SIZE, tcdm_width=4, transfer_queue_size=1, burst_queue_size=1)
-        idma1 = SnitchDma(self, f'tile-{tid}-idma1', loc_base=tid*ArchytasArch.L1_TILE_OFFSET, loc_size=ArchytasArch.L1_SIZE, tcdm_width=4, transfer_queue_size=1, burst_queue_size=1)
+        idma0 = SnitchDma(self, f'tile-{tid}-idma0', loc_base=tid*DemocritosArch.L1_TILE_OFFSET, loc_size=DemocritosArch.L1_SIZE, tcdm_width=4, transfer_queue_size=1, burst_queue_size=1)
+        idma1 = SnitchDma(self, f'tile-{tid}-idma1', loc_base=tid*DemocritosArch.L1_TILE_OFFSET, loc_size=DemocritosArch.L1_SIZE, tcdm_width=4, transfer_queue_size=1, burst_queue_size=1)
 
         # PCM HWPE
         mvm_latency_ns = 300 # MVM latency in ns
@@ -122,7 +122,7 @@ class Archytas_A_Tile(gvsoc.systree.Component):
         xifdec = XifDecoder(self, f'tile-{tid}-xif-dec')
 
         # UART
-        stdout = Stdout(self, f'tile-{tid}-stdout', max_cluster=ArchytasArch.NB_CLUSTERS, max_core_per_cluster=1, user_set_core_id=0, user_set_cluster_id=tid)
+        stdout = Stdout(self, f'tile-{tid}-stdout', max_cluster=DemocritosArch.NB_CLUSTERS, max_core_per_cluster=1, user_set_core_id=0, user_set_cluster_id=tid)
 
         # Bind: CV32 core data -> OBI interconnect
         core_cv32.o_DATA(obi_xbar.i_INPUT())
@@ -141,55 +141,55 @@ class Archytas_A_Tile(gvsoc.systree.Component):
 
         # Bind OBI Xbar so that it can communicate with local reserved
         obi_xbar.o_MAP(l1_tcdm.i_INPUT(0), name='local-reserved',
-                       base=ArchytasArch.RESERVED_ADDR_START,
-                       size=ArchytasArch.RESERVED_SIZE, rm_base=False)
+                       base=DemocritosArch.RESERVED_ADDR_START,
+                       size=DemocritosArch.RESERVED_SIZE, rm_base=False)
 
         # Bind OBI Xbar so that it can communicate with local stack
         obi_xbar.o_MAP(l1_tcdm.i_INPUT(0), name='local-stack',
-                       base=ArchytasArch.STACK_ADDR_START,
-                       size=ArchytasArch.STACK_SIZE, rm_base=False)
+                       base=DemocritosArch.STACK_ADDR_START,
+                       size=DemocritosArch.STACK_SIZE, rm_base=False)
 
         # Bind OBI Xbar so that it can communicate with local L1
         obi_xbar.o_MAP(l1_tcdm.i_DMA_INPUT(0), name='local-l1-mem', #here we use the iDMA interleaver because an iDMA AXI request routed to OBI (e.g. local L1 to off-tile L1 data movement) does not handle the right bank interleaving
-                       base=ArchytasArch.L1_ADDR_START,
-                       size=ArchytasArch.L1_SIZE, rm_base=False, remove_offset=(tid*ArchytasArch.L1_TILE_OFFSET))
+                       base=DemocritosArch.L1_ADDR_START,
+                       size=DemocritosArch.L1_SIZE, rm_base=False, remove_offset=(tid*DemocritosArch.L1_TILE_OFFSET))
 
         # Bind OBI Xbar so that it can communicate with the tile Xbar to get access to remote tiles L1
-        for tile_id in range(ArchytasArch.NB_CLUSTERS):
+        for tile_id in range(DemocritosArch.NB_CLUSTERS):
             if tile_id != tid: # skip yourself
                 obi_xbar.o_MAP(tile_xbar.i_INPUT(), name=f'ob12axi-off-tile-{tile_id}-l1-mem',
-                               base=ArchytasArch.L1_ADDR_START + (tile_id*ArchytasArch.L1_TILE_OFFSET),
-                               size=ArchytasArch.L1_SIZE, rm_base=False)
+                               base=DemocritosArch.L1_ADDR_START + (tile_id*DemocritosArch.L1_TILE_OFFSET),
+                               size=DemocritosArch.L1_SIZE, rm_base=False)
         
         # Bind tile Xbar so that it can communicate with OBI Xbar L1 mem
         tile_xbar.o_MAP(obi_xbar.i_INPUT(), name='axi2obi-l1-mem',
-                        base=ArchytasArch.L1_ADDR_START + (tile_id*ArchytasArch.L1_TILE_OFFSET),
-                        size=ArchytasArch.L1_SIZE, rm_base=False)
+                        base=DemocritosArch.L1_ADDR_START + (tile_id*DemocritosArch.L1_TILE_OFFSET),
+                        size=DemocritosArch.L1_SIZE, rm_base=False)
 
         # Bind tile Xbar so that it can communicate with OBI Xbar reserved mem
         tile_xbar.o_MAP(obi_xbar.i_INPUT(), name='axi-to-obi-reserved-mem',
-                        base=ArchytasArch.RESERVED_ADDR_START+(tid*ArchytasArch.L1_TILE_OFFSET),
-                        size=ArchytasArch.RESERVED_SIZE, rm_base=False)
+                        base=DemocritosArch.RESERVED_ADDR_START+(tid*DemocritosArch.L1_TILE_OFFSET),
+                        size=DemocritosArch.RESERVED_SIZE, rm_base=False)
 
         # Mapping used by OBI Xbar to communicate with the tile Xbar
         obi_xbar.o_MAP(tile_xbar.i_INPUT(), name='obi2axi-off-tile-l2-mem',
-                       base=ArchytasArch.L2_ADDR_START,
-                       size=ArchytasArch.L2_SIZE, rm_base=False)
+                       base=DemocritosArch.L2_ADDR_START,
+                       size=DemocritosArch.L2_SIZE, rm_base=False)
 
         # Bind tile Xbar so that it can write the L2 mem
         tile_xbar.o_MAP(self.__i_NARROW_OUTPUT(), name='axi-to-off-tile-l2-mem',
-                        base=ArchytasArch.L2_ADDR_START,
-                        size=ArchytasArch.L2_SIZE, rm_base=False)
+                        base=DemocritosArch.L2_ADDR_START,
+                        size=DemocritosArch.L2_SIZE, rm_base=False)
 
         # Bind OBI Xbar so that it can write to UART
         obi_xbar.o_MAP(stdout.i_INPUT(), name='local-uart-mem',
-                       base=ArchytasArch.STDOUT_START,
-                       size=ArchytasArch.STDOUT_SIZE, rm_base=False)
+                       base=DemocritosArch.STDOUT_START,
+                       size=DemocritosArch.STDOUT_SIZE, rm_base=False)
 
         # Bind OBI Xbar so that it can communuicate to PCM HWPE
         obi_xbar.o_MAP(pcm.i_hwpe_slv(), name='local-pcm-hwpe',
-                       base=ArchytasArch.PCM_START,
-                       size=ArchytasArch.PCM_SIZE,
+                       base=DemocritosArch.PCM_START,
+                       size=DemocritosArch.PCM_SIZE,
                        rm_base=True)
 
         self.__o_NARROW_INPUT(tile_xbar.i_INPUT())

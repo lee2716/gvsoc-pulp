@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 
-class ArchytasArch:
+class DemocritosArch:
     # Single tile address map from magia_tile_pkg.sv
     RESERVED_ADDR_START = 0x0000_0000
     RESERVED_SIZE       = 0x0000_FFFF - 0x0000_00E0
