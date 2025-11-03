@@ -27,7 +27,7 @@ from pulp.snitch.snitch_cluster.dma_interleaver import DmaInterleaver
 from pulp.chips.democritos.hierarchical_cache import Hierarchical_cache
 
 from pulp.chips.democritos.democritos_arch import DemocritosArch
-from pulp.chips.democritos.democritos_core import CV32CoreTest
+from pulp.chips.magia.cv32.core import CV32CoreTest
 from pulp.pcm.pcm import Pcm
 from pulp.idma.snitch_dma import SnitchDma
 from pulp.chips.magia.xif_decoder.xif_decoder import XifDecoder
