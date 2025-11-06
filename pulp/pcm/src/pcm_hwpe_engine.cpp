@@ -1,3 +1,6 @@
+#include <fstream>
+#include <sstream>
+#include <cstdint>
 #include <pcm.hpp>
 
 Pcm_HWPE_Engine::Pcm_HWPE_Engine(Pcm_HWPE* pcm){
@@ -38,21 +41,24 @@ void Pcm_HWPE_Engine::compute_mvm(Pcm_HWPE *pcm) {
 
     // Detect active layer
     layer = (this->user_registers[2] & 0x000000FF);
-    
-    // Initialize Xi, just for first debugging - REMOVE
-    for (uint32_t i=0; i<512; i++)
-        this->Xi[i] = 0x1;
 
     // Compute MVM - only signed MVM implemented
-    for (uint32_t j=0; j<512; j++){
-        for (uint32_t sec=0; sec<4; sec++){
-            if (active_sectors[sec] != 0){
-                for(uint32_t i=0; i<128; i++){
-                    full_prec_res[j] += (int32_t)this->Xi[i]*(int32_t)this->weights[layer*512+512*sec*i+j];
-                    //pcm->trace.msg(vp::TraceLevel::DEBUG, "Intermediate Yi[%d] = %d\n", j , pcm->Yi[j]);
-                }
+    /* for (uint32_t sec=0; sec<4; sec++){
+        if (active_sectors[sec] != 0){
+            for(uint32_t i=0; i<128; i++){
+                full_prec_res[sec*128+i] += (int32_t)this->Xi_buf[sec*128+i]*(int32_t)this->weights[layer*512*512+sec*128+i*512];
+                pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] x weight[%d] = %d x %d\n", (uint32_t)(sec*128+i), (uint32_t)(layer*512*512+sec*128+i*512), this->Xi_buf[sec*128+i], this->weights[layer*512*512+sec*128+i*512]);
             }
         }
+    } */
+
+    // Simplified MVM (assuming Xi_buf always full)
+    for (uint32_t j=0; j<512; j++){
+        for(uint32_t i=0; i<512; i++){
+            full_prec_res[j] += (int32_t)this->Xi_buf[i] * (int32_t)this->weights[j+512*i];
+            //pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] x weight[%d] = %d x %d\n", i, (j+i*512), this->Xi_buf[i], this->weights[j+i*512]);
+        }
+        pcm->trace.msg(vp::TraceLevel::DEBUG, "full_prec_res[%d] = %d\n", j, full_prec_res[j]);
     }
 
     // Just for first debug purposes - REMOVE!!
@@ -92,7 +98,7 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
     // Read Xi buffer - just for debugging
     /* for (int i = 0; i < 512; i++)
     {
-        this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] = 0x%x\n", i, (int8_t)Xi_buf[i]);
+        this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] = %d\n", i, (int8_t)Xi_buf[i]);
     } */
     
 
@@ -165,15 +171,21 @@ int Pcm_HWPE_Engine::handle_config(
         if (path != "")
         {
             this->pcm->trace.msg("Preloading Memory with stimuli file (path: %s)\n", path.c_str());
+            
+            std::ifstream file(path);
+            std::string line;
+            uint32_t idx = 0;
 
-            FILE *file = fopen(path.c_str(), "rb");
-            if (file == NULL)
-            {
-                this->pcm->trace.fatal("Unable to open stim file: %s, %s\n", path.c_str(), strerror(errno));
-            }
-            if (fread(this->weights, 1, 8*512*512, file) == 0)
-            {
-                this->pcm->trace.fatal("Failed to read stim file: %s, %s\n", path.c_str(), strerror(errno));
+            while (std::getline(file, line) && idx < 512*512) {
+                std::stringstream ss(line);
+                std::string value_str;
+                while (std::getline(ss, value_str, ',') /* && idx < 512 */) {
+                    int val = std::stoi(value_str);
+                    if (val < -128 || val > 127) {
+                        this->pcm->trace.warning("Weight value out of int8_t range: %d at index %d\n", val, idx);
+                    }
+                    this->weights[idx++] = static_cast<int8_t>(val);
+                }
             }
         }
         else
