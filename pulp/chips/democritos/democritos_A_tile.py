@@ -192,6 +192,11 @@ class Democritos_A_Tile(gvsoc.systree.Component):
                        size=DemocritosArch.PCM_SIZE,
                        rm_base=True)
 
+        # Bind obi xbar so that it can write to kill_module
+        obi_xbar.o_MAP(self.__i_KILLER_OUTPUT(), name="Kill-sim-mem",
+                base=DemocritosArch.TEST_END_ADDR_START,
+                size=DemocritosArch.TEST_END_SIZE, rm_base=False)
+
         self.__o_NARROW_INPUT(tile_xbar.i_INPUT())
 
         # Bind CV32 core enable prots -> matching composite ports
