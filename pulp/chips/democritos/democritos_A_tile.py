@@ -322,3 +322,10 @@ class Democritos_A_Tile(gvsoc.systree.Component):
 
     def __o_ENTRY(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('entry', itf, signature='wire<uint64_t>', composite_bind=True)
+
+    # Killer port
+    def o_KILLER_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('killer_output', itf, signature='io')
+
+    def __i_KILLER_OUTPUT(self) -> gvsoc.systree.SlaveItf:
+        return gvsoc.systree.SlaveItf(self, 'killer_output', signature='io')

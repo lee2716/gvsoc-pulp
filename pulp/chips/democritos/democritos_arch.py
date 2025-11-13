@@ -30,7 +30,10 @@ class DemocritosArch:
     L1_ADDR_END         = L1_ADDR_START + L1_SIZE
     L1_TILE_OFFSET      = 0x0010_0000
     L2_ADDR_START       = 0xC000_0000
-    L2_SIZE             = 0x4000_0000
+    L2_SIZE             = 0x0C02_FFFF
+    L2_ADDR_END         = L2_ADDR_START + L2_SIZE
+    TEST_END_ADDR_START = L2_ADDR_END + 1
+    TEST_END_SIZE       = 0x100
     L2_ADDR_END         = L2_ADDR_START + L2_SIZE
     STDOUT_START        = 0xFFFF_0004
     STDOUT_SIZE         = 0x100
