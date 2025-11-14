@@ -116,7 +116,7 @@ class Democritos_A_Tile(gvsoc.systree.Component):
         mvm_latency_ns = 300 # MVM latency in ns
         # Conversion of latency in clock cycles (TODO: make the clock frequency configurable)
         mvm_latency = int(mvm_latency_ns/((1/100000000)*(10**9)))
-        pcm = Pcm(self, f'pcm-{tid}', mvm_latency=mvm_latency)
+        pcm = Pcm(self, 'pcm', mvm_latency=mvm_latency, stim_file="../../../democritos_tests/pcm_test/generator/B.csv")
 
         # Xif decoder
         xifdec = XifDecoder(self, f'tile-{tid}-xif-dec')

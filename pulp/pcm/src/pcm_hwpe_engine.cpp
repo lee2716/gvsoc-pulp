@@ -15,6 +15,9 @@ Pcm_HWPE_Engine::Pcm_HWPE_Engine(Pcm_HWPE* pcm){
     this->ext_data_in = 0;
     this->ext_data_out = 0;
     this->mvm_latency = this->pcm->get_js_config()->get_child_int("mvm_latency");
+
+    for(uint32_t i=0; i<512; i++)
+        this->Xi_buf[i] = 0;
 }
 
 Pcm_HWPE_Engine::Pcm_HWPE_Engine() {
@@ -58,7 +61,7 @@ void Pcm_HWPE_Engine::compute_mvm(Pcm_HWPE *pcm) {
             full_prec_res[j] += (int32_t)this->Xi_buf[i] * (int32_t)this->weights[j+512*i];
             //pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] x weight[%d] = %d x %d\n", i, (j+i*512), this->Xi_buf[i], this->weights[j+i*512]);
         }
-        pcm->trace.msg(vp::TraceLevel::DEBUG, "full_prec_res[%d] = %d\n", j, full_prec_res[j]);
+        //pcm->trace.msg(vp::TraceLevel::DEBUG, "full_prec_res[%d] = %d\n", j, full_prec_res[j]);
     }
 
     // Just for first debug purposes - REMOVE!!
@@ -98,7 +101,7 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
     // Read Xi buffer - just for debugging
     /* for (int i = 0; i < 512; i++)
     {
-        this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] = %d\n", i, (int8_t)Xi_buf[i]);
+        this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] = %d\n", i, (int8_t)this->Xi_buf[i]);
     } */
     
 

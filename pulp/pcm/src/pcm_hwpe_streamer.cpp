@@ -118,6 +118,8 @@ int Pcm_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
 			}
 		
 			max_latency = latency > max_latency ? latency : max_latency;
+
+			//this->pcm->trace.msg(vp::TraceLevel::DEBUG, "addr: %0.4x, is_write: %x, data: %x\n", this->req->get_addr(), this->req->get_is_write(), this->req->get_data());
 		}
 
 		// this->pcm->trace.msg(vp::TraceLevel::DEBUG, "width = %d\n", width);
@@ -147,6 +149,9 @@ int Pcm_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
 					latency = req->get_latency();
 
 					strb = strb >> BYTES_PER_BANK;
+
+					//this->pcm->trace.msg(vp::TraceLevel::DEBUG, "addr: %0.4x, is_write: %x, data: %x\n", this->req->get_addr(), this->req->get_is_write(), this->req->get_data());
+
 				} else {
 					if (this->is_write) {	//TODO: does not support strobes with 0s at the beginning
 						int ones = sizeof(uint64_t) * 8 - __builtin_clzll (strb);
@@ -161,6 +166,8 @@ int Pcm_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
 						this->req->set_data((uint8_t *) &tmp);
 						this->req->set_size(BYTES_PER_BANK);
 					}
+
+					//this->pcm->trace.msg(vp::TraceLevel::DEBUG, "addr: %0.4x, is_write: %x, data: %x\n", this->req->get_addr(), this->req->get_is_write(), this->req->get_data());
 
 					vp::IoReqStatus err = this->pcm->stream_mst.req(this->req);
 
@@ -216,6 +223,8 @@ int Pcm_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
 						strb = strb >> 1;
 					}
 				}
+
+				//this->pcm->trace.msg(vp::TraceLevel::DEBUG, "addr: %0.4x, is_write: %x, data: %x\n", this->req->get_addr(), this->req->get_is_write(), this->req->get_data());
 			}
 
 			max_latency = latency > max_latency ? latency : max_latency;
