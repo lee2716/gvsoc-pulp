@@ -45,20 +45,10 @@ void Pcm_HWPE_Engine::compute_mvm(Pcm_HWPE *pcm) {
     // Detect active layer
     layer = (this->user_registers[2] & 0x000000FF);
 
-    // Compute MVM - only signed MVM implemented
-    /* for (uint32_t sec=0; sec<4; sec++){
-        if (active_sectors[sec] != 0){
-            for(uint32_t i=0; i<128; i++){
-                full_prec_res[sec*128+i] += (int32_t)this->Xi_buf[sec*128+i]*(int32_t)this->weights[layer*512*512+sec*128+i*512];
-                pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] x weight[%d] = %d x %d\n", (uint32_t)(sec*128+i), (uint32_t)(layer*512*512+sec*128+i*512), this->Xi_buf[sec*128+i], this->weights[layer*512*512+sec*128+i*512]);
-            }
-        }
-    } */
-
-    // Simplified MVM (assuming Xi_buf always full)
+    // Compute MVM - only signed MVM implemented - Simplified MVM (assuming Xi_buf always full)
     for (uint32_t j=0; j<512; j++){
         for(uint32_t i=0; i<512; i++){
-            full_prec_res[j] += (int32_t)this->Xi_buf[i] * (int32_t)this->weights[j+512*i];
+            full_prec_res[i] += (int32_t)this->Xi_buf[j] * (int32_t)this->weights[i+512*j];
             //pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] x weight[%d] = %d x %d\n", i, (j+i*512), this->Xi_buf[i], this->weights[j+i*512]);
         }
         //pcm->trace.msg(vp::TraceLevel::DEBUG, "full_prec_res[%d] = %d\n", j, full_prec_res[j]);
