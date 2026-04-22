@@ -45,13 +45,16 @@ void Pcm_HWPE_Engine::compute_mvm(Pcm_HWPE *pcm) {
     // Detect active layer
     layer = (this->user_registers[2] & 0x000000FF);
 
-    // Compute MVM - only signed MVM implemented - Simplified MVM (assuming Xi_buf always full)
-    for (uint32_t j=0; j<512; j++){
-        for(uint32_t i=0; i<512; i++){
-            full_prec_res[i] += (int32_t)this->Xi_buf[j] * (int32_t)this->weights[i+512*j];
-            //pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] x weight[%d] = %d x %d\n", i, (j+i*512), this->Xi_buf[i], this->weights[j+i*512]);
+    // Compute MVM - only signed MVM implemented
+    for (uint32_t sec=0; sec<4; sec++){
+        if (active_sectors[sec] != 0){
+            pcm->trace.msg(vp::TraceLevel::DEBUG, "sector %d is active\n", sec);
+            for (uint32_t j=0; j<128; j++){
+                for (uint32_t i=0; i<512; i++){
+                    full_prec_res[i] += (int32_t)this->Xi_buf[j+sec*128] * (int32_t)this->weights[i+512*(j+sec*128)];
+                }
+            }
         }
-        //pcm->trace.msg(vp::TraceLevel::DEBUG, "full_prec_res[%d] = %d\n", j, full_prec_res[j]);
     }
 
     // Just for first debug purposes - REMOVE!!
@@ -109,7 +112,7 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
         this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
     }
 
-    for(uint32_t j=1; j<(this->pcm->register_file[PCM_HWPE_TOTAL_LENGTH >> 2]/8); j++) {
+    for(uint32_t j=1; j<(this->pcm->register_file[PCM_HWPE_NUM_JOBS >> 2]); j++) {
         // Refill Xi buffer
         for (int8_t i = 0; i<8; i++) {
             this->pcm->inp_stream.rw_data(64, (void *)(this->Xi_buf+i*64), -1);
@@ -120,7 +123,8 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
         *latency += mvm_latency;
 
         // Stream outputs (we take into account the latency for the last stream out)
-        if(j<(this->pcm->register_file[PCM_HWPE_TOTAL_LENGTH >> 2]/8)-1) {
+        this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Streaming out results...\n");
+        if(j<(this->pcm->register_file[PCM_HWPE_NUM_JOBS >> 2])-1) {
             for (uint32_t i=0; i<8; i++) {
             this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
             }
@@ -133,6 +137,7 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
     }
 
     // Last stream out: we take into account the latency for this data movement
+    this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Streaming out results...\n");
     for (uint32_t i=0; i<8; i++) {
     *latency+=this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
     }

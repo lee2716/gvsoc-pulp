@@ -49,7 +49,7 @@ void Pcm_HWPE_Streamer::configure(
 	this->d3_stride	= d3_stride	;
     this->pos       = 0			;
 
-	this->pcm->trace.msg("base addr %x\ntot len %d\nd0 len %x\nd0 stride %x\nd1 len %x\nd1 stride %x\nd2 stride %x\nd3 stride %x\n",
+	this->pcm->trace.msg("base addr %x\ntot len %d\nd0 len %d\nd0 stride %d\nd1 len %d\nd1 stride %d\nd2 stride %d\nd3 stride %d\n",
 		this->base_addr	,
 		this->tot_len  	,
 		this->d0_len   	,
@@ -122,7 +122,8 @@ int Pcm_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
 			//this->pcm->trace.msg(vp::TraceLevel::DEBUG, "addr: %0.4x, is_write: %x, data: %x\n", this->req->get_addr(), this->req->get_is_write(), this->req->get_data());
 		}
 
-		// this->pcm->trace.msg(vp::TraceLevel::DEBUG, "width = %d\n", width);
+		/* this->pcm->trace.msg(vp::TraceLevel::DEBUG, "width = %d\n", width);
+		this->pcm->trace.msg(vp::TraceLevel::DEBUG, "offs % BYTES_PER_BANK = %d\n", (offs % BYTES_PER_BANK)); */
 		
 		for (int i = (offs % BYTES_PER_BANK) == 0 ? 0 : BYTES_PER_BANK - (offs % BYTES_PER_BANK); i < width; i += BYTES_PER_BANK) {
 			if (strb == 0) {
