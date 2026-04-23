@@ -3,6 +3,18 @@
 #include <cstdint>
 #include <pcm.hpp>
 
+// Thread worker function for computing MVM innermost loop
+void* mvm_thread_worker(void* arg) {
+    MvmThreadData* data = (MvmThreadData*)arg;
+    
+    for (uint32_t i = data->start_i; i < data->end_i; i++) {
+        data->full_prec_res[i] += (int32_t)data->Xi_buf[data->j + data->sec * 128] * 
+                                  (int32_t)data->weights[512 * 512 * data->layer + i + 512 * (data->j + data->sec * 128)];
+    }
+    
+    pthread_exit(NULL);
+}
+
 Pcm_HWPE_Engine::Pcm_HWPE_Engine(Pcm_HWPE* pcm){
     this->pcm = pcm;
 
@@ -37,21 +49,45 @@ void Pcm_HWPE_Engine::compute_mvm(Pcm_HWPE *pcm) {
     }
 
     // Detect active sectors
-    for (uint8_t sec=0; sec<4; sec++){
-        active_sectors[sec] = (this->user_registers[1]>>(8+sec*4)) & 0x0F;
+    active_sectors[0] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_0>>2]) & 0x0F;
+    active_sectors[1] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_1>>2]) & 0x0F;
+    active_sectors[2] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_2>>2]) & 0x0F;
+    active_sectors[3] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_3>>2]) & 0x0F;
+    
+    for (uint32_t sec=0; sec<4; sec++){
         pcm->trace.msg(vp::TraceLevel::DEBUG, "sector[%d] = %x\n", sec, active_sectors[sec]);
     }
 
     // Detect active layer
-    layer = (this->user_registers[2] & 0x000000FF);
+    layer = this->pcm->register_file[PCM_HWPE_ACT_LAYER>>2] & 0xFF;
 
     // Compute MVM - only signed MVM implemented
     for (uint32_t sec=0; sec<4; sec++){
         if (active_sectors[sec] != 0){
             pcm->trace.msg(vp::TraceLevel::DEBUG, "sector %d is active\n", sec);
             for (uint32_t j=0; j<128; j++){
-                for (uint32_t i=0; i<512; i++){
-                    full_prec_res[i] += (int32_t)this->Xi_buf[j+sec*128] * (int32_t)this->weights[i+512*(j+sec*128)];
+                // Parallelize the innermost loop with pthreads
+                pthread_t threads[NUM_THREADS];
+                MvmThreadData thread_data[NUM_THREADS];
+                uint32_t items_per_thread = 512 / NUM_THREADS;
+                
+                // Create threads
+                for (int t = 0; t < NUM_THREADS; t++) {
+                    thread_data[t].full_prec_res = full_prec_res;
+                    thread_data[t].Xi_buf = this->Xi_buf;
+                    thread_data[t].weights = this->weights;
+                    thread_data[t].j = j;
+                    thread_data[t].sec = sec;
+                    thread_data[t].layer = layer;
+                    thread_data[t].start_i = t * items_per_thread;
+                    thread_data[t].end_i = (t == NUM_THREADS - 1) ? 512 : (t + 1) * items_per_thread;
+                    
+                    pthread_create(&threads[t], NULL, mvm_thread_worker, &thread_data[t]);
+                }
+                
+                // Wait for all threads to complete
+                for (int t = 0; t < NUM_THREADS; t++) {
+                    pthread_join(threads[t], NULL);
                 }
             }
         }

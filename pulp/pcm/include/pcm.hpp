@@ -5,6 +5,7 @@
 #include <vp/itf/io.hpp>
 #include <algorithm>
 #include <stdio.h>
+#include <pthread.h>
 
 #include <pcm_hwpe_archi.hpp>
 
@@ -18,6 +19,21 @@
 #define ABORT_CMD       0x4
 
 typedef uint64_t strobe_t;
+
+// MVM threading configuration
+#define NUM_THREADS 4
+
+// Structure to pass data to pthread worker threads
+struct MvmThreadData {
+    int32_t* full_prec_res;
+    const int8_t* Xi_buf;
+    const int8_t* weights;
+    uint32_t j;
+    uint32_t sec;
+    uint32_t layer;
+    uint32_t start_i;
+    uint32_t end_i;
+};
 
 class Pcm_HWPE;
 

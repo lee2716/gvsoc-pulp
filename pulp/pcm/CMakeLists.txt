@@ -1,5 +1,8 @@
 get_filename_component(MOD_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
 
+# Find pthread library
+find_package(Threads REQUIRED)
+
 set(PCM_SRCS
     "${MOD_ROOT}/src/pcm_hwpe.cpp"
     "${MOD_ROOT}/src/pcm_hwpe_engine.cpp"
@@ -22,6 +25,12 @@ endforeach()
 vp_model(
   NAME    pulp.pcm.pcm
   SOURCES ${PCM_SRCS}
+)
+
+# Link pthread library using vp_model_link_libraries
+vp_model_link_libraries(
+  NAME pulp.pcm.pcm
+  LIBRARY pthread
 )
 
 # Include directory for this model
