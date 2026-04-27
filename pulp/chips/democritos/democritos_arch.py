@@ -14,29 +14,40 @@
 # limitations under the License.
 #
 
+from gvrun.attribute import Tree, Value
+
 class DemocritosArch:
     # Single tile address map from magia_tile_pkg.sv
-    RESERVED_ADDR_START = 0x0000_0000
-    RESERVED_SIZE       = 0x0000_FFFF - 0x0000_00E0
-    RESERVED_ADDR_END   = RESERVED_ADDR_START + RESERVED_SIZE
-    PCM_START           = RESERVED_ADDR_END + 1
-    PCM_SIZE            = 0x0000_00E0
-    PCM_END             = 0x0000_FFFF
-    STACK_ADDR_START    = PCM_END + 1
-    STACK_SIZE          = 0x0000_FFFF
-    STACK_ADDR_END      = STACK_ADDR_START + STACK_SIZE
-    L1_ADDR_START       = STACK_ADDR_END + 1
-    L1_SIZE             = 0x000D_FFFF
-    L1_ADDR_END         = L1_ADDR_START + L1_SIZE
-    L1_TILE_OFFSET      = 0x0010_0000
-    L2_ADDR_START       = 0xC000_0000
-    L2_SIZE             = 0x0C02_FFFF
-    L2_ADDR_END         = L2_ADDR_START + L2_SIZE
-    TEST_END_ADDR_START = L2_ADDR_END + 1
-    TEST_END_SIZE       = 0x100
-    L2_ADDR_END         = L2_ADDR_START + L2_SIZE
-    STDOUT_START        = 0xFFFF_0004
-    STDOUT_SIZE         = 0x100
+    IDMA_CTRL_ADDR_START    = 0x0000_0100
+    IDMA_CTRL_SIZE          = 0x0000_03FF
+    IDMA_CTRL_ADDR_END      = IDMA_CTRL_ADDR_START + IDMA_CTRL_SIZE
+    FSYNC_CTRL_ADDR_START   = IDMA_CTRL_ADDR_END + 1
+    FSYNC_CTRL_SIZE         = 0x0000_00FF
+    FSYNC_CTRL_ADDR_END     = FSYNC_CTRL_ADDR_START + FSYNC_CTRL_SIZE
+    EVENT_UNIT_ADDR_START   = FSYNC_CTRL_ADDR_END + 1
+    EVENT_UNIT_SIZE         = 0x0000_0FFF
+    EVENT_UNIT_ADDR_END     = EVENT_UNIT_ADDR_START + EVENT_UNIT_SIZE
+    RESERVED_ADDR_START     = EVENT_UNIT_ADDR_END + 1
+    RESERVED_SIZE           = 0x0000_E7FF
+    RESERVED_ADDR_END       = RESERVED_ADDR_START + RESERVED_SIZE
+    PCM_START               = RESERVED_ADDR_END + 1
+    PCM_SIZE                = 0x0000_00DF
+    PCM_END                 = PCM_START + PCM_SIZE
+    STACK_ADDR_START        = PCM_END + 1
+    STACK_SIZE              = 0x0000_FFFF
+    STACK_ADDR_END          = STACK_ADDR_START + STACK_SIZE
+    L1_ADDR_START           = STACK_ADDR_END + 1
+    L1_SIZE                 = 0x000D_FFFF
+    L1_ADDR_END             = L1_ADDR_START + L1_SIZE
+    L1_TILE_OFFSET          = 0x0010_0000
+    L2_ADDR_START           = 0xC000_0000
+    L2_SIZE                 = 0x0CFE_FFFF
+    L2_ADDR_END             = L2_ADDR_START + L2_SIZE
+    TEST_END_ADDR_START     = L2_ADDR_END + 1
+    TEST_END_SIZE           = 0x400
+    L2_ADDR_END             = L2_ADDR_START + L2_SIZE
+    STDOUT_START            = 0xFFFF_0004
+    STDOUT_SIZE             = 0x100
 
     # From magia_pkg.sv
     N_MEM_BANKS         = 32        # Number of TCDM banks
@@ -49,4 +60,27 @@ class DemocritosArch:
     ENABLE_NOC          = True
     N_TILES_X           = 2 # 16
     N_TILES_Y           = 2 # 16
-    NB_CLUSTERS         = N_TILES_X*N_TILES_Y
+    NB_CLUSTERS         = N_TILES_X*N_TILES_Y # to be removed when we'll use the DemocritosTree properties instead of hardcoding the number of clusters in the components
+
+class DemocritosTree(Tree):
+    def __init__(self, parent, name):
+        super().__init__(parent, name)
+        self.n_tiles_x = Value(self, 'n_tiles_x', DemocritosArch.N_TILES_X, cast=int,
+            description='Number of tiles on X dimension')
+        self.n_tiles_y = Value(self, 'n_tiles_y', DemocritosArch.N_TILES_Y, cast=int,
+            description='Number of tiles on Y dimension')
+
+        self.nb_clusters = self.n_tiles_x*self.n_tiles_y
+
+class DemocritosDSE:
+    SOC_L2_LATENCY              = 2
+    TILE_ICACHE_REFILL_LATENCY  = 2
+    TILE_TCDM_LATENCY           = 1
+    TILE_AXI_XBAR_LATENCY       = 2
+    TILE_AXI_XBAR_SYNC          = False
+    TILE_OBI_XBAR_LATENCY       = 2
+    TILE_OBI_XBAR_SYNC          = True
+    TILE_IDMA0_BQUEUE_SIZE      = 2
+    TILE_IDMA0_B_SIZE           = 32
+    TILE_IDMA1_BQUEUE_SIZE      = 2
+    TILE_IDMA1_B_SIZE           = 32

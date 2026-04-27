@@ -26,12 +26,13 @@ from pulp.light_redmule.hwpe_interleaver import HWPEInterleaver
 from pulp.snitch.snitch_cluster.dma_interleaver import DmaInterleaver
 from pulp.chips.democritos.hierarchical_cache import Hierarchical_cache
 
-from pulp.chips.democritos.democritos_arch import DemocritosArch
-from pulp.chips.magia.cv32.core import CV32CoreTest
+from pulp.chips.democritos.democritos_arch import *
+from pulp.chips.magia_v2.cv32.core import CV32CoreTest
 from pulp.pcm.pcm import Pcm
 from pulp.idma.snitch_dma import SnitchDma
-from pulp.chips.magia.xif_decoder.xif_decoder import XifDecoder
-from pulp.chips.magia.idma_ctrl.idma_ctrl import Magia_iDMA_Ctrl
+from pulp.chips.magia_v2.fractal_sync_mm_ctrl.fractal_sync_mm_ctrl import FSync_mm_ctrl
+from pulp.chips.magia_v2.idma_mm_ctrl.idma_mm_ctrl import iDMA_mm_ctrl
+from pulp.event_unit.event_unit_v3 import Event_unit
 
 
 # adapted from snitch cluster model
@@ -101,16 +102,16 @@ class Democritos_A_Tile(gvsoc.systree.Component):
         # Data scratchpad
         l1_tcdm = Democritos_A_TileTcdm(self, f'tile-{tid}-l1-tcdm', parser)
 
-        # Temporary test interconnects (use OBI to access TCDM), to be refined later
-        tile_xbar = router.Router(self, f'tile-{tid}-xbar', bandwidth=4, latency=2)
-        obi_xbar  = router.Router(self, f'tile-{tid}-obi-xbar', bandwidth=4, latency=0)
+       # AXI and OBI x-bars
+        tile_xbar = router.Router(self, f'tile-{tid}-axi-xbar',bandwidth=4,latency=DemocritosDSE.TILE_AXI_XBAR_LATENCY,synchronous=DemocritosDSE.TILE_AXI_XBAR_SYNC)
+        obi_xbar = router.Router(self, f'tile-{tid}-obi-xbar',bandwidth=4,latency=DemocritosDSE.TILE_OBI_XBAR_LATENCY,synchronous=DemocritosDSE.TILE_OBI_XBAR_SYNC)
 
         # iDMA controller
-        idma_ctrl = Magia_iDMA_Ctrl(self, f'tile-{tid}-idma-ctrl')
+        idma_mm_ctrl= iDMA_mm_ctrl(self,f'tile-{tid}-idma-ctrl-mm')
 
         # iDMA
-        idma0 = SnitchDma(self, f'tile-{tid}-idma0', loc_base=tid*DemocritosArch.L1_TILE_OFFSET, loc_size=DemocritosArch.L1_SIZE, tcdm_width=4, transfer_queue_size=1, burst_queue_size=1)
-        idma1 = SnitchDma(self, f'tile-{tid}-idma1', loc_base=tid*DemocritosArch.L1_TILE_OFFSET, loc_size=DemocritosArch.L1_SIZE, tcdm_width=4, transfer_queue_size=1, burst_queue_size=1)
+        idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
+        idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
 
         # PCM HWPE
         mvm_latency_ns = 300 # MVM latency in ns
@@ -118,8 +119,8 @@ class Democritos_A_Tile(gvsoc.systree.Component):
         mvm_latency = int(mvm_latency_ns/((1/100000000)*(10**9)))
         pcm = Pcm(self, 'pcm', mvm_latency=mvm_latency, stim_file="../../../democritos_tests/pcm_test/generator/B.csv")
 
-        # Xif decoder
-        xifdec = XifDecoder(self, f'tile-{tid}-xif-dec')
+        # Fsync mm controller
+        fsync_mm_ctrl = FSync_mm_ctrl(self,f'tile-{tid}-fs-ctrl-mm')
 
         # UART
         stdout = Stdout(self, f'tile-{tid}-stdout', max_cluster=DemocritosArch.NB_CLUSTERS, max_core_per_cluster=1, user_set_core_id=0, user_set_cluster_id=tid)
@@ -203,43 +204,36 @@ class Democritos_A_Tile(gvsoc.systree.Component):
         self.__o_ENTRY(core_cv32.i_ENTRY())
         self.__o_FETCHEN(core_cv32.i_FETCHEN())
 
-        # Bind X-if decoder
-        core_cv32.o_OFFLOAD(xifdec.i_OFFLOAD_M())
-        xifdec.o_OFFLOAD_GRANT_M(core_cv32.i_OFFLOAD_GRANT())
-
         # Bind: iDMA controller
-        xifdec.o_OFFLOAD_S1(idma_ctrl.i_OFFLOAD_M())
-        idma_ctrl.o_OFFLOAD_GRANT_M(xifdec.i_OFFLOAD_GRANT_S1())
-        idma_ctrl.o_IRQ_DMA0(core_cv32.i_IRQ(26))
-        idma_ctrl.o_IRQ_DMA1(core_cv32.i_IRQ(27))
+        obi_xbar.o_MAP(idma_mm_ctrl.i_INPUT(), name=f'iDMA-ctrl-mm-{tid}-mem', base=DemocritosArch.IDMA_CTRL_ADDR_START, size=DemocritosArch.IDMA_CTRL_SIZE, rm_base=True)
 
         # Bind iDMA0
         idma0.o_AXI(tile_xbar.i_INPUT())
         idma0.o_TCDM(l1_tcdm.i_INPUT(1)) # here we don't use the iDMA interleaver because here iDMA is directly connected to TCDM and iDMA has it's own interleaver for TCDM access (in iDMA-BE)
-        idma_ctrl.o_OFFLOAD_iDMA0_AXI2OBI(idma0.i_OFFLOAD())
-        idma0.o_OFFLOAD_GRANT(idma_ctrl.i_OFFLOAD_GRANT_iDMA0_AXI2OBI())
+        idma_mm_ctrl.o_OFFLOAD_iDMA0_AXI2OBI(idma0.i_OFFLOAD())
+        idma0.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA0_AXI2OBI())
 
         # Bind iDMA1
         idma1.o_AXI(tile_xbar.i_INPUT())
         idma1.o_TCDM(l1_tcdm.i_INPUT(2)) # here we don't use the iDMA interleaver because here iDMA is directly connected to TCDM and iDMA has it's own interleaver for TCDM access (in iDMA-BE)
-        idma_ctrl.o_OFFLOAD_iDMA1_OBI2AXI(idma1.i_OFFLOAD())
-        idma1.o_OFFLOAD_GRANT(idma_ctrl.i_OFFLOAD_GRANT_iDMA1_OBI2AXI())
+        idma_mm_ctrl.o_OFFLOAD_iDMA1_OBI2AXI(idma1.i_OFFLOAD())
+        idma1.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA1_OBI2AXI())
 
         # Bind PCM
         pcm.o_stream_mst(l1_tcdm.i_PCM_HWPE_INPUT())
 
         # Bind FractalSync ports
-        xifdec.o_XIF_2_FRACTAL_EAST_WEST(self.__o_SLAVE_EAST_WEST_FRACTAL())
-        self.__i_SLAVE_EAST_WEST_FRACTAL(xifdec.i_FRACTAL_2_XIF_EAST_WEST())
+        fsync_mm_ctrl.o_XIF_2_FRACTAL_EAST_WEST(self.__o_SLAVE_EAST_WEST_FRACTAL())
+        self.__i_SLAVE_EAST_WEST_FRACTAL(fsync_mm_ctrl.i_FRACTAL_2_XIF_EAST_WEST())
 
-        xifdec.o_XIF_2_FRACTAL_NORD_SUD(self.__o_SLAVE_NORTH_SOUTH_FRACTAL())
-        self.__i_SLAVE_NORTH_SOUTH_FRACTAL(xifdec.i_FRACTAL_2_XIF_NORD_SUD())
+        fsync_mm_ctrl.o_XIF_2_FRACTAL_NORD_SUD(self.__o_SLAVE_NORTH_SOUTH_FRACTAL())
+        self.__i_SLAVE_NORTH_SOUTH_FRACTAL(fsync_mm_ctrl.i_FRACTAL_2_XIF_NORD_SUD())
 
-        xifdec.o_XIF_2_NEIGHBOUR_FRACTAL_EAST_WEST(self.__o_SLAVE_EAST_WEST_NEIGHBOUR_FRACTAL())
-        self.__i_SLAVE_EAST_WEST_NEIGHBOUR_FRACTAL(xifdec.i_NEIGHBOUR_FRACTAL_2_XIF_EAST_WEST())
+        fsync_mm_ctrl.o_XIF_2_NEIGHBOUR_FRACTAL_EAST_WEST(self.__o_SLAVE_EAST_WEST_NEIGHBOUR_FRACTAL())
+        self.__i_SLAVE_EAST_WEST_NEIGHBOUR_FRACTAL(fsync_mm_ctrl.i_NEIGHBOUR_FRACTAL_2_XIF_EAST_WEST())
 
-        xifdec.o_XIF_2_NEIGHBOUR_FRACTAL_NORD_SUD(self.__o_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL())
-        self.__i_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL(xifdec.i_NEIGHBOUR_FRACTAL_2_XIF_NORD_SUD())
+        fsync_mm_ctrl.o_XIF_2_NEIGHBOUR_FRACTAL_NORD_SUD(self.__o_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL())
+        self.__i_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL(fsync_mm_ctrl.i_NEIGHBOUR_FRACTAL_2_XIF_NORD_SUD())
 
         # Enable debug
         gdbserver.gdbserver.Gdbserver(self, 'gdbserver')
