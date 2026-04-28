@@ -23,6 +23,9 @@ typedef uint64_t strobe_t;
 // MVM threading configuration
 #define NUM_THREADS 4
 
+// PCM design parameters
+#define PCM_NUM_LAYERS 8
+
 // Structure to pass data to pthread worker threads
 struct MvmThreadData {
     int32_t* full_prec_res;

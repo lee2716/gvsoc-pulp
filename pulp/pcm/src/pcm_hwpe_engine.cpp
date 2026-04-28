@@ -209,11 +209,12 @@ int Pcm_HWPE_Engine::handle_config(
             std::ifstream file(path);
             std::string line;
             uint32_t idx = 0;
+            const uint32_t max_weights = PCM_NUM_LAYERS * 512 * 512;
 
-            while (std::getline(file, line) && idx < 512*512) {
+            while (std::getline(file, line) && idx < max_weights) {
                 std::stringstream ss(line);
                 std::string value_str;
-                while (std::getline(ss, value_str, ',') /* && idx < 512 */) {
+                while (std::getline(ss, value_str, ',') && idx < max_weights) {
                     int val = std::stoi(value_str);
                     if (val < -128 || val > 127) {
                         this->pcm->trace.warning("Weight value out of int8_t range: %d at index %d\n", val, idx);
@@ -221,11 +222,13 @@ int Pcm_HWPE_Engine::handle_config(
                     this->weights[idx++] = static_cast<int8_t>(val);
                 }
             }
+            
+            this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Loaded %d layers from stimuli file\n", idx/(512*512));
         }
         else
         {
             this->pcm->trace.msg(vp::TraceLevel::DEBUG, "No path specified, preloading PCM weights with all ones\n");
-            std::fill(this->weights, this->weights+(8*512*512), 1);
+            std::fill(this->weights, this->weights+(PCM_NUM_LAYERS*512*512), 1);
         }
     }
     
