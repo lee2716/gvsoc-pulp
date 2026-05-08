@@ -33,6 +33,9 @@ struct MvmThreadData {
     const int8_t* weights;
     uint32_t j;
     uint32_t sec;
+    bool sec_reuse;
+    uint16_t sec_mask;
+    uint8_t sec_rep;
     uint32_t layer;
     uint32_t start_i;
     uint32_t end_i;
@@ -54,7 +57,7 @@ class Pcm_HWPE_Engine {
     public:
         Pcm_HWPE_Engine(Pcm_HWPE* pcm);
         Pcm_HWPE_Engine();
-        void compute_mvm(Pcm_HWPE* pcm);
+        void compute_mvm(Pcm_HWPE* pcm, uint16_t sec_mask, bool sec_reuse, uint8_t sec_rep);
         int8_t Xi_buf[512];
         int handle_config(
             Pcm_HWPE    *pcm,

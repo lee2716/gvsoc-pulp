@@ -14,6 +14,8 @@
 # limitations under the License.
 #
 
+import string
+
 import gvsoc.systree
 import memory.memory as memory
 import interco.router as router
@@ -90,7 +92,7 @@ class Democritos_A_TileTcdm(gvsoc.systree.Component):
         return gvsoc.systree.SlaveItf(self, f'PCM_HWPE_input', signature='io')
 
 class Democritos_A_Tile(gvsoc.systree.Component):
-    def __init__(self, parent, name, parser, tid: int=0):
+    def __init__(self, parent, name, parser, tid: int=0, weights_path: string=None):
         super().__init__(parent, name)
 
         # Core
@@ -117,7 +119,8 @@ class Democritos_A_Tile(gvsoc.systree.Component):
         mvm_latency_ns = 300 # MVM latency in ns
         # Conversion of latency in clock cycles (TODO: make the clock frequency configurable)
         mvm_latency = int(mvm_latency_ns/((1/100000000)*(10**9)))
-        pcm = Pcm(self, 'pcm', mvm_latency=mvm_latency, stim_file="../../../democritos_tests/pcm_test/generator/B.csv")
+        #pcm = Pcm(self, 'pcm', mvm_latency=mvm_latency, stim_file="../../../democritos_tests/a-tile_test/generator/B.csv")
+        pcm = Pcm(self, 'pcm', mvm_latency=mvm_latency, stim_file=weights_path)
 
         # Fsync mm controller
         fsync_mm_ctrl = FSync_mm_ctrl(self,f'tile-{tid}-fs-ctrl-mm')

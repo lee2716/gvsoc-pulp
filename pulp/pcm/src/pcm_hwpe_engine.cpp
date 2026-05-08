@@ -6,10 +6,62 @@
 // Thread worker function for computing MVM innermost loop
 void* mvm_thread_worker(void* arg) {
     MvmThreadData* data = (MvmThreadData*)arg;
+
+    uint8_t inp_sec, weight_sec;
+
+    switch (data->sec_mask)
+    {
+    case 0x0001:
+        weight_sec = 0;
+        inp_sec = data->sec_rep;
+        break;
+    case 0x0010:
+        weight_sec = 1;
+        inp_sec = data->sec_rep;
+        break;
+    case 0x0100:
+        weight_sec = 2;
+        inp_sec = data->sec_rep;
+        break;
+    case 0x1000:
+        weight_sec = 3;
+        inp_sec = data->sec_rep;
+        break;
+    case 0x0011:
+        if (data->sec_reuse) {
+            weight_sec = data->sec;
+            inp_sec = data->sec + 2;
+        } else {
+            weight_sec = data->sec;
+            inp_sec = data->sec;
+        }
+        break;
+    case 0x1100:
+        if (data->sec_reuse) {
+            weight_sec = data->sec + 2;
+            inp_sec = data->sec + 2;
+        } else {
+            weight_sec = data->sec + 2;
+            inp_sec = data->sec;
+        }
+        break;
+    case 0x0111:
+        weight_sec = data->sec;
+        inp_sec = data->sec;
+        break;
+    case 0x1110:
+        weight_sec = data->sec + 1;
+        inp_sec = data->sec;
+        break;
+    default:
+        weight_sec = data->sec;
+        inp_sec = data->sec;
+        break;
+    }
     
     for (uint32_t i = data->start_i; i < data->end_i; i++) {
-        data->full_prec_res[i] += (int32_t)data->Xi_buf[data->j + data->sec * 128] * 
-                                  (int32_t)data->weights[512 * 512 * data->layer + i + 512 * (data->j + data->sec * 128)];
+        data->full_prec_res[i] += (int32_t)data->Xi_buf[data->j + inp_sec * 128] * 
+                                  (int32_t)data->weights[512 * 512 * data->layer + i + 512 * (data->j + weight_sec * 128)];
     }
     
     pthread_exit(NULL);
@@ -36,12 +88,13 @@ Pcm_HWPE_Engine::Pcm_HWPE_Engine() {
 	this->pcm = (Pcm_HWPE *) NULL;
 }
 
-void Pcm_HWPE_Engine::compute_mvm(Pcm_HWPE *pcm) {
+void Pcm_HWPE_Engine::compute_mvm(Pcm_HWPE *pcm, uint16_t sec_mask, bool sec_reuse, uint8_t sec_rep) {
     this->pcm = pcm;
 
     int32_t full_prec_res[512];
     uint8_t layer;
-    uint8_t active_sectors[4] = {0, 0, 0, 0};
+    uint8_t sectors[4] = {0, 0, 0, 0};
+    uint8_t active_sectors = 0;
     
     // Initialize accumulators
     for (uint32_t i=0; i<512; i++){
@@ -49,56 +102,59 @@ void Pcm_HWPE_Engine::compute_mvm(Pcm_HWPE *pcm) {
     }
 
     // Detect active sectors
-    active_sectors[0] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_0>>2]) & 0x0F;
-    active_sectors[1] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_1>>2]) & 0x0F;
-    active_sectors[2] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_2>>2]) & 0x0F;
-    active_sectors[3] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_3>>2]) & 0x0F;
+    sectors[0] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_0>>2]) & 0x0F;
+    sectors[1] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_1>>2]) & 0x0F;
+    sectors[2] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_2>>2]) & 0x0F;
+    sectors[3] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_3>>2]) & 0x0F;
     
     for (uint32_t sec=0; sec<4; sec++){
-        pcm->trace.msg(vp::TraceLevel::DEBUG, "sector[%d] = %x\n", sec, active_sectors[sec]);
+        pcm->trace.msg(vp::TraceLevel::DEBUG, "sector[%d] = %x\n", sec, sectors[sec]);
+        if (sectors[sec] != 0) {
+            active_sectors++;
+        }
     }
 
     // Detect active layer
     layer = this->pcm->register_file[PCM_HWPE_ACT_LAYER>>2] & 0xFF;
 
     // Compute MVM - only signed MVM implemented
-    for (uint32_t sec=0; sec<4; sec++){
-        if (active_sectors[sec] != 0){
-            pcm->trace.msg(vp::TraceLevel::DEBUG, "sector %d is active\n", sec);
-            for (uint32_t j=0; j<128; j++){
-                // Parallelize the innermost loop with pthreads
-                pthread_t threads[NUM_THREADS];
-                MvmThreadData thread_data[NUM_THREADS];
-                uint32_t items_per_thread = 512 / NUM_THREADS;
+    for (uint32_t sec=0; sec<active_sectors; sec++) {
+        for (uint32_t j=0; j<128; j++){
+            // Parallelize the innermost loop with pthreads
+            pthread_t threads[NUM_THREADS];
+            MvmThreadData thread_data[NUM_THREADS];
+            uint32_t items_per_thread = 512 / NUM_THREADS;
+            
+            // Create threads
+            for (int t = 0; t < NUM_THREADS; t++) {
+                thread_data[t].full_prec_res = full_prec_res;
+                thread_data[t].Xi_buf = this->Xi_buf;
+                thread_data[t].weights = this->weights;
+                thread_data[t].j = j;
+                thread_data[t].sec = sec;
+                thread_data[t].sec_reuse = sec_reuse;
+                thread_data[t].sec_mask = sec_mask;
+                thread_data[t].sec_rep = sec_rep;
+                thread_data[t].layer = layer;
+                thread_data[t].start_i = t * items_per_thread;
+                thread_data[t].end_i = (t == NUM_THREADS - 1) ? 512 : (t + 1) * items_per_thread;
                 
-                // Create threads
-                for (int t = 0; t < NUM_THREADS; t++) {
-                    thread_data[t].full_prec_res = full_prec_res;
-                    thread_data[t].Xi_buf = this->Xi_buf;
-                    thread_data[t].weights = this->weights;
-                    thread_data[t].j = j;
-                    thread_data[t].sec = sec;
-                    thread_data[t].layer = layer;
-                    thread_data[t].start_i = t * items_per_thread;
-                    thread_data[t].end_i = (t == NUM_THREADS - 1) ? 512 : (t + 1) * items_per_thread;
-                    
-                    pthread_create(&threads[t], NULL, mvm_thread_worker, &thread_data[t]);
-                }
-                
-                // Wait for all threads to complete
-                for (int t = 0; t < NUM_THREADS; t++) {
-                    pthread_join(threads[t], NULL);
-                }
+                pthread_create(&threads[t], NULL, mvm_thread_worker, &thread_data[t]);
+            }
+            
+            // Wait for all threads to complete
+            for (int t = 0; t < NUM_THREADS; t++) {
+                pthread_join(threads[t], NULL);
             }
         }
     }
 
     // Just for first debug purposes - REMOVE!!
-    /* for (uint32_t i=0; i<512; i++){
-        pcm->trace.msg(vp::TraceLevel::DEBUG, "full_prec_res[%d] = %d\n", i, full_prec_res[i]);
-    } */
+    for (uint32_t i=0; i<512; i++){
+        this->pcm->trace.msg(vp::TraceLevel::DEBUG, "full_prec_res[%d] = %d\n", i, full_prec_res[i]);
+    }
 
-    // Cast full precision results to 8 bit 
+    // Cast full precision results to 8 bit and write to output buffer
     for (uint32_t i=0; i<512; i++){
         this->Yi[i] = std::max(-128, std::min(full_prec_res[i], 127));
     }
@@ -116,22 +172,51 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
     int             *latency
 ){     
     this->pcm = pcm;
+    uint8_t sectors[4] = {0,0,0,0};
+    uint8_t active_sectors = 0;
+    uint8_t sec_reps = 0;
+    uint16_t sec_mask = 0;
+    
+    // Detect active sectors
+    sectors[0] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_0>>2]) & 0x0F;
+    sectors[1] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_1>>2]) & 0x0F;
+    sectors[2] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_2>>2]) & 0x0F;
+    sectors[3] = (this->pcm->register_file[PCM_HWPE_ACT_SECT_3>>2]) & 0x0F;
+    
+    for (uint32_t sec=0; sec<4; sec++){
+        pcm->trace.msg(vp::TraceLevel::DEBUG, "sector[%d] = %x\n", sec, sectors[sec]);
+        if(sectors[sec] != 0){
+            active_sectors++;
+        }
+
+        sec_mask |= (sectors[sec] != 0) << (sec*4);
+    }
+
+    this->pcm->trace.msg(vp::TraceLevel::DEBUG, "sec_mask = %.4x\n", sec_mask);
+
+    // Calculate the re-use factor of each sector
+    sec_reps = 4/active_sectors;
+
+    // Refill factor, i.e. number of 64-bit requests to do to fill the Xi buffer for 1 computation
+    uint8_t refill_factor = 8 - (8 % active_sectors);
 
     // Clear HWPE status register
     this->pcm->register_file[PCM_HWPE_STATUS>>2] = 0x0;
 
     this->pcm->trace.msg(vp::TraceLevel::DEBUG, "HWPE_STATUS = 0x%x\n", this->pcm->register_file[PCM_HWPE_STATUS>>2]);
     
+    this->pcm->trace.msg(vp::TraceLevel::DEBUG, "active_sectors = %d,sec_reps = %d, refill_factor= %d\n", active_sectors, sec_reps, refill_factor);
+
     // Initial fill of the Xi buffer
     this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Filling Xi buffer\n");
-    for (int8_t i = 0; i<8; i++)
+    for (int8_t i = 0; i<refill_factor; i++)
         *latency += this->pcm->inp_stream.rw_data(64, (void *)(this->Xi_buf+i*64), -1);
 
     // Read Xi buffer - just for debugging
-    /* for (int i = 0; i < 512; i++)
+    for (int i = 0; i < 512; i++)
     {
         this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] = %d\n", i, (int8_t)this->Xi_buf[i]);
-    } */
+    }
     
 
     /********************************************************************************************
@@ -140,7 +225,7 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
     * the MVM computation so we pay only the latency related to the actual computation of each  *
     * MVM.                                                                                      *
     ********************************************************************************************/
-    this->compute_mvm(this->pcm);
+    this->compute_mvm(this->pcm, sec_mask, false, 0);
     *latency += this->mvm_latency;
 
     this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Streaming out results...\n");
@@ -148,21 +233,56 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
         this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
     }
 
+    // Weights re-use
+    if (sec_reps > 1) {
+        for (uint8_t rep=1; rep<sec_reps; rep++) {
+
+            this->compute_mvm(this->pcm, sec_mask, true, rep);
+            *latency += this->mvm_latency;
+
+            this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Streaming out results...\n");
+            for (uint32_t i=0; i<8; i++) {
+                this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
+            }
+        }
+    }
+
     for(uint32_t j=1; j<(this->pcm->register_file[PCM_HWPE_NUM_JOBS >> 2]); j++) {
         // Refill Xi buffer
-        for (int8_t i = 0; i<8; i++) {
+        for (int8_t i = 0; i<refill_factor; i++) {
             this->pcm->inp_stream.rw_data(64, (void *)(this->Xi_buf+i*64), -1);
         }
 
+        // Reading Xi buffer, just for debugging
+        for (int i = 0; i < 512; i++)
+        {
+            this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Xi_buf[%d] = %d\n", i, (int8_t)this->Xi_buf[i]);
+        }
+
         // Compute MVM
-        this->compute_mvm(this->pcm);
+        this->compute_mvm(this->pcm, sec_mask, false, 0);
         *latency += mvm_latency;
 
         // Stream outputs (we take into account the latency for the last stream out)
         this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Streaming out results...\n");
         if(j<(this->pcm->register_file[PCM_HWPE_NUM_JOBS >> 2])-1) {
             for (uint32_t i=0; i<8; i++) {
-            this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
+                this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
+            }
+        }
+
+        // Weights re-use
+        if (sec_reps > 1) {
+            for (uint8_t rep=1; rep<sec_reps; rep++) {
+                this->compute_mvm(this->pcm, sec_mask, true, rep);
+                *latency += this->mvm_latency;
+
+                this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Streaming out results...\n");
+                if(j<(this->pcm->register_file[PCM_HWPE_NUM_JOBS >> 2])-1) {
+                    for (uint32_t i=0; i<8; i++) {
+                        this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
+                    }
+                }
             }
         }
     }
@@ -175,7 +295,7 @@ vp::IoReqStatus Pcm_HWPE_Engine::handle_compute(
     // Last stream out: we take into account the latency for this data movement
     this->pcm->trace.msg(vp::TraceLevel::DEBUG, "Streaming out results...\n");
     for (uint32_t i=0; i<8; i++) {
-    *latency+=this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
+        *latency+=this->pcm->out_stream.rw_data(64, (void *)(this->Yi+64*i), -1);
     }
    
     return vp::IO_REQ_OK;
