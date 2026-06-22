@@ -30,9 +30,14 @@ class DemocritosArch:
     RESERVED_ADDR_START     = EVENT_UNIT_ADDR_END + 1
     RESERVED_SIZE           = 0x0000_E7FF
     RESERVED_ADDR_END       = RESERVED_ADDR_START + RESERVED_SIZE
+    # A-tile-local HWPE address segment (PCM)
     PCM_START               = RESERVED_ADDR_END + 1
     PCM_SIZE                = 0x0000_00DF
     PCM_END                 = PCM_START + PCM_SIZE
+    # D-tile-local HWPE address segment (DIMC) -- same tile-local position as PCM
+    DIMC_START              = PCM_START
+    DIMC_SIZE               = PCM_SIZE
+    DIMC_END                = PCM_END
     STACK_ADDR_START        = PCM_END + 1
     STACK_SIZE              = 0x0000_FFFF
     STACK_ADDR_END          = STACK_ADDR_START + STACK_SIZE
