@@ -41,6 +41,11 @@ class Dimc_Macro {
         int32_t compute_PP(int row_sel);
         int32_t final_compute(int32_t bias);
 
+        // Double-buffer ping-pong scheduling
+        void issue(int row, int32_t bias);
+        void tick();
+        bool can_accept() const;
+
         // Runtime configuration
         uint8_t  compe      = DIMC_COMPE_COMPUTE;
         uint8_t  ci         = DIMC_CI_8BIT;
@@ -55,6 +60,14 @@ class Dimc_Macro {
         // Outputs
         int32_t  psout = 0;
         uint8_t  sout  = 0;
+
+        // Ping-pong pipeline state
+        bool     busy             = false;
+        bool     kb_ready         = false;
+        bool     fb_ready         = false;
+        bool     result_ready     = false;
+        int      row_assigned     = -1;
+        int      cycles_remaining = 0;
 };
 
 #endif

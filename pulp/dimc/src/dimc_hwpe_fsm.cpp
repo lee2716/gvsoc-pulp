@@ -6,6 +6,8 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     Dimc_HWPE *_this = (Dimc_HWPE *)__this;
 
+    _this->trace.msg(vp::TraceLevel::WARNING, "DIMC job start\n");
+
     // Configuration of the weight (KB) input streamer
     _this->weight_stream.configure(
         _this->register_file[DIMC_HWPE_JOB_KB_SRC_ADDR >> 2],   // base_addr
@@ -60,7 +62,7 @@ void Dimc_HWPE::fsm_end_handler(vp::Block *__this, vp::ClockEvent *event)
     Dimc_HWPE *_this = (Dimc_HWPE *)__this;
     _this->state.set(DIMC_IDLE);
     _this->register_file[DIMC_HWPE_STATUS >> 2] = 0x1;
-    _this->trace.msg(vp::TraceLevel::DEBUG, "DIMC job done, STATUS=1\n");
+    _this->trace.msg(vp::TraceLevel::WARNING, "DIMC job done, STATUS=1\n");
 }
 
 void Dimc_HWPE::fsm_loop()
@@ -137,25 +139,61 @@ int Dimc_HWPE::fsm()
             this->macros[m].write_fb(buf);
         }
 
-        // Compute: for each row, cascade across macros; select sel_dimc output
+        this->trace.msg(vp::TraceLevel::WARNING, "DIMC engine loop start\n");
+
+        // Ping-pong scheduling: macros run in parallel, each cycle drain ready
+        // results, issue new rows to idle macros, then tick all macros
+        for (uint32_t m = 0; m < num_active; m++) {
+            this->macros[m].kb_ready     = true;
+            this->macros[m].fb_ready     = true;
+            this->macros[m].result_ready = false;
+            this->macros[m].busy         = false;
+            this->macros[m].cycles_remaining = 0;
+            this->macros[m].psin         = psin0;
+        }
+
         const uint32_t out_w = 4;
         uint8_t  out_buf[DIMC_MACRO_KB_LEN * out_w];
+        std::vector<int> macro_job_row(num_active, -1);
 
-        for (uint32_t r = 0; r < row_count; r++) {
-            uint32_t row_idx = (row_base + r) % DIMC_MACRO_KB_LEN;
-            int32_t  cur_psin = psin0;
+        uint32_t rows_issued = 0;
+        uint32_t rows_done   = 0;
+        uint32_t cycles      = 0;
+        uint32_t cycles_cap  = (row_count + 4) * DIMC_MACRO_LATENCY + 16;
+
+        while (rows_done < row_count && cycles < cycles_cap) {
+            // Drain ready results to the row slot the macro was issued for
             for (uint32_t m = 0; m < num_active; m++) {
-                this->macros[m].psin = cur_psin;
-                this->macros[m].compute_PP((int)row_idx);
-                this->macros[m].final_compute(bias);
-                cur_psin = this->macros[m].psout;
+                if (this->macros[m].result_ready) {
+                    int jr = macro_job_row[m];
+                    uint32_t psout_u = (uint32_t)this->macros[m].psout;
+                    std::memcpy(out_buf + jr * out_w, &psout_u, out_w);
+                    this->macros[m].result_ready = false;
+                    rows_done++;
+                }
             }
-            uint32_t sel = this->sel_dimc;
-            if (sel >= num_active) sel = num_active - 1;
-            uint32_t psout_u = (uint32_t)this->macros[sel].psout;
-            std::memcpy(out_buf + r * out_w, &psout_u, out_w);
-            latency += DIMC_MACRO_LATENCY;
+            // Issue new rows to idle macros (round-robin job-row order)
+            for (uint32_t m = 0; m < num_active && rows_issued < row_count; m++) {
+                if (this->macros[m].can_accept()) {
+                    int jr = (int)rows_issued;
+                    uint32_t row_idx = (row_base + jr) % DIMC_MACRO_KB_LEN;
+                    macro_job_row[m] = jr;
+                    this->macros[m].issue((int)row_idx, bias);
+                    rows_issued++;
+                }
+            }
+            // Advance the pipeline of every active macro
+            for (uint32_t m = 0; m < num_active; m++) {
+                this->macros[m].tick();
+            }
+            cycles++;
         }
+        latency += cycles;
+
+        this->trace.msg(vp::TraceLevel::WARNING, "DIMC engine loop end\n");
+        this->trace.msg(vp::TraceLevel::WARNING,
+            "DIMC ping-pong: num_active=%u row_count=%u cycles=%u\n",
+            num_active, row_count, cycles);
 
         // Stream the results back to L1 in 64-byte chunks
         uint32_t out_total = row_count * out_w;

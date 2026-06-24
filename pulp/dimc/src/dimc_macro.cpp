@@ -21,6 +21,41 @@ void Dimc_Macro::reset()
     this->psin      = 0;
     this->psout     = 0;
     this->sout      = 0;
+
+    this->busy             = false;
+    this->kb_ready         = false;
+    this->fb_ready         = false;
+    this->result_ready     = false;
+    this->row_assigned     = -1;
+    this->cycles_remaining = 0;
+}
+
+bool Dimc_Macro::can_accept() const
+{
+    return !this->busy && this->kb_ready && this->fb_ready && !this->result_ready;
+}
+
+void Dimc_Macro::issue(int row, int32_t bias)
+{
+    if (!this->can_accept()) return;
+
+    this->row_assigned     = row;
+    this->busy             = true;
+    this->cycles_remaining = DIMC_MACRO_LATENCY;
+
+    this->compute_PP(row);
+    this->final_compute(bias);
+}
+
+void Dimc_Macro::tick()
+{
+    if (this->busy && this->cycles_remaining > 0) {
+        this->cycles_remaining--;
+        if (this->cycles_remaining == 0) {
+            this->busy         = false;
+            this->result_ready = true;
+        }
+    }
 }
 
 void Dimc_Macro::write_row(int row, const uint8_t *src)

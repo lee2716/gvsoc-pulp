@@ -92,6 +92,7 @@ int Dimc_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
                 this->req->set_size(BYTES_PER_BANK);
             }
 
+            this->req->prepare();
             vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
             if (err != vp::IO_REQ_OK) {
                 this->dimc->trace.fatal("There was an error while reading/writing data\n");
@@ -121,7 +122,8 @@ int Dimc_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
                     this->req->set_data(((uint8_t *) buf) + i);
                     this->req->set_size(BYTES_PER_BANK);
 
-                    vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
+                    this->req->prepare();
+            vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
                     if (err != vp::IO_REQ_OK) {
                         this->dimc->trace.fatal("There was an error while reading/writing data\n");
                         return 0;
@@ -141,7 +143,8 @@ int Dimc_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
                         this->req->set_size(BYTES_PER_BANK);
                     }
 
-                    vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
+                    this->req->prepare();
+            vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
                     if (err != vp::IO_REQ_OK) {
                         this->dimc->trace.fatal("There was an error while reading/writing data\n");
                         return 0;
@@ -170,7 +173,8 @@ int Dimc_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
                 }
 
                 if (req->get_size() != 0) {
-                    vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
+                    this->req->prepare();
+            vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
                     if (err != vp::IO_REQ_OK) {
                         this->dimc->trace.fatal("There was an error while reading/writing data\n");
                         return 0;
