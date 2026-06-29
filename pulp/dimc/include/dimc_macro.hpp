@@ -2,12 +2,20 @@
 #define __DIMC_MACRO_HPP__
 
 #include <cstdint>
+#include <deque>
 
-// DIMC macro design parameters (ARCHYTAS PDF)
+// DIMC macro design parameters
 #define DIMC_MACRO_KB_LEN   32
 #define DIMC_MACRO_KB_EW    128
 #define DIMC_MACRO_FB_EW    128
-#define DIMC_MACRO_LATENCY  5
+// Pipeline depth: 4 cycles per spatz_DIMC.sv (1 result/cycle throughput after fill)
+#define DIMC_MACRO_LATENCY  4
+
+struct DimcPipeEntry {
+    int32_t  psout;
+    int      job_row;
+    int      cycles_remaining;
+};
 
 // Compute mode
 #define DIMC_COMPE_MEM      0
@@ -41,10 +49,13 @@ class Dimc_Macro {
         int32_t compute_PP(int row_sel);
         int32_t final_compute(int32_t bias);
 
-        // Double-buffer ping-pong scheduling
-        void issue(int row, int32_t bias);
+        // Pipelined scheduling: issue is non-blocking unless pipeline is full;
+        // tick advances the pipeline; has_ready/drain pop the front entry
+        void issue(int row, int job_row, int32_t bias);
         void tick();
         bool can_accept() const;
+        bool has_ready() const;
+        DimcPipeEntry drain();
 
         // Runtime configuration
         uint8_t  compe      = DIMC_COMPE_COMPUTE;
@@ -61,13 +72,10 @@ class Dimc_Macro {
         int32_t  psout = 0;
         uint8_t  sout  = 0;
 
-        // Ping-pong pipeline state
-        bool     busy             = false;
+        // Pipeline state: in-flight entries waiting to drain
+        std::deque<DimcPipeEntry> pipe;
         bool     kb_ready         = false;
         bool     fb_ready         = false;
-        bool     result_ready     = false;
-        int      row_assigned     = -1;
-        int      cycles_remaining = 0;
 };
 
 #endif

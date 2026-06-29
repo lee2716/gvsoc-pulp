@@ -22,40 +22,43 @@ void Dimc_Macro::reset()
     this->psout     = 0;
     this->sout      = 0;
 
-    this->busy             = false;
-    this->kb_ready         = false;
-    this->fb_ready         = false;
-    this->result_ready     = false;
-    this->row_assigned     = -1;
-    this->cycles_remaining = 0;
+    this->kb_ready = false;
+    this->fb_ready = false;
+    this->pipe.clear();
 }
 
 bool Dimc_Macro::can_accept() const
 {
-    return !this->busy && this->kb_ready && this->fb_ready && !this->result_ready;
+    return this->kb_ready && this->fb_ready
+        && (int)this->pipe.size() < DIMC_MACRO_LATENCY;
 }
 
-void Dimc_Macro::issue(int row, int32_t bias)
+void Dimc_Macro::issue(int row, int job_row, int32_t bias)
 {
     if (!this->can_accept()) return;
 
-    this->row_assigned     = row;
-    this->busy             = true;
-    this->cycles_remaining = DIMC_MACRO_LATENCY;
-
     this->compute_PP(row);
     this->final_compute(bias);
+    this->pipe.push_back({this->psout, job_row, DIMC_MACRO_LATENCY});
 }
 
 void Dimc_Macro::tick()
 {
-    if (this->busy && this->cycles_remaining > 0) {
-        this->cycles_remaining--;
-        if (this->cycles_remaining == 0) {
-            this->busy         = false;
-            this->result_ready = true;
-        }
+    for (auto &e : this->pipe) {
+        e.cycles_remaining--;
     }
+}
+
+bool Dimc_Macro::has_ready() const
+{
+    return !this->pipe.empty() && this->pipe.front().cycles_remaining <= 0;
+}
+
+DimcPipeEntry Dimc_Macro::drain()
+{
+    DimcPipeEntry e = this->pipe.front();
+    this->pipe.pop_front();
+    return e;
 }
 
 void Dimc_Macro::write_row(int row, const uint8_t *src)

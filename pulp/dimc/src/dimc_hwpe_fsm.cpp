@@ -141,48 +141,45 @@ int Dimc_HWPE::fsm()
 
         this->trace.msg(vp::TraceLevel::WARNING, "DIMC engine loop start\n");
 
-        // Ping-pong scheduling: macros run in parallel, each cycle drain ready
-        // results, issue new rows to idle macros, then tick all macros
+        // Pipelined scheduling: each macro keeps a 4-deep shift-register
+        // pipeline (1 result/cycle throughput after a 4-cycle fill). The
+        // wrapper each cycle drains any ready results, issues new rows to
+        // macros that can accept, then ticks all macros.
         for (uint32_t m = 0; m < num_active; m++) {
-            this->macros[m].kb_ready     = true;
-            this->macros[m].fb_ready     = true;
-            this->macros[m].result_ready = false;
-            this->macros[m].busy         = false;
-            this->macros[m].cycles_remaining = 0;
-            this->macros[m].psin         = psin0;
+            this->macros[m].kb_ready = true;
+            this->macros[m].fb_ready = true;
+            this->macros[m].pipe.clear();
+            this->macros[m].psin     = psin0;
         }
 
         const uint32_t out_w = 4;
         uint8_t  out_buf[DIMC_MACRO_KB_LEN * out_w];
-        std::vector<int> macro_job_row(num_active, -1);
 
         uint32_t rows_issued = 0;
         uint32_t rows_done   = 0;
         uint32_t cycles      = 0;
-        uint32_t cycles_cap  = (row_count + 4) * DIMC_MACRO_LATENCY + 16;
+        uint32_t cycles_cap  = row_count + DIMC_MACRO_LATENCY * 4 + 16;
 
         while (rows_done < row_count && cycles < cycles_cap) {
-            // Drain ready results to the row slot the macro was issued for
+            // Drain every macro head whose pipeline front is ready
             for (uint32_t m = 0; m < num_active; m++) {
-                if (this->macros[m].result_ready) {
-                    int jr = macro_job_row[m];
-                    uint32_t psout_u = (uint32_t)this->macros[m].psout;
-                    std::memcpy(out_buf + jr * out_w, &psout_u, out_w);
-                    this->macros[m].result_ready = false;
+                while (this->macros[m].has_ready()) {
+                    DimcPipeEntry e = this->macros[m].drain();
+                    uint32_t psout_u = (uint32_t)e.psout;
+                    std::memcpy(out_buf + e.job_row * out_w, &psout_u, out_w);
                     rows_done++;
                 }
             }
-            // Issue new rows to idle macros (round-robin job-row order)
+            // Issue new rows round-robin to macros that can accept
             for (uint32_t m = 0; m < num_active && rows_issued < row_count; m++) {
                 if (this->macros[m].can_accept()) {
                     int jr = (int)rows_issued;
                     uint32_t row_idx = (row_base + jr) % DIMC_MACRO_KB_LEN;
-                    macro_job_row[m] = jr;
-                    this->macros[m].issue((int)row_idx, bias);
+                    this->macros[m].issue((int)row_idx, jr, bias);
                     rows_issued++;
                 }
             }
-            // Advance the pipeline of every active macro
+            // Advance every active macro pipeline by one cycle
             for (uint32_t m = 0; m < num_active; m++) {
                 this->macros[m].tick();
             }
