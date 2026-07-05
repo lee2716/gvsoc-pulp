@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Author: Cong Li <cong.li3@unibo.it>
-#
 
 import gvsoc.systree
 
