@@ -1,6 +1,5 @@
 #include <dimc.hpp>
 
-#define BYTES_PER_BANK 4
 
 Dimc_HWPE_Streamer::Dimc_HWPE_Streamer(Dimc_HWPE* dimc, bool is_write) {
     this->dimc = dimc;
@@ -67,161 +66,45 @@ void Dimc_HWPE_Streamer::configure(
 
 void Dimc_HWPE_Streamer::set_base_addr(uint32_t addr) { this->base_addr = addr; }
 uint32_t Dimc_HWPE_Streamer::get_base_addr() { return this->base_addr; }
-bool Dimc_HWPE_Streamer::is_done() { return this->tot_iters == this->tot_len; }
+// tot_len is a BYTE count; the linear DIMC stream is done once pos (bytes
+// consumed from base) reaches it. This keeps termination independent of the
+// per-call chunk size, which can be swept at run time.
+bool Dimc_HWPE_Streamer::is_done() { return this->pos >= this->tot_len; }
 
 int Dimc_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
     uint32_t offs = (this->base_addr + this->pos);
-    int64_t latency = 0;
-    int64_t max_latency = 0;
-    uint32_t tmp = 0;
 
     if (this->is_done()) {
         return 1;
     }
 
+    // Functional transfer: one request of `width` bytes. The tile L1 interleaver
+    // (HWPEInterleaver) splits it across the 32 word-interleaved TCDM banks; we
+    // only need the data movement here and model the timing ourselves below.
     if (buf != NULL) {
-        if (offs % BYTES_PER_BANK != 0) {
-            if (this->is_write) {
-                this->req->set_addr(offs);
-                this->req->set_data((uint8_t *) buf);
-                this->req->set_size(BYTES_PER_BANK - (offs % BYTES_PER_BANK));
-                strb = strb >> (BYTES_PER_BANK - (offs % BYTES_PER_BANK));
-            } else {
-                this->req->set_addr(offs - (offs % BYTES_PER_BANK));
-                this->req->set_data((uint8_t *) &tmp);
-                this->req->set_size(BYTES_PER_BANK);
-            }
-
-            this->req->prepare();
-            vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
-            if (err != vp::IO_REQ_OK) {
-                this->dimc->trace.fatal("There was an error while reading/writing data\n");
-                return 0;
-            }
-            latency = req->get_latency();
-
-            if (!this->is_write) {
-                for (int i = 0; i < BYTES_PER_BANK - (offs % BYTES_PER_BANK); i++) {
-                    if (strb & 0x1) {
-                        *(((uint8_t *) buf) + i) = *(((uint8_t *) &tmp) + i + (offs % BYTES_PER_BANK));
-                    }
-                    strb = strb >> 1;
-                }
-            }
-            max_latency = latency > max_latency ? latency : max_latency;
-        }
-
-        for (int i = (offs % BYTES_PER_BANK) == 0 ? 0 : BYTES_PER_BANK - (offs % BYTES_PER_BANK);
-             i < width; i += BYTES_PER_BANK)
-        {
-            if (strb == 0) break;
-
-            if (i + BYTES_PER_BANK <= width) {
-                if ((strb & 0xF) == 0xF) {
-                    this->req->set_addr(offs + i);
-                    this->req->set_data(((uint8_t *) buf) + i);
-                    this->req->set_size(BYTES_PER_BANK);
-
-                    this->req->prepare();
-            vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
-                    if (err != vp::IO_REQ_OK) {
-                        this->dimc->trace.fatal("There was an error while reading/writing data\n");
-                        return 0;
-                    }
-                    latency = req->get_latency();
-                    strb = strb >> BYTES_PER_BANK;
-                } else {
-                    if (this->is_write) {
-                        int ones = sizeof(uint64_t) * 8 - __builtin_clzll(strb);
-                        this->req->set_addr(offs + i);
-                        this->req->set_data(((uint8_t *) buf) + i);
-                        this->req->set_size(ones);
-                        strb = strb >> BYTES_PER_BANK;
-                    } else {
-                        this->req->set_addr(offs + i);
-                        this->req->set_data((uint8_t *) &tmp);
-                        this->req->set_size(BYTES_PER_BANK);
-                    }
-
-                    this->req->prepare();
-            vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
-                    if (err != vp::IO_REQ_OK) {
-                        this->dimc->trace.fatal("There was an error while reading/writing data\n");
-                        return 0;
-                    }
-                    latency = req->get_latency();
-
-                    if (!this->is_write) {
-                        for (int j = 0; j < BYTES_PER_BANK; j++) {
-                            if (strb & 0x1) {
-                                *(((uint8_t *) buf) + j + i) = *(((uint8_t *) &tmp) + j);
-                            }
-                            strb = strb >> 1;
-                        }
-                    }
-                }
-            } else {
-                if (this->is_write) {
-                    int ones = sizeof(uint64_t) * 8 - __builtin_clzll(strb);
-                    this->req->set_addr(offs + i);
-                    this->req->set_data(((uint8_t *) buf) + i);
-                    this->req->set_size(ones > width - i ? width - i : ones);
-                } else {
-                    this->req->set_addr(offs + i);
-                    this->req->set_data((uint8_t *) &tmp);
-                    this->req->set_size(BYTES_PER_BANK);
-                }
-
-                if (req->get_size() != 0) {
-                    this->req->prepare();
-            vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
-                    if (err != vp::IO_REQ_OK) {
-                        this->dimc->trace.fatal("There was an error while reading/writing data\n");
-                        return 0;
-                    }
-                    latency = req->get_latency();
-                } else {
-                    latency = 0;
-                }
-
-                if (!this->is_write) {
-                    for (int j = 0; j < width - i; j++) {
-                        if (strb & 0x1) {
-                            *(((uint8_t *) buf) + j + i) = *(((uint8_t *) &tmp) + j);
-                        }
-                        strb = strb >> 1;
-                    }
-                }
-            }
-            max_latency = latency > max_latency ? latency : max_latency;
+        this->req->prepare();
+        this->req->set_addr(offs);
+        this->req->set_data((uint8_t *) buf);
+        this->req->set_size(width);
+        vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
+        if (err != vp::IO_REQ_OK) {
+            this->dimc->trace.fatal("There was an error while reading/writing data\n");
+            return 0;
         }
     }
 
-    this->pos += this->d0_stride;
-    this->d0_iters++;
+    this->pos += (uint32_t)width;
     this->tot_iters++;
 
-    if (this->d0_len != 0 && this->d0_iters == this->d0_len) {
-        this->pos -= this->d0_len * this->d0_stride;
-        this->pos += this->d1_stride;
-        this->d0_iters = 0;
-        this->d1_iters++;
-
-        if (this->d1_len != 0 && this->d1_iters == this->d1_len) {
-            this->pos -= this->d1_len * this->d1_stride;
-            this->pos += this->d2_stride;
-            this->d1_iters = 0;
-            this->d2_iters++;
-
-            if (this->d2_len != 0 && this->d2_iters == this->d2_len) {
-                this->pos -= this->d2_len * this->d2_stride;
-                this->pos += this->d3_stride;
-                this->d2_iters = 0;
-            }
-        }
-    }
-
-    return (int) max_latency + 1;
+    // ---- L1 bandwidth + bank-conflict timing model ----
+    // The TCDM delivers  l1_bw = (nb_banks * bank_width)  bytes per cycle for an
+    // aligned contiguous access. A request wider than l1_bw hits some banks more
+    // than once (intra-request bank conflict) and serialises into ceil(width/l1_bw)
+    // cycles. stream_bank_bytes carries l1_bw (bytes/cycle, default 128 = 32*4).
+    uint32_t l1_bw = this->dimc->stream_bank_bytes;
+    if (l1_bw == 0) l1_bw = 128;
+    int transfer = ((int)width + (int)l1_bw - 1) / (int)l1_bw;   // ceil, >=1
+    return transfer + (int) this->dimc->stream_sync;
 }
 
 int Dimc_HWPE_Streamer::iterate(void* buf, strobe_t strb) {

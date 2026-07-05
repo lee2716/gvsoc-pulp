@@ -8,6 +8,10 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
 
     _this->trace.msg(vp::TraceLevel::WARNING, "DIMC job start\n");
 
+    // Clear STATUS at job start so a back-to-back trigger (e.g. reuse without a
+    // soft_clear) does not see the previous job's STATUS=1 and exit polling early.
+    _this->register_file[DIMC_HWPE_STATUS >> 2] = 0x0;
+
     // Configuration of the weight (KB) input streamer
     _this->weight_stream.configure(
         _this->register_file[DIMC_HWPE_JOB_KB_SRC_ADDR >> 2],   // base_addr
@@ -102,6 +106,9 @@ int Dimc_HWPE::fsm()
             m.sign_mode = sign_mode;
             m.mct       = mct;
         }
+        // Streamer bandwidth (chunk / l1bw / sync) is a fixed hardware property,
+        // set once from the systree / gvrun --param (this->stream_*), not per
+        // trigger. Nothing to read here.
         next_state = DIMC_EXEC;
         break;
     }
@@ -116,91 +123,143 @@ int Dimc_HWPE::fsm()
         int32_t  bias       = (int32_t)this->register_file[DIMC_HWPE_CFG_BIAS >> 2];
         int32_t  psin0      = (int32_t)this->register_file[DIMC_HWPE_PSIN     >> 2];
 
-        uint8_t buf[DIMC_MACRO_KB_EW];
+        const uint32_t out_w = 4;
+        uint8_t  buf[DIMC_MACRO_KB_EW];
+        uint8_t  out_buf[DIMC_MACRO_KB_LEN * out_w];
+        const uint32_t compute_cyc = row_count + DIMC_MACRO_LATENCY;   // 36 @ row=32
 
-        // Load KB rows from L1; broadcast each row to all active macros' KB
-        for (uint32_t r = 0; r < row_count; r++) {
-            for (uint32_t off = 0; off < DIMC_MACRO_KB_EW; off += 64) {
-                int l = this->weight_stream.rw_data(64, (void *)(buf + off), (strobe_t)-1);
-                latency += l;
-            }
-            uint32_t row_idx = (row_base + r) % DIMC_MACRO_KB_LEN;
-            for (uint32_t m = 0; m < num_active; m++) {
-                this->macros[m].write_row((int)row_idx, buf);
-            }
-        }
+        // Double-buffer: each active macro processes its OWN matvec (own kernel +
+        // own feature + own output, NO broadcast). One shared streamer (single L1
+        // port) serialises all traffic, N compute pipelines run in parallel.
+        //
+        // For real load/compute overlap the schedule front-loads ALL loads on the
+        // streamer (loads have priority), each compute starts when its own load is
+        // done, and the OUT writebacks are drained afterwards (results are held in
+        // the output FIFO). This lets macro m+1's load run DURING macro m's compute
+        // instead of waiting behind macro m's OUT.
+        // Reuse auto-detect (weight-stationary): the KERNEL (weights) is the big
+        // 32-row load. If this trigger's KB source address matches the previously
+        // loaded one, the weights are still resident in the IMC array, so that
+        // load is skipped -- exactly like a real weight cache. A soft_clear or a
+        // different address forces a reload.
+        //
+        // The FEATURE (activations) is ALWAYS streamed fresh: a new matvec means
+        // new inputs. Keeping the feature load flowing is what keeps the double
+        // buffer alive during weight reuse -- each macro's compute overlaps the
+        // NEXT macro's feature load, so reuse converts the pipeline from
+        // weight-load-bound into feature-stream / compute bound instead of
+        // collapsing it (which would happen if we skipped all loads).
+        uint32_t kb_src  = this->register_file[DIMC_HWPE_JOB_KB_SRC_ADDR >> 2];
+        bool     skip_kb = (kb_src == this->last_kb_src);
+        bool     skip_fb = false;   // activations always stream (double buffer stays alive)
+        this->last_kb_src = kb_src;
 
-        // Load FB once; broadcast to all active macros' FB
-        for (uint32_t off = 0; off < DIMC_MACRO_FB_EW; off += 64) {
-            int l_fb = this->input_stream.rw_data(64, (void *)(buf + off), (strobe_t)-1);
-            latency += l_fb;
-        }
+        std::vector<uint32_t> load_lat(num_active, 0);
+        std::vector<uint32_t> out_lat (num_active, 0);
+
         for (uint32_t m = 0; m < num_active; m++) {
-            this->macros[m].write_fb(buf);
-        }
+            // --- Load THIS macro's own kernel (no broadcast) ---
+            // width clamped to the row boundary so a chunk wider than the row does
+            // not overrun the buffer (chunk >= row => one row per call).
+            uint32_t kb_lat = 0;
+            if (!skip_kb) {
+                for (uint32_t r = 0; r < row_count; r++) {
+                    for (uint32_t off = 0; off < DIMC_MACRO_KB_EW; off += this->stream_chunk_bytes) {
+                        uint32_t w = DIMC_MACRO_KB_EW - off;
+                        if (w > this->stream_chunk_bytes) w = this->stream_chunk_bytes;
+                        kb_lat += this->weight_stream.rw_data((int)w, (void *)(buf + off), (strobe_t)-1);
+                    }
+                    uint32_t row_idx = (row_base + r) % DIMC_MACRO_KB_LEN;
+                    this->macros[m].write_row((int)row_idx, buf);   // ★ only macro m
+                }
+            }
+            // else: macro[m].KB keeps the resident kernel from a previous trigger.
 
-        this->trace.msg(vp::TraceLevel::WARNING, "DIMC engine loop start\n");
-
-        // Pipelined scheduling: each macro keeps a 4-deep shift-register
-        // pipeline (1 result/cycle throughput after a 4-cycle fill). The
-        // wrapper each cycle drains any ready results, issues new rows to
-        // macros that can accept, then ticks all macros.
-        for (uint32_t m = 0; m < num_active; m++) {
+            // --- Load THIS macro's own feature ---
+            uint32_t fb_lat = 0;
+            if (!skip_fb) {
+                for (uint32_t off = 0; off < DIMC_MACRO_FB_EW; off += this->stream_chunk_bytes) {
+                    uint32_t w = DIMC_MACRO_FB_EW - off;
+                    if (w > this->stream_chunk_bytes) w = this->stream_chunk_bytes;
+                    fb_lat += this->input_stream.rw_data((int)w, (void *)(buf + off), (strobe_t)-1);
+                }
+                this->macros[m].write_fb(buf);                  // ★ only macro m
+            }
+            // else: macro[m].FB keeps the resident feature from a previous trigger.
             this->macros[m].kb_ready = true;
             this->macros[m].fb_ready = true;
             this->macros[m].pipe.clear();
             this->macros[m].psin     = psin0;
-        }
 
-        const uint32_t out_w = 4;
-        uint8_t  out_buf[DIMC_MACRO_KB_LEN * out_w];
-
-        uint32_t rows_issued = 0;
-        uint32_t rows_done   = 0;
-        uint32_t cycles      = 0;
-        uint32_t cycles_cap  = row_count + DIMC_MACRO_LATENCY * 4 + 16;
-
-        while (rows_done < row_count && cycles < cycles_cap) {
-            // Drain every macro head whose pipeline front is ready
-            for (uint32_t m = 0; m < num_active; m++) {
+            // --- Compute THIS macro's matvec through its 4-deep pipeline ---
+            uint32_t rows_issued = 0, rows_done = 0, cyc = 0;
+            uint32_t cap = row_count + DIMC_MACRO_LATENCY * 4 + 16;
+            while (rows_done < row_count && cyc < cap) {
                 while (this->macros[m].has_ready()) {
                     DimcPipeEntry e = this->macros[m].drain();
                     uint32_t psout_u = (uint32_t)e.psout;
                     std::memcpy(out_buf + e.job_row * out_w, &psout_u, out_w);
                     rows_done++;
                 }
-            }
-            // Issue new rows round-robin to macros that can accept
-            for (uint32_t m = 0; m < num_active && rows_issued < row_count; m++) {
-                if (this->macros[m].can_accept()) {
-                    int jr = (int)rows_issued;
-                    uint32_t row_idx = (row_base + jr) % DIMC_MACRO_KB_LEN;
-                    this->macros[m].issue((int)row_idx, jr, bias);
+                if (rows_issued < row_count && this->macros[m].can_accept()) {
+                    uint32_t row_idx = (row_base + rows_issued) % DIMC_MACRO_KB_LEN;
+                    this->macros[m].issue((int)row_idx, (int)rows_issued, bias);
                     rows_issued++;
                 }
-            }
-            // Advance every active macro pipeline by one cycle
-            for (uint32_t m = 0; m < num_active; m++) {
                 this->macros[m].tick();
+                cyc++;
             }
-            cycles++;
-        }
-        latency += cycles;
 
-        this->trace.msg(vp::TraceLevel::WARNING, "DIMC engine loop end\n");
+            // --- Write THIS macro's own output ---
+            uint32_t o_lat     = 0;
+            uint32_t out_total = row_count * out_w, off = 0;
+            while (off < out_total) {
+                uint32_t chunk = (out_total - off >= this->stream_chunk_bytes)
+                                     ? this->stream_chunk_bytes : (out_total - off);
+                o_lat += this->out_stream.rw_data(chunk, (void *)(out_buf + off), (strobe_t)-1);
+                off += this->stream_chunk_bytes;
+            }
+
+            // One NoC round-trip latency per streamer burst (bandwidth-independent):
+            // the input-load burst (weights+features) and the output-store burst
+            // each pay it once at the head, then the transfers pipeline behind it.
+            uint32_t noc = this->stream_noc_lat;
+            load_lat[m] = noc + kb_lat + fb_lat;   // default noc=1 -> 1+32+1 = 34 (non-reuse)
+            out_lat[m]  = noc + o_lat;
+        }
+
+        // ---- Overlapped timeline accounting ----
+        // 1) Loads back-to-back on the shared streamer (single L1 port). This is
+        //    the throughput bottleneck: 34 cycles of data load per macro.
+        // 2) The N DIMC macros compute IN PARALLEL (independent in-memory-compute
+        //    arrays, not sel-muxed): compute[m] starts as soon as its OWN load is
+        //    done and runs concurrently with the other macros' computes, hidden
+        //    under the following macros' loads (classic double buffering).
+        // 3) OUTs drain on the streamer once all loads are done and each compute
+        //    is complete (results buffered in the output FIFO meanwhile).
+        uint64_t load_done = 0;
+        uint64_t finish    = 0;
+        std::vector<uint64_t> compute_done(num_active, 0);
+        for (uint32_t m = 0; m < num_active; m++) {
+            load_done      += load_lat[m];                  // serial loads (bottleneck)
+            compute_done[m] = load_done + compute_cyc;      // parallel compute, overlaps next loads
+        }
+        uint64_t out_free = load_done;                       // streamer free after last load
+        for (uint32_t m = 0; m < num_active; m++) {
+            uint64_t out_start = std::max(out_free, compute_done[m]);
+            out_free = out_start + out_lat[m];
+            finish   = std::max(finish, out_free);
+            this->trace.msg(vp::TraceLevel::WARNING,
+                "macro[%u]: load=%u compute=%u OUT=%u compute_done=%lu out_done=%lu\n",
+                m, load_lat[m], compute_cyc, out_lat[m],
+                (unsigned long)compute_done[m], (unsigned long)out_free);
+        }
+
+        latency += (int)finish;
         this->trace.msg(vp::TraceLevel::WARNING,
-            "DIMC ping-pong: num_active=%u row_count=%u cycles=%u\n",
-            num_active, row_count, cycles);
-
-        // Stream the results back to L1 in 64-byte chunks
-        uint32_t out_total = row_count * out_w;
-        uint32_t off = 0;
-        while (off < out_total) {
-            uint32_t chunk = (out_total - off >= 64) ? 64 : (out_total - off);
-            int l_out = this->out_stream.rw_data(chunk, (void *)(out_buf + off), (strobe_t)-1);
-            latency += l_out;
-            off += 64;
-        }
+            "DIMC double-buffer: num_active=%u row_count=%u chunk=%u l1bw=%u total_latency=%lu\n",
+            num_active, row_count, this->stream_chunk_bytes, this->stream_bank_bytes,
+            (unsigned long)finish);
 
         this->register_file[DIMC_HWPE_FIN_JOBS >> 2] = 1;
         next_state = DIMC_FINISHED;

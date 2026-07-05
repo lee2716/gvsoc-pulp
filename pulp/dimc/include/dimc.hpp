@@ -10,7 +10,6 @@
 
 #include <dimc_hwpe_archi.hpp>
 #include <dimc_macro.hpp>
-#include <dimc_fifo.hpp>
 
 typedef uint64_t strobe_t;
 
@@ -87,19 +86,22 @@ class Dimc_HWPE : public vp::Component {
         Dimc_HWPE_Streamer input_stream;
         Dimc_HWPE_Streamer out_stream;
 
-        // FIFOs
-        Dimc_Fifo<uint8_t> weight_fifo;
-        Dimc_Fifo<uint8_t> input_fifo;
-        Dimc_Fifo<uint8_t> out_fifo;
-
         // Macros
         std::vector<Dimc_Macro> macros;
         uint8_t sel_dimc;
 
         // Configuration
         uint32_t num_macros;
-        uint32_t fifo_depth;
-        uint32_t dimc_latency;
+        // Streamer bandwidth: fixed hardware properties, set once from the
+        // systree / gvrun --param (no per-trigger MMIO override).
+        uint32_t stream_chunk_bytes;   // bytes per rw_data call (Layer 3)
+        uint32_t stream_bank_bytes;    // L1 bandwidth bytes/cycle, 32 banks*4=128 (Layer 2)
+        uint32_t stream_sync;          // per-call wrapper sync cycle (0/1)
+        uint32_t stream_noc_lat;       // NoC round-trip latency per streamer burst (bandwidth-independent)
+        // Reuse auto-detect: the KB (weight) source address of the last loaded
+        // job. A trigger whose KB address matches reuses the resident weights
+        // (skips that load), like a real weight cache. 0xFFFFFFFF = none yet.
+        uint32_t last_kb_src;
 
         // Traces
         vp::Trace trace;

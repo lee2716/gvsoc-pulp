@@ -7,13 +7,20 @@
 
 Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
 {
-    // Configuration from systree
-    this->num_macros   = (uint32_t)this->get_js_config()->get_child_int("num_macros");
-    this->fifo_depth   = (uint32_t)this->get_js_config()->get_child_int("fifo_depth");
-    this->dimc_latency = (uint32_t)this->get_js_config()->get_child_int("dimc_latency");
-    if (this->num_macros == 0) this->num_macros = 2;
-    if (this->fifo_depth == 0) this->fifo_depth = 8;
-
+    // Configuration from the systree. gvrun --param / set_stream_params set these
+    // at launch without recompiling the SW test:
+    //   make run runner_args="--param dimc_chunk=64 --param dimc_l1bw=128 --param dimc_sync=0"
+    this->num_macros         = (uint32_t)this->get_js_config()->get_child_int("num_macros");
+    this->stream_chunk_bytes = (uint32_t)this->get_js_config()->get_child_int("stream_chunk_bytes");
+    this->stream_bank_bytes  = (uint32_t)this->get_js_config()->get_child_int("stream_bank_bytes");
+    this->stream_sync        = (uint32_t)this->get_js_config()->get_child_int("stream_sync");
+    this->stream_noc_lat     = (uint32_t)this->get_js_config()->get_child_int("stream_noc_lat");
+    if (this->num_macros == 0)         this->num_macros = 2;
+    if (this->stream_chunk_bytes == 0) this->stream_chunk_bytes = 128; // 1 KB row/cycle
+    if (this->stream_bank_bytes == 0)  this->stream_bank_bytes  = 128; // 32 banks * 4 B
+    // stream_sync defaults to 0 (pipelined, RTL gnt=1). stream_noc_lat defaults
+    // to 1 (dimc.py always sets it; 0 is a valid "ideal NoC" value so not forced).
+    this->last_kb_src = 0xFFFFFFFF;   // no resident weights yet
     // HWPE slave port
     this->hwpe_slv.set_req_meth(&Dimc_HWPE::hwpe_slave);
     this->new_slave_port("hwpe_slv", &this->hwpe_slv);
@@ -25,11 +32,6 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->weight_stream = Dimc_HWPE_Streamer(this, false);
     this->input_stream  = Dimc_HWPE_Streamer(this, false);
     this->out_stream    = Dimc_HWPE_Streamer(this, true);
-
-    // FIFOs
-    this->weight_fifo.set_depth(this->fifo_depth);
-    this->input_fifo.set_depth(this->fifo_depth);
-    this->out_fifo.set_depth(this->fifo_depth);
 
     // Macros
     this->macros.resize(this->num_macros);
@@ -45,6 +47,11 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
 
     // Traces
     this->traces.new_trace("trace", &this->trace);
+
+    this->trace.msg(vp::TraceLevel::WARNING,
+        "DIMC systree config: num_macros=%u chunk=%u l1bw=%u sync=%u noc_lat=%u\n",
+        this->num_macros, this->stream_chunk_bytes,
+        this->stream_bank_bytes, this->stream_sync, this->stream_noc_lat);
 }
 
 void Dimc_HWPE::reset(bool active)
@@ -54,10 +61,8 @@ void Dimc_HWPE::reset(bool active)
             this->register_file[i] = 0x0;
         }
         for (auto &m : this->macros) m.reset();
-        this->weight_fifo.reset();
-        this->input_fifo.reset();
-        this->out_fifo.reset();
         this->sel_dimc = 0;
+        this->last_kb_src = 0xFFFFFFFF;
         this->state.set(DIMC_IDLE);
     }
 }
@@ -85,10 +90,8 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                 break;
             case DIMC_HWPE_SOFT_CLEAR:
                 for (auto &m : _this->macros) m.reset();
-                _this->weight_fifo.reset();
-                _this->input_fifo.reset();
-                _this->out_fifo.reset();
                 _this->sel_dimc = 0;
+                _this->last_kb_src = 0xFFFFFFFF;   // resident weights invalidated
                 for (uint32_t i = 0; i < N_CFG_REGS; i++)
                     _this->register_file[i] = 0x0;
                 _this->state.set(DIMC_IDLE);

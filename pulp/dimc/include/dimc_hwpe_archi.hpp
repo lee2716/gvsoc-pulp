@@ -1,7 +1,7 @@
 #ifndef __DIMC_HWPE_ARCHI__
 #define __DIMC_HWPE_ARCHI__
 
-#define N_CFG_REGS 44
+#define N_CFG_REGS 48
 
 #define DIMC_HWPE_BASE   0x0
 
@@ -46,6 +46,9 @@
 #define DIMC_HWPE_MCT                (DIMC_HWPE_BASE + 0x9C)
 #define DIMC_HWPE_PSIN               (DIMC_HWPE_BASE + 0xA0)
 
+// Streamer bandwidth (chunk/l1bw/sync) and kernel reuse are NOT MMIO: bandwidth
+// is a fixed hardware property set from the systree / gvrun --param, and reuse is
+// auto-detected in the FSM by comparing the KB/FB source address to the last job.
 #define DIMC_HWPE_REG_MAX            (DIMC_HWPE_BASE + 0xA0)
 
 #endif
