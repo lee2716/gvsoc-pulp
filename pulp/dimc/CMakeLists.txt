@@ -12,7 +12,6 @@ set(DIMC_HDRS
     "${MOD_ROOT}/include/dimc_hwpe_archi.hpp"
     "${MOD_ROOT}/include/dimc.hpp"
     "${MOD_ROOT}/include/dimc_macro.hpp"
-    "${MOD_ROOT}/include/dimc_fifo.hpp"
     )
 
 foreach(f IN LISTS DIMC_SRCS DIMC_HDRS)

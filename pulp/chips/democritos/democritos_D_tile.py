@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 
+import os
 import string
 
 import gvsoc.systree
@@ -115,10 +116,12 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
         idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
 
-        # DIMC HWPE
-        dimc_latency_ns = 100
-        dimc_latency = int(dimc_latency_ns/((1/100000000)*(10**9)))
-        dimc = Dimc(self, 'dimc', dimc_latency=dimc_latency, num_macros=2, fifo_depth=8)
+        # DIMC HWPE. Streamer knobs default in the Dimc systree; gvrun --param
+        # (via set_dimc_params below) sets them at launch for sweeps, and the SW
+        # can still override per-trigger via MMIO (STREAM_CHUNK / STREAM_BANK /
+        # STREAM_SYNC) for a one-run multi-config sweep.
+        dimc = Dimc(self, 'dimc', num_macros=3)
+        self.dimc = dimc
 
         # Fsync mm controller
         fsync_mm_ctrl = FSync_mm_ctrl(self,f'tile-{tid}-fs-ctrl-mm')
@@ -290,6 +293,12 @@ class Democritos_D_Tile(gvsoc.systree.Component):
 
     def i_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL(self) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, 'north_south_neighbour_fractal_2_xif', signature='wire<PortResp<uint32_t>*>')
+
+    # Forward gvrun --param streamer knobs to the DIMC (called from the SoC/board
+    # configure() chain, mirrors PCM's set_weights_path propagation).
+    def set_dimc_params(self, chunk_bytes=None, l1bw=None, sync=None, noc_lat=None):
+        self.dimc.set_stream_params(chunk_bytes=chunk_bytes, l1bw=l1bw, sync=sync,
+                                    noc_lat=noc_lat)
 
     # Output (master) port to off-tile L2 memory
     def o_NARROW_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
