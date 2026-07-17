@@ -114,6 +114,24 @@ class Dimc_HWPE : public vp::Component {
         uint32_t stream_bank_bytes;    // L1 bandwidth bytes/cycle, 32 banks*4=128 (Layer 2)
         uint32_t stream_sync;          // per-call wrapper sync cycle (0/1)
         uint32_t stream_noc_lat;       // NoC round-trip latency per streamer burst (bandwidth-independent)
+        uint32_t stream_min_bank;      // min transfer per bank = bank word width (bytes); over-fetch when finer
+        uint32_t stream_prefetch;      // cross-trigger prefetch on/off (0=off, default). When on, the
+                                       // first macro's load is hidden under the previous trigger's drain.
+        // ---- OUTER BLOCK (outer double buffer) ----
+        // An INNER BLOCK = "num_macro macros share one inner (L1) port, double-buffered".
+        // An OUTER BLOCK = "num_block inner blocks share one outer (L2) port, double-
+        // buffered against each other": while inner block b runs its whole block-job,
+        // inner block b+1's data is filled from L2 into its L1. All default to today's
+        // behavior (num_block=1 => no-op).
+        uint32_t stream_num_block;     // 1 = single inner block (today); 2 = outer block
+        uint32_t stream_l2_shared;     // 1 = blocks share ONE L2 port (serial fills, real L2 double buffer);
+                                       // 0 = each block has its own L2 port (independent/parallel, no upper buffer)
+        uint32_t stream_l1_depth;      // 1 = single L1 buffer per block; 2 = ping-pong L1 (a block's next
+                                       // L2 fill overlaps its current compute)
+        uint32_t stream_l2_bw;         // L2 port bytes/cycle (0 sentinel => same as l1bw / stream_bank_bytes)
+        uint32_t stream_noc_l2;        // L2 burst latency (sentinel <0 => same as stream_noc_lat)
+        uint64_t prev_drain_slack;     // streamer-idle tail (compute+OUT) left by the previous trigger;
+                                       // reset by soft_clear so a single/independent trigger gets no prefetch.
         // Reuse auto-detect: the KB (weight) source address of the last loaded
         // job. A trigger whose KB address matches reuses the resident weights
         // (skips that load), like a real weight cache. 0xFFFFFFFF = none yet.

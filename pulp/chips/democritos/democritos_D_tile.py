@@ -296,9 +296,13 @@ class Democritos_D_Tile(gvsoc.systree.Component):
 
     # Forward gvrun --param streamer knobs to the DIMC (called from the SoC/board
     # configure() chain, mirrors PCM's set_weights_path propagation).
-    def set_dimc_params(self, chunk_bytes=None, l1bw=None, sync=None, noc_lat=None):
+    def set_dimc_params(self, chunk_bytes=None, l1bw=None, sync=None, noc_lat=None,
+                        min_bank=None, prefetch=None, num_block=None, l2_shared=None,
+                        l1_depth=None, l2bw=None, noc_l2=None):
         self.dimc.set_stream_params(chunk_bytes=chunk_bytes, l1bw=l1bw, sync=sync,
-                                    noc_lat=noc_lat)
+                                    noc_lat=noc_lat, min_bank=min_bank, prefetch=prefetch,
+                                    num_block=num_block, l2_shared=l2_shared,
+                                    l1_depth=l1_depth, l2bw=l2bw, noc_l2=noc_l2)
 
     # Output (master) port to off-tile L2 memory
     def o_NARROW_OUTPUT(self, itf: gvsoc.systree.SlaveItf):

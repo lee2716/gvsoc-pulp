@@ -26,7 +26,14 @@ class Dimc(gvsoc.systree.Component):
                  stream_chunk_bytes: int = 128,
                  stream_l1bw: int = 128,
                  stream_sync: int = 0,
-                 stream_noc_lat: int = 1):
+                 stream_noc_lat: int = 1,
+                 stream_min_bank: int = 4,
+                 stream_prefetch: int = 0,
+                 stream_num_block: int = 1,
+                 stream_l2_shared: int = 1,
+                 stream_l1_depth: int = 1,
+                 stream_l2bw: int = 0,
+                 stream_noc_l2: int = -1):
         super().__init__(parent, name)
 
         self.set_component('pulp.dimc.dimc')
@@ -42,16 +49,34 @@ class Dimc(gvsoc.systree.Component):
             "stream_bank_bytes":  stream_l1bw,   # L1 bandwidth bytes/cycle
             "stream_sync":        stream_sync,
             "stream_noc_lat":     stream_noc_lat,
+            "stream_min_bank":    stream_min_bank,
+            "stream_prefetch":    stream_prefetch,
+            # OUTER BLOCK (outer double buffer). Sentinels: stream_l2_bw=0
+            # => same as l1bw; stream_noc_l2=-1 => same as noc_lat (resolved in C++).
+            "stream_num_block":   stream_num_block,
+            "stream_l2_shared":   stream_l2_shared,
+            "stream_l1_depth":    stream_l1_depth,
+            "stream_l2_bw":       stream_l2bw,
+            "stream_noc_l2":      stream_noc_l2,
         })
 
     # Called from the tile/soc/board configure() chain so gvrun --param can set
     # these at launch time (mirrors PCM's set_stim_file / weights_path pattern).
-    def set_stream_params(self, chunk_bytes=None, l1bw=None, sync=None, noc_lat=None):
+    def set_stream_params(self, chunk_bytes=None, l1bw=None, sync=None, noc_lat=None,
+                          min_bank=None, prefetch=None, num_block=None, l2_shared=None,
+                          l1_depth=None, l2bw=None, noc_l2=None):
         props = {}
         if chunk_bytes is not None: props["stream_chunk_bytes"] = int(chunk_bytes)
         if l1bw       is not None: props["stream_bank_bytes"]  = int(l1bw)
         if sync       is not None: props["stream_sync"]        = int(sync)
         if noc_lat    is not None: props["stream_noc_lat"]     = int(noc_lat)
+        if min_bank   is not None: props["stream_min_bank"]    = int(min_bank)
+        if prefetch   is not None: props["stream_prefetch"]    = int(prefetch)
+        if num_block  is not None: props["stream_num_block"]   = int(num_block)
+        if l2_shared  is not None: props["stream_l2_shared"]   = int(l2_shared)
+        if l1_depth   is not None: props["stream_l1_depth"]    = int(l1_depth)
+        if l2bw       is not None: props["stream_l2_bw"]       = int(l2bw)
+        if noc_l2     is not None: props["stream_noc_l2"]      = int(noc_l2)
         if props:
             self.add_properties(props)
 
