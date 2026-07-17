@@ -67,7 +67,21 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
         0                                                       // d3_stride
     );
 
-    _this->state.set(DIMC_WRITE_RF);
+    // Latch the per-job compute configuration once at commit, then broadcast it
+    // to every macro (precision, sign mode, thermometric mask, dimc select).
+    uint8_t compe     = (uint8_t)(_this->register_file[DIMC_HWPE_COMPE     >> 2] & 0x1);
+    uint8_t ci        = (uint8_t)(_this->register_file[DIMC_HWPE_CFG_CI    >> 2] & 0x3);
+    uint8_t sign_mode = (uint8_t)(_this->register_file[DIMC_HWPE_SIGN_MODE >> 2] & 0x3);
+    uint8_t mct       = (uint8_t)(_this->register_file[DIMC_HWPE_MCT       >> 2] & 0xFF);
+    _this->sel_dimc   = (uint8_t)(_this->register_file[DIMC_HWPE_SEL_DIMC  >> 2] & 0xFF);
+    for (auto &m : _this->macros) {
+        m.compe = compe; m.ci = ci; m.sign_mode = sign_mode; m.mct = mct;
+    }
+
+    _this->job_running = true;
+    _this->register_file[DIMC_HWPE_STATUS >> 2] = 0x0;   // busy
+
+    _this->state.set(DIMC_STARTING);
     _this->fsm_loop();
 }
 
@@ -81,8 +95,17 @@ void Dimc_HWPE::fsm_end_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     Dimc_HWPE *_this = (Dimc_HWPE *)__this;
     _this->state.set(DIMC_IDLE);
-    _this->register_file[DIMC_HWPE_STATUS >> 2] = 0x1;
-    _this->trace.msg(vp::TraceLevel::WARNING, "DIMC job done, STATUS=1\n");
+    _this->job_running = false;
+    _this->finished_jobs++;
+    _this->register_file[DIMC_HWPE_STATUS    >> 2] = 0x1;                 // done
+    _this->register_file[DIMC_HWPE_FIN_JOBS  >> 2] = _this->finished_jobs;
+    _this->trace.msg(vp::TraceLevel::WARNING,
+        "DIMC job done, STATUS=1, finished_jobs=%u\n", _this->finished_jobs);
+    // Standard HWPE completion interrupt (pulse), if the line is wired.
+    if (_this->irq.is_bound()) {
+        _this->irq.sync(true);
+        _this->irq.sync(false);
+    }
 }
 
 void Dimc_HWPE::fsm_loop()
@@ -106,30 +129,49 @@ int Dimc_HWPE::fsm()
     int  latency    = 0;
 
     switch (this->state.get()) {
-    case DIMC_WRITE_RF:
-        next_state = DIMC_CONFIG;
+    case DIMC_STARTING:
+        if (this->preload_iter(&latency)) next_state = DIMC_COMPUTING;
         break;
 
-    case DIMC_CONFIG: {
-        uint8_t compe     = (uint8_t)(this->register_file[DIMC_HWPE_COMPE     >> 2] & 0x1);
-        uint8_t ci        = (uint8_t)(this->register_file[DIMC_HWPE_CFG_CI    >> 2] & 0x3);
-        uint8_t sign_mode = (uint8_t)(this->register_file[DIMC_HWPE_SIGN_MODE >> 2] & 0x3);
-        uint8_t mct       = (uint8_t)(this->register_file[DIMC_HWPE_MCT       >> 2] & 0xFF);
-        this->sel_dimc    = (uint8_t)(this->register_file[DIMC_HWPE_SEL_DIMC  >> 2] & 0xFF);
-        for (auto &m : this->macros) {
-            m.compe     = compe;
-            m.ci        = ci;
-            m.sign_mode = sign_mode;
-            m.mct       = mct;
-        }
-        // Streamer bandwidth (chunk / l1bw / sync) is a fixed hardware property,
-        // set once from the systree / gvrun --param (this->stream_*), not per
-        // trigger. Nothing to read here.
-        next_state = DIMC_EXEC;
+    case DIMC_COMPUTING:
+        if (this->compute_iter(&latency)) next_state = DIMC_STORING;
         break;
+
+    case DIMC_STORING:
+        if (this->store_iter(&latency)) next_state = DIMC_FINISHED;
+        break;
+
+    case DIMC_FINISHED:
+        break;
+
+    default:
+        this->trace.fatal("DIMC HWPE FSM: UNKNOWN STATE (%d)!\n", this->state.get());
     }
 
-    case DIMC_EXEC: {
+    this->state.set(next_state);
+    return latency;
+}
+
+// ---- Engine phase iterators (standard HWPE scheduler structure) ----
+// Phase 1: preload/store are pass-throughs (config is latched at commit and the
+// output drain is folded into the analytical compute); compute_iter carries the
+// full inner-block / outer-block makespan so timing stays bit-identical. Phase
+// 2/3 turn preload and store into real per-beat streamer events and split the
+// compute across rows.
+bool Dimc_HWPE::preload_iter(int *latency)
+{
+    *latency = 0;
+    return true;
+}
+
+bool Dimc_HWPE::store_iter(int *latency)
+{
+    *latency = 0;
+    return true;
+}
+
+bool Dimc_HWPE::compute_iter(int *latency)
+{
         uint32_t num_active = this->register_file[DIMC_HWPE_NUM_MACROS  >> 2];
         if (num_active == 0 || num_active > this->num_macros) num_active = this->num_macros;
         uint32_t row_base   = this->register_file[DIMC_HWPE_ROW_SEL_BASE >> 2];
@@ -346,26 +388,12 @@ int Dimc_HWPE::fsm()
                 (unsigned long)block_job, (unsigned long)super);
         }
 
-        latency += (int)finish;
+        *latency = (int)finish;
         this->trace.msg(vp::TraceLevel::WARNING,
             "DIMC double-buffer: num_active=%u row_count=%u chunk=%u l1bw=%u "
             "prefetch=%u hidden=%lu reuse=%u total_latency=%lu\n",
             num_active, row_count, this->stream_chunk_bytes, this->stream_bank_bytes,
             this->stream_prefetch, (unsigned long)prefetched,
             (unsigned)skip_kb, (unsigned long)finish);
-
-        this->register_file[DIMC_HWPE_FIN_JOBS >> 2] = 1;
-        next_state = DIMC_FINISHED;
-        break;
-    }
-
-    case DIMC_FINISHED:
-        break;
-
-    default:
-        this->trace.fatal("DIMC HWPE FSM: UNKNOWN STATE (%d)!\n", this->state.get());
-    }
-
-    this->state.set(next_state);
-    return latency;
+        return true;
 }

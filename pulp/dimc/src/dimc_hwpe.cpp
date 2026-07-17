@@ -62,6 +62,9 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     // Streamer master port
     this->new_master_port("stream_mst", &this->stream_mst);
 
+    // Completion interrupt master port (standard HWPE done_irq)
+    this->new_master_port("irq", &this->irq);
+
     // Streamers
     this->weight_stream = Dimc_HWPE_Streamer(this, false);
     this->input_stream  = Dimc_HWPE_Streamer(this, false);
@@ -75,8 +78,12 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->fsm_event       = this->event_new(&Dimc_HWPE::fsm_handler);
     this->fsm_end_event   = this->event_new(&Dimc_HWPE::fsm_end_handler);
 
-    // Initial state of the controller FSM
-    this->sel_dimc = 0;
+    // Initial state of the controller FSM + standard HWPE offload bookkeeping
+    this->sel_dimc      = 0;
+    this->running_job   = 0;
+    this->next_job_id   = 0;
+    this->finished_jobs = 0;
+    this->job_running   = false;
     this->state.set(DIMC_IDLE);
 
     // Traces
@@ -98,6 +105,10 @@ void Dimc_HWPE::reset(bool active)
         this->sel_dimc = 0;
         this->last_kb_src = 0xFFFFFFFF;
         this->prev_drain_slack = 0;        // no prefetch across a reset boundary
+        this->running_job   = 0;
+        this->next_job_id   = 0;
+        this->finished_jobs = 0;
+        this->job_running   = false;
         this->state.set(DIMC_IDLE);
     }
 }
@@ -120,8 +131,12 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
             _this->register_file[(address >> 2)] = data;
         } else {
             switch (address) {
-            case DIMC_HWPE_TRIG:
+            case DIMC_HWPE_TRIG:   // commit_and_trigger: latch this job's id and start
+                _this->running_job = _this->next_job_id++;
+                _this->register_file[DIMC_HWPE_RUN_TASK >> 2] = _this->running_job;
                 _this->event_enqueue(_this->fsm_start_event, 1);
+                break;
+            case DIMC_HWPE_ACQ:    // acquire is observed on the read path; write is a no-op
                 break;
             case DIMC_HWPE_SOFT_CLEAR:
                 for (auto &m : _this->macros) m.reset();
@@ -137,6 +152,12 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
             }
         }
     } else {
+        // ACQUIRE: hand out a job id if a context is free, 0xFFFFFFFF (-1) if busy.
+        if (address == DIMC_HWPE_ACQ) {
+            *(uint32_t *)req->get_data() = _this->job_running ? 0xFFFFFFFFu
+                                                              : _this->next_job_id;
+            return vp::IO_REQ_OK;
+        }
         if (address > DIMC_HWPE_REG_MAX) {
             _this->trace.fatal("Trying to access invalid address 0x%x\n", address);
             return vp::IO_REQ_INVALID;
