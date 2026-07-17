@@ -119,7 +119,15 @@ int Dimc_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
     // cycles. stream_bank_bytes carries l1_bw (bytes/cycle, default 128 = 32*4).
     uint32_t l1_bw = this->dimc->stream_bank_bytes;
     if (l1_bw == 0) l1_bw = 128;
-    int transfer = ((int)width + (int)l1_bw - 1) / (int)l1_bw;   // ceil, >=1
+    // min_transfer_bank = bank word width: every bank access delivers a whole
+    // `min_bank` bytes, so a request is rounded UP to a multiple of min_bank
+    // (over-fetch waste when the access granularity is finer than the bank).
+    // MAGIA default = 4 B (DATA_W=32); for aligned 128 B rows any min_bank<=128
+    // is free, wider banks over-fetch.
+    uint32_t min_bank = this->dimc->stream_min_bank;
+    if (min_bank == 0) min_bank = 4;
+    uint32_t eff = ((uint32_t)width + min_bank - 1) / min_bank * min_bank;   // round up
+    int transfer = ((int)eff + (int)l1_bw - 1) / (int)l1_bw;     // ceil, >=1
     return transfer + (int) this->dimc->stream_sync;
 }
 

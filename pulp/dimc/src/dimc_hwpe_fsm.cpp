@@ -271,11 +271,88 @@ int Dimc_HWPE::fsm()
                 (unsigned long)compute_done[m], (unsigned long)out_free);
         }
 
+        // ---- Cross-trigger prefetch (opt-in, compatible with single trigger) ----
+        // When enabled, the FIRST macro's load (this trigger's Fill) is prefetched
+        // during the PREVIOUS trigger's Drain, where the shared streamer sat idle
+        // (idle tail = compute + last OUT). We credit min(fill, prev_drain_slack)
+        // back off this trigger's makespan. A lone / soft-cleared trigger has
+        // prev_drain_slack = 0, so it degrades EXACTLY to the non-prefetch case.
+        uint64_t drain_slack_next = (uint64_t)compute_cyc + out_lat[num_active - 1];
+        uint64_t prefetched = 0;
+        if (this->stream_prefetch && num_active > 0) {
+            prefetched = std::min((uint64_t)load_lat[0], this->prev_drain_slack);
+            if (prefetched > finish) prefetched = finish;
+            finish -= prefetched;
+        }
+        this->prev_drain_slack = drain_slack_next;
+
+        // ---- OUTER BLOCK (outer double buffer), gated by num_block ----
+        // The inner-block `finish` above is ONE inner block's makespan (block_job):
+        // num_macro matvecs sharing one inner (L1) port, double-buffered. The outer
+        // block adds num_block inner blocks that share one outer (L2) port and double-
+        // buffer against each other, mirroring the inner block's max()-overlap idiom
+        // one level up:
+        //   * fill an inner block from L2:  load2 = ceil(block_working_set / l2bw) + noc_l2
+        //   * l2_shared=1: the inner blocks' L2 fills are SERIAL on the shared port; each
+        //     block-job runs after its own fill and (with ping-pong L1, l1_depth=2)
+        //     overlaps the FOLLOWING block's fill -> num_block*load2 + block_job + out2
+        //     when L2-bound, converging to block_job when the fills hide (load2<=job).
+        //   * l1_depth=1: single L1 buffer -> an inner block's fill cannot overlap its
+        //     own compute, so fill+compute serialize (fill added fully).
+        //   * l2_shared=0: independent L2 ports -> both inner blocks fill in parallel,
+        //     one fill exposed, block-jobs fully parallel -> block_job + load2.
+        // num_block==1 leaves `finish` untouched => bit-identical to today.
+        if (this->stream_num_block > 1) {
+            uint32_t num_block = this->stream_num_block;
+            uint32_t l2bw      = this->stream_l2_bw;
+            uint32_t noc_l2    = this->stream_noc_l2;
+            uint64_t block_job = finish;   // inner-block result = one block-job makespan
+            // Working set that must come from L2 per block. On REUSE (skip_kb: the
+            // weights are already resident in the IMC array) the L2 only supplies the
+            // features -- the kernel is not re-fetched. Fresh => full KB+FB per macro.
+            uint64_t per_macro_ws = skip_kb
+                ? (uint64_t)DIMC_MACRO_FB_EW
+                : ((uint64_t)row_count * DIMC_MACRO_KB_EW + DIMC_MACRO_FB_EW);
+            uint64_t block_ws  = (uint64_t)num_active * per_macro_ws;
+            uint64_t out_ws    = (uint64_t)num_active * (uint64_t)row_count * out_w;
+            uint64_t load2 = (block_ws + l2bw - 1) / l2bw + noc_l2;   // L2 fill of one block
+            uint64_t out2  = (out_ws  + l2bw - 1) / l2bw + noc_l2;    // L2 drain of one block
+            // ---- Throughput (roofline) makespan ----
+            // The outer fill OVERLAPS the inner block-jobs (double buffer), it is NOT
+            // added on top. So once the outer port keeps up (fill_time <= block_job) the
+            // outer block is bounded by the inner/compute side and per-matvec is FLAT vs
+            // outer bandwidth. fill_time = time to bring every block's working set in
+            // through the outer port(s).
+            uint64_t fill_time = this->stream_l2_shared
+                ? (uint64_t)num_block * load2    // one shared outer port: fills serialize
+                : load2;                         // independent outer ports: fills in parallel
+            uint64_t super;
+            if (this->stream_l2_shared && this->stream_l1_depth < 2) {
+                // single L1 buffer: the fill cannot overlap the compute -> additive
+                super = fill_time + block_job + out2;
+            } else {
+                // ping-pong L1 (or independent ports): fill hidden under the block-jobs
+                super = std::max(fill_time, block_job) + out2;
+            }
+
+            finish = super;
+            this->trace.msg(vp::TraceLevel::WARNING,
+                "DIMC outer-block: num_block=%u num_macro=%u l2bw=%u noc_l2=%u "
+                "l2_shared=%u l1_depth=%u load2=%lu out2=%lu block_job=%lu "
+                "outer_makespan=%lu\n",
+                num_block, num_active, l2bw, noc_l2,
+                this->stream_l2_shared, this->stream_l1_depth,
+                (unsigned long)load2, (unsigned long)out2,
+                (unsigned long)block_job, (unsigned long)super);
+        }
+
         latency += (int)finish;
         this->trace.msg(vp::TraceLevel::WARNING,
-            "DIMC double-buffer: num_active=%u row_count=%u chunk=%u l1bw=%u total_latency=%lu\n",
+            "DIMC double-buffer: num_active=%u row_count=%u chunk=%u l1bw=%u "
+            "prefetch=%u hidden=%lu reuse=%u total_latency=%lu\n",
             num_active, row_count, this->stream_chunk_bytes, this->stream_bank_bytes,
-            (unsigned long)finish);
+            this->stream_prefetch, (unsigned long)prefetched,
+            (unsigned)skip_kb, (unsigned long)finish);
 
         this->register_file[DIMC_HWPE_FIN_JOBS >> 2] = 1;
         next_state = DIMC_FINISHED;

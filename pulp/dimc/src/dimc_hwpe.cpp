@@ -31,12 +31,30 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->stream_bank_bytes  = (uint32_t)this->get_js_config()->get_child_int("stream_bank_bytes");
     this->stream_sync        = (uint32_t)this->get_js_config()->get_child_int("stream_sync");
     this->stream_noc_lat     = (uint32_t)this->get_js_config()->get_child_int("stream_noc_lat");
+    this->stream_min_bank    = (uint32_t)this->get_js_config()->get_child_int("stream_min_bank");
+    this->stream_prefetch    = (uint32_t)this->get_js_config()->get_child_int("stream_prefetch");
+    if (this->stream_min_bank == 0)    this->stream_min_bank = 4;   // MAGIA bank word = 4 B
     if (this->num_macros == 0)         this->num_macros = 2;
     if (this->stream_chunk_bytes == 0) this->stream_chunk_bytes = 128; // 1 KB row/cycle
     if (this->stream_bank_bytes == 0)  this->stream_bank_bytes  = 128; // 32 banks * 4 B
+    // ---- OUTER BLOCK knobs (default = today's behavior => no-op) ----
+    // Read AFTER stream_bank_bytes / stream_noc_lat are finalized so the coupled
+    // defaults (l2bw=l1bw, noc_l2=noc_lat) resolve against the effective values.
+    int64_t nb = this->get_js_config()->get_child_int("stream_num_block");
+    int64_t ls = this->get_js_config()->get_child_int("stream_l2_shared");
+    int64_t ld = this->get_js_config()->get_child_int("stream_l1_depth");
+    int64_t lb = this->get_js_config()->get_child_int("stream_l2_bw");
+    int64_t n2 = this->get_js_config()->get_child_int("stream_noc_l2");
+    this->stream_num_block = (nb <= 0) ? 1 : (uint32_t)nb;
+    this->stream_l2_shared = (ls <  0) ? 1 : (uint32_t)ls;   // default 1; 0 is valid (parallel blocks)
+    this->stream_l1_depth  = (ld <= 0) ? 1 : (uint32_t)ld;
+    this->stream_l2_bw     = (lb <= 0) ? this->stream_bank_bytes : (uint32_t)lb; // 0 => same as l1bw
+    this->stream_noc_l2    = (n2 <  0) ? this->stream_noc_lat   : (uint32_t)n2;  // <0 => same as noc_lat
     // stream_sync defaults to 0 (pipelined, RTL gnt=1). stream_noc_lat defaults
     // to 1 (dimc.py always sets it; 0 is a valid "ideal NoC" value so not forced).
-    this->last_kb_src = 0xFFFFFFFF;   // no resident weights yet
+    // stream_prefetch defaults to 0 (off): keeps every existing figure's numbers.
+    this->last_kb_src     = 0xFFFFFFFF;   // no resident weights yet
+    this->prev_drain_slack = 0;           // no previous trigger to prefetch from
     // HWPE slave port
     this->hwpe_slv.set_req_meth(&Dimc_HWPE::hwpe_slave);
     this->new_slave_port("hwpe_slv", &this->hwpe_slv);
@@ -79,6 +97,7 @@ void Dimc_HWPE::reset(bool active)
         for (auto &m : this->macros) m.reset();
         this->sel_dimc = 0;
         this->last_kb_src = 0xFFFFFFFF;
+        this->prev_drain_slack = 0;        // no prefetch across a reset boundary
         this->state.set(DIMC_IDLE);
     }
 }
@@ -108,6 +127,7 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                 for (auto &m : _this->macros) m.reset();
                 _this->sel_dimc = 0;
                 _this->last_kb_src = 0xFFFFFFFF;   // resident weights invalidated
+                _this->prev_drain_slack = 0;       // and no prefetch across soft_clear (single trigger)
                 for (uint32_t i = 0; i < N_CFG_REGS; i++)
                     _this->register_file[i] = 0x0;
                 _this->state.set(DIMC_IDLE);
