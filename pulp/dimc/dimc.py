@@ -85,3 +85,8 @@ class Dimc(gvsoc.systree.Component):
 
     def o_stream_mst(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('stream_mst', itf, signature='io')
+
+    # Standard HWPE completion interrupt (done_irq). Optional to bind: the model
+    # guards irq.sync() with is_bound(), so leaving it unwired is harmless.
+    def o_irq(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('irq', itf, signature='wire<bool>')

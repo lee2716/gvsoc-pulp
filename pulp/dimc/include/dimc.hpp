@@ -29,11 +29,15 @@
 
 typedef uint64_t strobe_t;
 
+// Standard HWPE controller states (mirrors redmule: IDLE / STARTING /
+// COMPUTING / STORING / FINISHED). A job is offloaded via the acquire/commit
+// protocol, then the FSM steps preload -> compute -> store as event-driven
+// iterations (each iter returns a latency and the loop re-enqueues).
 enum dimc_hwpe_state_t {
     DIMC_IDLE,
-    DIMC_WRITE_RF,
-    DIMC_CONFIG,
-    DIMC_EXEC,
+    DIMC_STARTING,
+    DIMC_COMPUTING,
+    DIMC_STORING,
     DIMC_FINISHED
 };
 
@@ -91,11 +95,14 @@ class Dimc_HWPE : public vp::Component {
         // HWPE RF
         uint32_t register_file[N_CFG_REGS];
 
-        // Streamer master port
+        // Streamer master port (data path to L1/TCDM)
         vp::IoMaster stream_mst;
 
-        // HWPE slave port
+        // HWPE slave port (memory-mapped register interface)
         vp::IoSlave hwpe_slv;
+
+        // Completion interrupt line (standard HWPE done_irq)
+        vp::WireMaster<bool> irq;
 
         // Streamers (weight, input, out)
         Dimc_HWPE_Streamer weight_stream;
@@ -142,6 +149,20 @@ class Dimc_HWPE : public vp::Component {
 
         // Internal state
         vp::reg_32 state;
+
+        // ---- Standard HWPE offload/context bookkeeping ----
+        uint32_t running_job;   // id of the job currently executing (RUNNING_JOB reg)
+        uint32_t next_job_id;   // id handed out by the next ACQUIRE
+        uint32_t finished_jobs; // count of completed jobs (FINISHED reg)
+        bool     job_running;   // a committed job is in flight
+
+        // ---- Event-driven engine phase iterators (scheduler) ----
+        // Each returns true when its phase is complete and writes the cycles
+        // consumed by this step into *latency (mirrors redmule preload/compute/
+        // store_iter). Phase 1: compute_iter carries the analytical makespan.
+        bool preload_iter(int *latency);
+        bool compute_iter(int *latency);
+        bool store_iter(int *latency);
 
     private:
         static vp::IoReqStatus hwpe_slave(vp::Block *__this, vp::IoReq *req);
