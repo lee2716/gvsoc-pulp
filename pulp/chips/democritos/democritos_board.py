@@ -16,6 +16,7 @@
 
 import gvsoc.systree
 import gvsoc.runner
+from gvrun.parameter import TargetParameter
 
 from pulp.chips.democritos.democritos_soc import DemocritosSoc
 
@@ -23,14 +24,24 @@ class DemocritosBoard(gvsoc.systree.Component):
     def __init__(self, parent, name:str, parser, options):
         super().__init__(parent, name, options=options)
 
-        [args, __] = parser.parse_known_args()
-        binary = args.binary
+        TargetParameter(
+            self, name='binary', value=None,
+            description='Binary to be loaded and started', cast=str
+        )
 
         # Soc model
-        soc = DemocritosSoc(self, 'democritos-soc', parser, binary)
+        self.soc = DemocritosSoc(self, 'democritos-soc', parser)
+
+    def configure(self):
+        binary = self.get_parameter('binary')
+        if binary is not None:
+            self.soc.loader.set_binary(binary)
+
+    def handle_binary(self, binary):
+        self.set_parameter('binary', binary)
 
 
 class Target(gvsoc.runner.Target):
-    def __init__(self, parser, options):
+    def __init__(self, parser, options, name=None):
         super(Target, self).__init__(parser, options,
               model=DemocritosBoard, description="Democritos test board")

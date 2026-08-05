@@ -20,12 +20,12 @@ import vp.clock_domain
 import utils.loader.loader
 import interco.router as router
 
-from pulp.chips.democritos.democritos_T_tile import Democritos_T_Tile
+from pulp.chips.democritos.democritos_D_tile import Democritos_D_Tile
 # from pulp.chips.democritos.democritos_A_tile import Democritos_A_Tile
 # from pulp.chips.democritos.democritos_V_tile import Democritos_V_Tile
 from pulp.chips.democritos.democritos_arch import DemocritosArch
 from pulp.floonoc.floonoc import *
-from pulp.fractal_sync.fractal_sync import *
+from pulp.chips.magia_v2.fractal_sync.fractal_sync import *
 from typing import List, Dict
 import math
 
@@ -48,10 +48,11 @@ def calculate_north_south(n, tiling):
     return north, south
 
 class DemocritosSoc(gvsoc.systree.Component):
-    def __init__(self, parent, name, parser, binary):
+    def __init__(self, parent, name, parser, binary=None):
         super().__init__(parent, name)
 
         loader=utils.loader.loader.ElfLoader(self, f'loader', binary=binary)
+        self.loader = loader   # exposed so the board can set the binary in configure()
 
         # Single clock domain
         clock = vp.clock_domain.Clock_domain(self, 'tile-clock',
@@ -61,9 +62,9 @@ class DemocritosSoc(gvsoc.systree.Component):
         # TODO: Create a mechanism to create the tiles according to specifications
         #       This might be a collection of lists that are then indexed for the instantiation 
         # Create Tiles
-        cluster:List[Democritos_T_Tile] = []
+        cluster:List[Democritos_D_Tile] = []
         for id in range(0,DemocritosArch.NB_CLUSTERS):
-            cluster.append(Democritos_T_Tile(self, f'democritos-T-tile-{id}', parser, id))
+            cluster.append(Democritos_D_Tile(self, f'democritos-D-tile-{id}', parser, id))
 
         # L2 memory
         l2_mem:List[memory.Memory] = []
@@ -143,9 +144,9 @@ class DemocritosSoc(gvsoc.systree.Component):
             noc = FlooNoc2dMeshNarrowWide(self,
                                         name='magia-noc',
                                         narrow_width=4,
-                                        wide_width=4,
+                                        wide_width=32,
                                         ni_outstanding_reqs=8, #need to double check this with RTL
-                                        router_input_queue_size=2, #need to double check this with RTL
+                                        router_input_queue_size=4, #matches magia_v2
                                         dim_x=DemocritosArch.N_TILES_X+1, dim_y=DemocritosArch.N_TILES_Y)
             
 
@@ -226,8 +227,8 @@ class DemocritosSoc(gvsoc.systree.Component):
                     cluster[id].o_SLAVE_EAST_WEST_FRACTAL(fsync_nord[n].i_SLAVE_WEST())
                     fsync_nord[n].o_SLAVE_WEST(cluster[id].i_SLAVE_EAST_WEST_FRACTAL())
                     #print(f"Connection tile-id {id} to fsync_west_id_{n} NORD INPUT port")
-                    cluster[id].o_SLAVE_NORD_SUD_FRACTAL(fsync_west[n].i_SLAVE_NORD())
-                    fsync_west[n].o_SLAVE_NORD(cluster[id].i_SLAVE_NORD_SUD_FRACTAL())
+                    cluster[id].o_SLAVE_NORTH_SOUTH_FRACTAL(fsync_west[n].i_SLAVE_NORD())
+                    fsync_west[n].o_SLAVE_NORD(cluster[id].i_SLAVE_NORTH_SOUTH_FRACTAL())
                     n=n+1
 
                 # get the list of tiles connected to fractal sud west --> even rows and odd cols of tile_matrix
@@ -238,8 +239,8 @@ class DemocritosSoc(gvsoc.systree.Component):
                     cluster[id].o_SLAVE_EAST_WEST_FRACTAL(fsync_nord[n].i_SLAVE_EAST())
                     fsync_nord[n].o_SLAVE_EAST(cluster[id].i_SLAVE_EAST_WEST_FRACTAL())
                     #print(f"Connection tile-id {id} to fsync_east_id_{n} NORD INPUT port")
-                    cluster[id].o_SLAVE_NORD_SUD_FRACTAL(fsync_east[n].i_SLAVE_NORD())
-                    fsync_east[n].o_SLAVE_NORD(cluster[id].i_SLAVE_NORD_SUD_FRACTAL())
+                    cluster[id].o_SLAVE_NORTH_SOUTH_FRACTAL(fsync_east[n].i_SLAVE_NORD())
+                    fsync_east[n].o_SLAVE_NORD(cluster[id].i_SLAVE_NORTH_SOUTH_FRACTAL())
                     n=n+1
 
                 # get the list of tiles connected to fractal nord east --> odd rows and even cols of tile_matrix
@@ -250,8 +251,8 @@ class DemocritosSoc(gvsoc.systree.Component):
                     cluster[id].o_SLAVE_EAST_WEST_FRACTAL(fsync_sud[n].i_SLAVE_WEST())
                     fsync_sud[n].o_SLAVE_WEST(cluster[id].i_SLAVE_EAST_WEST_FRACTAL())
                     #print(f"Connection tile-id {id} to fsync_west_id_{n} SUD INPUT port")
-                    cluster[id].o_SLAVE_NORD_SUD_FRACTAL(fsync_west[n].i_SLAVE_SUD())
-                    fsync_west[n].o_SLAVE_SUD(cluster[id].i_SLAVE_NORD_SUD_FRACTAL())
+                    cluster[id].o_SLAVE_NORTH_SOUTH_FRACTAL(fsync_west[n].i_SLAVE_SUD())
+                    fsync_west[n].o_SLAVE_SUD(cluster[id].i_SLAVE_NORTH_SOUTH_FRACTAL())
                     n=n+1
                     
                 # get the list of tiles connected to fractal sud east --> odd rows and odd cols of tile_matrix
@@ -262,8 +263,8 @@ class DemocritosSoc(gvsoc.systree.Component):
                     cluster[id].o_SLAVE_EAST_WEST_FRACTAL(fsync_sud[n].i_SLAVE_EAST())
                     fsync_sud[n].o_SLAVE_EAST(cluster[id].i_SLAVE_EAST_WEST_FRACTAL())
                     #print(f"Connection tile-id {id} to fsync_west_id_{n} SUD INPUT port")
-                    cluster[id].o_SLAVE_NORD_SUD_FRACTAL(fsync_east[n].i_SLAVE_SUD())
-                    fsync_east[n].o_SLAVE_SUD(cluster[id].i_SLAVE_NORD_SUD_FRACTAL())
+                    cluster[id].o_SLAVE_NORTH_SOUTH_FRACTAL(fsync_east[n].i_SLAVE_SUD())
+                    fsync_east[n].o_SLAVE_SUD(cluster[id].i_SLAVE_NORTH_SOUTH_FRACTAL())
                     n=n+1
 
                 if n_fractal_neighbour > 0:
@@ -286,11 +287,11 @@ class DemocritosSoc(gvsoc.systree.Component):
                     for row in odd_rows:
                         for id in row:
                             print(f"Connection tile-id {id} to fsync_neighbour_nord_sud_{n} NORD INPUT port")
-                            cluster[id].o_SLAVE_NORD_SUD_NEIGHBOUR_FRACTAL(fsync_neighbour_nord_sud[n].i_SLAVE_NORD())
-                            fsync_neighbour_nord_sud[n].o_SLAVE_NORD(cluster[id].i_SLAVE_NORD_SUD_NEIGHBOUR_FRACTAL())
+                            cluster[id].o_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL(fsync_neighbour_nord_sud[n].i_SLAVE_NORD())
+                            fsync_neighbour_nord_sud[n].o_SLAVE_NORD(cluster[id].i_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL())
                             print(f"Connection tile-id {id+DemocritosArch.N_TILES_X} to fsync_neighbour_nord_sud_{n} SUD INPUT port")
-                            cluster[id+DemocritosArch.N_TILES_X].o_SLAVE_NORD_SUD_NEIGHBOUR_FRACTAL(fsync_neighbour_nord_sud[n].i_SLAVE_SUD())
-                            fsync_neighbour_nord_sud[n].o_SLAVE_SUD(cluster[id+DemocritosArch.N_TILES_X].i_SLAVE_NORD_SUD_NEIGHBOUR_FRACTAL())
+                            cluster[id+DemocritosArch.N_TILES_X].o_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL(fsync_neighbour_nord_sud[n].i_SLAVE_SUD())
+                            fsync_neighbour_nord_sud[n].o_SLAVE_SUD(cluster[id+DemocritosArch.N_TILES_X].i_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL())
                             n=n+1
     
             elif (lvl == 1) and (lvl<(int(math.log2(DemocritosArch.NB_CLUSTERS))-1)): #this is another special level as from now on we leave the nord-sud naming and we move to a more abstract form

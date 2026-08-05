@@ -14,8 +14,6 @@
 # limitations under the License.
 #
 
-import os
-import string
 
 import gvsoc.systree
 import memory.memory as memory
@@ -54,11 +52,11 @@ class Democritos_D_TileTcdm(gvsoc.systree.Component):
 
         # 3 masters: OBI
         dma_masters = 1
-        dma_interleaver = DmaInterleaver(self, 'dma_interleaver', nb_master_ports=dma_masters, nb_banks=nb_banks, bank_width=4)
+        dma_interleaver = DmaInterleaver(self, 'dma_interleaver', nb_master_ports=dma_masters, nb_banks=nb_banks, bank_width=DemocritosArch.BYTES_PER_WORD)
 
         # 1 master: DIMC HWPE
         dimc_hwpe_masters = 1
-        dimc_interleaver = HWPEInterleaver(self, "dimc_interleaver", nb_master_ports=dimc_hwpe_masters, nb_banks=nb_banks, bank_width=4)
+        dimc_interleaver = HWPEInterleaver(self, "dimc_interleaver", nb_master_ports=dimc_hwpe_masters, nb_banks=nb_banks, bank_width=DemocritosArch.BYTES_PER_WORD)
 
         banks = []
         for i in range(nb_banks):
@@ -120,8 +118,39 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         # (via set_dimc_params below) sets them at launch for sweeps, and the SW
         # can still override per-trigger via MMIO (STREAM_CHUNK / STREAM_BANK /
         # STREAM_SYNC) for a one-run multi-config sweep.
-        dimc = Dimc(self, 'dimc', num_macros=3)
+        # D-tile = ONE outer block: 2 inner blocks x 2 macros = 4 DIMC macros.
+        # `num_macros` is the macros PER INNER BLOCK (they share one inner port
+        # and double-buffer against each other); the 2 inner blocks and their
+        # outer ping-pong come from stream_num_block=2 / stream_l1_depth=2,
+        # whose defaults live in Dimc() and can be overridden with gvrun --param.
+        dimc = Dimc(self, 'dimc', num_macros=2)
         self.dimc = dimc
+
+        # Event unit (mirrors pulp/chips/magia_v2/tile.py). The address window is
+        # already reserved in DemocritosArch; the HWPE raises done_irq into it so
+        # SW can wait on an event instead of polling STATUS.
+        self.add_properties({
+            "event_unit": {
+                "version": "4",
+                "mapping": {
+                    "base":          DemocritosArch.EVENT_UNIT_ADDR_START,
+                    "size":          DemocritosArch.EVENT_UNIT_SIZE,
+                    "remove_offset": DemocritosArch.EVENT_UNIT_ADDR_START,
+                },
+                "config": {
+                    "nb_core": 1,                      # D-tile has one CV32 core
+                    "properties": {
+                        "dispatch":  {"size": 8},
+                        "mutex":     {"nb_mutexes": 0},
+                        "barriers":  {"nb_barriers": 0},
+                        "soc_event": {"nb_fifo_events": 8, "fifo_event": 8},
+                        "events":    {"dispatch": 8, "mutex": 0, "barrier": 0},
+                    },
+                },
+            }
+        })
+        event_unit = Event_unit(self, f'tile-{tid}-event-unit',
+                                self.get_property('event_unit/config'))
 
         # Fsync mm controller
         fsync_mm_ctrl = FSync_mm_ctrl(self,f'tile-{tid}-fs-ctrl-mm')
@@ -196,6 +225,29 @@ class Democritos_D_Tile(gvsoc.systree.Component):
                        base=DemocritosArch.DIMC_START,
                        size=DemocritosArch.DIMC_SIZE,
                        rm_base=True)
+
+        # Event unit: map it on the OBI xbar and route the DIMC completion
+        # interrupt into it (magia_v2 pattern: bind(<hwpe>, 'done_irq', ...)).
+        obi_xbar.add_mapping('event_unit', **self.get_property('event_unit/mapping'))
+        self.bind(obi_xbar, 'event_unit', event_unit, 'input')
+        # Core side: clock + the irq request/ack handshake (magia_v2 does the same).
+        self.bind(event_unit, 'clock_0', core_cv32, 'clock')
+        self.bind(core_cv32, 'irq_ack', event_unit, 'irq_ack_0')
+        self.bind(event_unit, 'irq_req_0', core_cv32, 'irq_req')
+        # DIMC completion -> event 10 (same slot magia_v2 gives RedMule).
+        self.bind(dimc, 'done_irq', event_unit, 'in_event_10_pe_0')
+        # FractalSync barrier completion -> event 24 (same slot as magia_v2).
+        self.bind(fsync_mm_ctrl, 'fsync_done_irq', event_unit, 'in_event_24_pe_0')
+        # DANGLING event slots: magia_v2 additionally routes
+        #   idma_mm_ctrl 'idma0_done_irq' -> in_event_2_pe_0
+        #   idma_mm_ctrl 'idma1_done_irq' -> in_event_3_pe_0
+        # Those stay unconnected: the iDMA interrupts are not modelled yet.
+
+        # FractalSync controller registers, so software can request a barrier.
+        # Same address window magia_v2 uses (arch reserves FSYNC_CTRL_*).
+        obi_xbar.o_MAP(fsync_mm_ctrl.i_INPUT(), name=f'fs-ctrl-mm-{tid}-mem',
+                       base=DemocritosArch.FSYNC_CTRL_ADDR_START,
+                       size=DemocritosArch.FSYNC_CTRL_SIZE, rm_base=True)
 
         # Bind obi xbar so that it can write to kill_module
         obi_xbar.o_MAP(self.__i_KILLER_OUTPUT(), name="Kill-sim-mem",
@@ -296,13 +348,13 @@ class Democritos_D_Tile(gvsoc.systree.Component):
 
     # Forward gvrun --param streamer knobs to the DIMC (called from the SoC/board
     # configure() chain, mirrors PCM's set_weights_path propagation).
-    def set_dimc_params(self, chunk_bytes=None, l1bw=None, sync=None, noc_lat=None,
-                        min_bank=None, prefetch=None, num_block=None, l2_shared=None,
-                        l1_depth=None, l2bw=None, noc_l2=None):
-        self.dimc.set_stream_params(chunk_bytes=chunk_bytes, l1bw=l1bw, sync=sync,
-                                    noc_lat=noc_lat, min_bank=min_bank, prefetch=prefetch,
-                                    num_block=num_block, l2_shared=l2_shared,
-                                    l1_depth=l1_depth, l2bw=l2bw, noc_l2=noc_l2)
+    def set_dimc_params(self, inner_bw=None, sync=None, noc_lat=None,
+                        bank_word=None, nb_inner=None, outer_shared=None,
+                        outer_bw=None, outer_noc=None):
+        self.dimc.set_stream_params(inner_bw=inner_bw, sync=sync,
+                                    noc_lat=noc_lat, bank_word=bank_word,
+                                    nb_inner=nb_inner, outer_shared=outer_shared,
+                                    outer_bw=outer_bw, outer_noc=outer_noc)
 
     # Output (master) port to off-tile L2 memory
     def o_NARROW_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
