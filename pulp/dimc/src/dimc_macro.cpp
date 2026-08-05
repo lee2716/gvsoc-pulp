@@ -36,6 +36,8 @@ void Dimc_Macro::reset()
     this->mct       = 0;
     this->psin      = 0;
     this->psout     = 0;
+    this->accumulate = 0;
+    for (int r = 0; r < DIMC_MACRO_KB_LEN; r++) this->accum[r] = 0;
     this->sout      = 0;
 
     this->kb_ready = false;
@@ -83,6 +85,8 @@ void Dimc_Macro::write_row(int row, const uint8_t *src)
     std::memcpy(this->KB[row], src, DIMC_MACRO_KB_EW);
 }
 
+// Dangling: no caller. This is the COMPE=0 memory-mode read-back path; the
+// compute pipeline never uses it. Kept for register/behaviour fidelity.
 void Dimc_Macro::read_row(int row, uint8_t *dst) const
 {
     if (row < 0 || row >= DIMC_MACRO_KB_LEN) return;
@@ -106,6 +110,9 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
 
     switch (this->ci) {
     case DIMC_CI_1BIT: {
+        // 1-bit multiply = XNOR + popcount (bipolar encoding: bit 0 = -1, bit 1 = +1,
+        // so the product is +1 exactly when the two bits AGREE). Confirmed 2026-07-18.
+        // Alternative convention: AND is the literal unsigned {0,1} multiply.
         for (uint32_t i = 0; i < valid_bytes; i++) {
             uint8_t x = ~((uint8_t)(this->KB[row_sel][i] ^ this->FB[i]));
             for (int b = 0; b < 8; b++)
@@ -125,6 +132,14 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
             for (int s = 0; s < 4; s++)
                 comp += ((k >> (s*2)) & 0x3) * ((f >> (s*2)) & 0x3);
         }
+        // Partial trailing byte: the MCT mask moves in 4-bit steps, so a masked
+        // row can end mid-byte. Only WHOLE 2-bit elements inside it still count.
+        if (tail_bits) {
+            uint8_t k = this->KB[row_sel][valid_bytes];
+            uint8_t f = this->FB[valid_bytes];
+            for (uint32_t s = 0; s < tail_bits / 2u; s++)
+                comp += ((k >> (s*2)) & 0x3) * ((f >> (s*2)) & 0x3);
+        }
         break;
     }
     case DIMC_CI_4BIT: {
@@ -134,10 +149,19 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
             comp += ( k        & 0xF) * ( f        & 0xF)
                   + ((k >> 4) & 0xF) * ((f >> 4) & 0xF);
         }
+        // Partial trailing byte: only WHOLE 4-bit elements inside it count.
+        if (tail_bits) {
+            uint8_t k = this->KB[row_sel][valid_bytes];
+            uint8_t f = this->FB[valid_bytes];
+            for (uint32_t n = 0; n < tail_bits / 4u; n++)
+                comp += ((k >> (n*4)) & 0xF) * ((f >> (n*4)) & 0xF);
+        }
         break;
     }
     case DIMC_CI_8BIT:
     default: {
+        // No tail handling needed: the mask steps in 4-bit units, so a partial
+        // trailing byte can never hold a whole 8-bit element, so it is dropped.
         for (uint32_t i = 0; i < valid_bytes; i++) {
             int32_t k = (this->sign_mode & 0x2) ? (int32_t)(int8_t)this->KB[row_sel][i]
                                                 : (int32_t)(uint8_t)this->KB[row_sel][i];
@@ -151,10 +175,22 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
 
     comp += this->psin;
 
+    // Partial-sum chain. accumulate=0 starts a fresh sum for this row, so no
+    // explicit clear is needed between chains; accumulate=1 continues the one
+    // the previous chunk left in accum[row_sel].
+    if (this->accumulate) comp += this->accum[row_sel];
+    this->accum[row_sel] = comp;
+
     this->psout = comp;
     return comp;
 }
 
+// DANGLING PATH: the value this returns is DISCARDED by issue(), and `sout` is
+// never read by the FSM (the pipeline carries `psout`). Consequences:
+//   * the `bias` argument NEVER reaches the 32-bit output the test reads;
+//   * the ReLU + 8-bit saturation result (`sout`) is not wired out anywhere;
+//   * there is no requantisation, so `sout` saturates for INT4/INT8 ranges.
+// Confirmed as an unused path on 2026-07-18; left as-is.
 int32_t Dimc_Macro::final_compute(int32_t bias)
 {
     int32_t psum = this->psout + bias;
