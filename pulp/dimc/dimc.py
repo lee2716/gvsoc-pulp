@@ -23,16 +23,13 @@ class Dimc(gvsoc.systree.Component):
                  parent: gvsoc.systree.Component,
                  name: str,
                  num_macros: int = 2,
-                 stream_chunk_bytes: int = 128,
-                 stream_l1bw: int = 128,
-                 stream_sync: int = 0,
-                 stream_noc_lat: int = 1,
-                 stream_min_bank: int = 4,
-                 stream_prefetch: int = 0,
-                 stream_num_block: int = 1,
+                 stream_l1bw: int = 32,     # inner port 256 bits
+                 stream_sync: int = 0,      # MAGIA l1_spm gnt=1 -> pipelined, no extra cycle
+                 stream_noc_lat: int = 1,   # TCDM bank read latency (memory latency=1)
+                 stream_min_bank: int = 4,  # MAGIA BYTES_PER_WORD: TCDM bank word
+                 stream_num_block: int = 2,
                  stream_l2_shared: int = 1,
-                 stream_l1_depth: int = 1,
-                 stream_l2bw: int = 0,
+                 stream_l2bw: int = 64,     # outer port 512 bits
                  stream_noc_l2: int = -1):
         super().__init__(parent, name)
 
@@ -45,38 +42,34 @@ class Dimc(gvsoc.systree.Component):
         # burst); bandwidth-independent, so it models the interconnect delay.
         self.add_properties({
             "num_macros":         num_macros,
-            "stream_chunk_bytes": stream_chunk_bytes,
-            "stream_bank_bytes":  stream_l1bw,   # L1 bandwidth bytes/cycle
-            "stream_sync":        stream_sync,
-            "stream_noc_lat":     stream_noc_lat,
-            "stream_min_bank":    stream_min_bank,
-            "stream_prefetch":    stream_prefetch,
-            # OUTER BLOCK (outer double buffer). Sentinels: stream_l2_bw=0
-            # => same as l1bw; stream_noc_l2=-1 => same as noc_lat (resolved in C++).
-            "stream_num_block":   stream_num_block,
-            "stream_l2_shared":   stream_l2_shared,
-            "stream_l1_depth":    stream_l1_depth,
-            "stream_l2_bw":       stream_l2bw,
-            "stream_noc_l2":      stream_noc_l2,
+            "inner_port_bytes":  stream_l1bw,   # inner port B/cycle (256 bits)
+            "port_sync_cycles":        stream_sync,
+            "inner_noc_lat":     stream_noc_lat,
+            "bank_word_bytes":    stream_min_bank,
+            # OUTER BLOCK (outer double buffer). Default = the D-tile shape:
+            # nb_inner=2 inner blocks x num_macros=2 macros = 4 DIMC macros,
+            # Sentinels keep the "no explicit parameter" behaviour: stream_l2_bw=0
+            # => same as inner_bw; stream_noc_l2=-1 => same as noc_lat (resolved in C++).
+            "nb_inner_blocks":   stream_num_block,
+            "outer_port_shared":   stream_l2_shared,
+            "outer_port_bytes":       stream_l2bw,
+            "outer_noc_lat":      stream_noc_l2,
         })
 
     # Called from the tile/soc/board configure() chain so gvrun --param can set
     # these at launch time (mirrors PCM's set_stim_file / weights_path pattern).
-    def set_stream_params(self, chunk_bytes=None, l1bw=None, sync=None, noc_lat=None,
-                          min_bank=None, prefetch=None, num_block=None, l2_shared=None,
-                          l1_depth=None, l2bw=None, noc_l2=None):
+    def set_stream_params(self, inner_bw=None, sync=None, noc_lat=None,
+                          bank_word=None, nb_inner=None, outer_shared=None,
+                          outer_bw=None, outer_noc=None):
         props = {}
-        if chunk_bytes is not None: props["stream_chunk_bytes"] = int(chunk_bytes)
-        if l1bw       is not None: props["stream_bank_bytes"]  = int(l1bw)
-        if sync       is not None: props["stream_sync"]        = int(sync)
-        if noc_lat    is not None: props["stream_noc_lat"]     = int(noc_lat)
-        if min_bank   is not None: props["stream_min_bank"]    = int(min_bank)
-        if prefetch   is not None: props["stream_prefetch"]    = int(prefetch)
-        if num_block  is not None: props["stream_num_block"]   = int(num_block)
-        if l2_shared  is not None: props["stream_l2_shared"]   = int(l2_shared)
-        if l1_depth   is not None: props["stream_l1_depth"]    = int(l1_depth)
-        if l2bw       is not None: props["stream_l2_bw"]       = int(l2bw)
-        if noc_l2     is not None: props["stream_noc_l2"]      = int(noc_l2)
+        if inner_bw       is not None: props["inner_port_bytes"]  = int(inner_bw)
+        if sync       is not None: props["port_sync_cycles"]        = int(sync)
+        if noc_lat    is not None: props["inner_noc_lat"]     = int(noc_lat)
+        if bank_word   is not None: props["bank_word_bytes"]    = int(bank_word)
+        if nb_inner  is not None: props["nb_inner_blocks"]   = int(nb_inner)
+        if outer_shared  is not None: props["outer_port_shared"]   = int(outer_shared)
+        if outer_bw       is not None: props["outer_port_bytes"]       = int(outer_bw)
+        if outer_noc     is not None: props["outer_noc_lat"]      = int(outer_noc)
         if props:
             self.add_properties(props)
 
@@ -88,5 +81,5 @@ class Dimc(gvsoc.systree.Component):
 
     # Standard HWPE completion interrupt (done_irq). Optional to bind: the model
     # guards irq.sync() with is_bound(), so leaving it unwired is harmless.
-    def o_irq(self, itf: gvsoc.systree.SlaveItf):
-        self.itf_bind('irq', itf, signature='wire<bool>')
+    def o_DONE_IRQ(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('done_irq', itf, signature='wire<bool>')
