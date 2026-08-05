@@ -23,16 +23,15 @@
 #include <stdio.h>
 #include <cstdint>
 #include <vector>
+#include <queue>
 
 #include <dimc_hwpe_archi.hpp>
 #include <dimc_macro.hpp>
 
 typedef uint64_t strobe_t;
 
-// Standard HWPE controller states (mirrors redmule: IDLE / STARTING /
-// COMPUTING / STORING / FINISHED). A job is offloaded via the acquire/commit
-// protocol, then the FSM steps preload -> compute -> store as event-driven
-// iterations (each iter returns a latency and the loop re-enqueues).
+// Standard HWPE states, as in redmule. A job is offloaded with the
+// acquire/commit protocol, then the FSM runs preload -> compute -> store.
 enum dimc_hwpe_state_t {
     DIMC_IDLE,
     DIMC_STARTING,
@@ -47,7 +46,6 @@ class Dimc_HWPE_Streamer {
     public:
         Dimc_HWPE_Streamer(Dimc_HWPE* dimc, bool is_write);
         Dimc_HWPE_Streamer();
-        int  iterate(void* buf, strobe_t strb);
         void configure(
                 uint32_t base_addr,
                 uint32_t tot_len,
@@ -59,10 +57,11 @@ class Dimc_HWPE_Streamer {
                 uint32_t d2_stride,
                 uint32_t d3_stride
         );
-        void set_base_addr(uint32_t addr);
-        uint32_t get_base_addr();
         bool is_done();
-        int rw_data(int width, void* buf, strobe_t strb);
+        // Issue ONE beat (inner_port_bytes wide) and return the cycle count after
+        // which its response is due. The caller keeps the timestamp in a pending
+        // queue instead of blocking, so several beats can be in flight at once.
+        int issue_beat(int width, void* buf);
 
     private:
         Dimc_HWPE*  dimc;
@@ -86,6 +85,75 @@ class Dimc_HWPE_Streamer {
         bool        is_write;
 };
 
+// ---- Outer port: shared L2 port with temporal state ----
+// Same idiom as interco/router's BandwidthLimiter: the port remembers when it
+// is free again, so a client arriving before that is delayed.
+// Serialization on a shared port emerges from this, it is not computed.
+class Dimc_OuterPort {
+    public:
+        // `bandwidth` in bytes/cycle, `latency` = fixed per-burst round trip.
+        void configure(uint32_t bandwidth, uint32_t latency);
+        // Reserve the port for `bytes` starting no earlier than `now`; returns
+        // the cycle at which the transfer has landed.
+        int64_t request(int64_t now, uint64_t bytes);
+        void reset();
+
+        int64_t  next_free_cycle;   // <- the state interco/router calls next_burst_cycle
+        uint32_t bandwidth_bytes;
+        uint32_t burst_latency;
+};
+
+// ---- Inner block: num_macros macros on one inner (L1) port ----
+// A plain class, not a vp::Component, like redmule.hpp:22 RedMule_Engine.
+// One control plane drives N of these.
+class Dimc_InnerBlock {
+    public:
+        // Data path: this block's own three streamers and its own macros.
+        Dimc_HWPE_Streamer weight_stream;
+        Dimc_HWPE_Streamer input_stream;
+        Dimc_HWPE_Streamer out_stream;
+        std::vector<Dimc_Macro> macros;
+
+        // Cycle-accurate cursor. ONE linear beat index is the only position
+        // state; (macro, row, offset) are decoded from it on demand, so they
+        // cannot drift apart across cycles.
+        std::queue<uint64_t> pending_req_queue;  // cycle at which each beat returns
+        uint32_t beat_index;                     // linear position in the phase
+        uint32_t beat_total;                     // beats this phase must issue
+        uint32_t rows_issued;                    // compute: rows pushed into pipes
+        uint8_t  row_buffer[DIMC_MACRO_KB_EW];   // accumulates the row in flight
+
+        // Per-phase completion, so the phase ends only when EVERY block is done.
+        bool phase_done;
+
+        // Cycle at which this block's outer-port transfer has landed: the fill
+        // during STARTING, the result drain during STORING. The block cannot
+        // touch its inner port before it.
+        int64_t data_ready_cycle;
+        bool    fill_requested;
+
+        // Results and per-block reporting.
+        std::vector<std::vector<uint8_t>> out_buf;
+        std::vector<uint32_t> load_done;   // per-macro L1-load completion cycle
+        uint32_t out_lat;
+
+        // Clear everything the engine tracks for one job. Called from the
+        // constructor, from reset(), and at every job start, so the three sites
+        // cannot drift apart.
+        void reset_job_state()
+        {
+            this->beat_index = 0;
+            this->beat_total = 0;
+            this->rows_issued = 0;
+            this->phase_done = false;
+            this->fill_requested = false;
+            this->data_ready_cycle = 0;
+            this->out_lat = 0;
+            this->load_done.clear();
+            while (!this->pending_req_queue.empty()) this->pending_req_queue.pop();
+        }
+};
+
 class Dimc_HWPE : public vp::Component {
     public:
         Dimc_HWPE(vp::ComponentConf &config);
@@ -104,41 +172,41 @@ class Dimc_HWPE : public vp::Component {
         // Completion interrupt line (standard HWPE done_irq)
         vp::WireMaster<bool> irq;
 
-        // Streamers (weight, input, out)
-        Dimc_HWPE_Streamer weight_stream;
-        Dimc_HWPE_Streamer input_stream;
-        Dimc_HWPE_Streamer out_stream;
+        // ---- Inner blocks (nb_inner_blocks of them) ----
+        // Each owns its streamers and macros. nb_inner_blocks == 1 reduces to
+        // exactly the previous single-block engine.
+        std::vector<Dimc_InnerBlock> inner_blocks;
 
-        // Macros
-        std::vector<Dimc_Macro> macros;
+        // ---- Outer ports ----
+        // shared=1: one port, all blocks contend on it (fills serialize via
+        // next_free_cycle). shared=0: one port per block, fills run in parallel.
+        // A topology choice, not a formula branch.
+        std::vector<Dimc_OuterPort> outer_ports;
+        Dimc_OuterPort *block_port(uint32_t blk);
+        // Bytes one inner block pulls through the outer port for this job.
+        uint64_t block_working_set() const;
+
         uint8_t sel_dimc;
 
         // Configuration
         uint32_t num_macros;
         // Streamer bandwidth: fixed hardware properties, set once from the
         // systree / gvrun --param (no per-trigger MMIO override).
-        uint32_t stream_chunk_bytes;   // bytes per rw_data call (Layer 3)
-        uint32_t stream_bank_bytes;    // L1 bandwidth bytes/cycle, 32 banks*4=128 (Layer 2)
-        uint32_t stream_sync;          // per-call wrapper sync cycle (0/1)
-        uint32_t stream_noc_lat;       // NoC round-trip latency per streamer burst (bandwidth-independent)
-        uint32_t stream_min_bank;      // min transfer per bank = bank word width (bytes); over-fetch when finer
-        uint32_t stream_prefetch;      // cross-trigger prefetch on/off (0=off, default). When on, the
-                                       // first macro's load is hidden under the previous trigger's drain.
-        // ---- OUTER BLOCK (outer double buffer) ----
-        // An INNER BLOCK = "num_macro macros share one inner (L1) port, double-buffered".
-        // An OUTER BLOCK = "num_block inner blocks share one outer (L2) port, double-
-        // buffered against each other": while inner block b runs its whole block-job,
-        // inner block b+1's data is filled from L2 into its L1. All default to today's
-        // behavior (num_block=1 => no-op).
-        uint32_t stream_num_block;     // 1 = single inner block (today); 2 = outer block
-        uint32_t stream_l2_shared;     // 1 = blocks share ONE L2 port (serial fills, real L2 double buffer);
-                                       // 0 = each block has its own L2 port (independent/parallel, no upper buffer)
-        uint32_t stream_l1_depth;      // 1 = single L1 buffer per block; 2 = ping-pong L1 (a block's next
-                                       // L2 fill overlaps its current compute)
-        uint32_t stream_l2_bw;         // L2 port bytes/cycle (0 sentinel => same as l1bw / stream_bank_bytes)
-        uint32_t stream_noc_l2;        // L2 burst latency (sentinel <0 => same as stream_noc_lat)
-        uint64_t prev_drain_slack;     // streamer-idle tail (compute+OUT) left by the previous trigger;
-                                       // reset by soft_clear so a single/independent trigger gets no prefetch.
+        uint32_t inner_port_bytes;    // inner (L1) port bytes/cycle, e.g. 32 banks*4=128
+        uint32_t port_sync_cycles;          // per-beat wrapper sync cycle (0/1)
+        uint32_t inner_noc_lat;       // NoC round-trip latency per streamer burst (bandwidth-independent)
+        uint32_t bank_word_bytes;      // min transfer per bank = bank word width (bytes); over-fetch when finer
+        // ---- Outer block ----
+        // An inner block is num_macros macros on one inner port. An outer block
+        // is nb_inner_blocks of them, each a real Dimc_InnerBlock reaching L2
+        // through a Dimc_OuterPort. With a shared port, block b+1's fill waits
+        // for block b's, so it lands later.
+        // nb_inner_blocks==1 creates no port and matches a lone inner block.
+        uint32_t nb_inner_blocks;     // inner blocks in the outer block (D-tile default 2)
+        uint32_t outer_port_shared;     // 1 = all blocks contend on ONE L2 port (fills serialize);
+                                       // 0 = one L2 port per block (fills proceed in parallel)
+        uint32_t outer_port_bytes;         // L2 port bytes/cycle (0 sentinel => same as inner_port_bytes)
+        uint32_t outer_noc_lat;        // L2 burst latency (sentinel <0 => same as inner_noc_lat)
         // Reuse auto-detect: the KB (weight) source address of the last loaded
         // job. A trigger whose KB address matches reuses the resident weights
         // (skips that load), like a real weight cache. 0xFFFFFFFF = none yet.
@@ -154,15 +222,70 @@ class Dimc_HWPE : public vp::Component {
         uint32_t running_job;   // id of the job currently executing (RUNNING_JOB reg)
         uint32_t next_job_id;   // id handed out by the next ACQUIRE
         uint32_t finished_jobs; // count of completed jobs (FINISHED reg)
-        bool     job_running;   // a committed job is in flight
+        bool     job_running;   // the engine is executing a committed job
 
-        // ---- Event-driven engine phase iterators (scheduler) ----
-        // Each returns true when its phase is complete and writes the cycles
-        // consumed by this step into *latency (mirrors redmule preload/compute/
-        // store_iter). Phase 1: compute_iter carries the analytical makespan.
+        // ---- Dual context (standard HWPE job queue) ----
+        // The job-dependent registers are banked DIMC_NB_CONTEXT times, so a
+        // second job can be offloaded while the first runs. The engine still
+        // runs one job at a time, so the per-block state and the scratch below
+        // are not banked: they hold the running job only.
+        uint32_t ctx_regs[DIMC_NB_CONTEXT][DIMC_HWPE_NB_JOB_REGS];
+        bool     ctx_busy[DIMC_NB_CONTEXT];    // acquired or committed, not yet retired
+        uint32_t ctx_job_id[DIMC_NB_CONTEXT];  // job id stamped at commit
+        int      acquired_ctx;                 // context SW is currently filling (-1 none)
+        int      running_ctx;                  // context the engine executes (-1 none)
+        int      next_ctx;                  // committed and waiting to run (-1 none)
+        int      spare_ctx;                   // 2nd committed job behind pending (-1 none)
+
+        int      ctx_alloc();                  // reserve a free context, -1 if none
+        uint32_t job_reg(uint32_t addr) const; // read a job-dep reg of the RUNNING ctx
+        void     start_next_job();             // launch the pending context, if any
+
+        // ---- Engine phase iterators ----
+        // Called once per cycle. Each sets *latency=1 and returns true when its
+        // phase is done. The makespan is not returned: it accrues in
+        // fsm_timestamp and is read from the trace.
+        //   preload_iter : real per-beat load of every macro's KB + FB
+        //   compute_iter : run each macro's matvec through its 4-deep pipeline
+        //   store_iter   : real per-beat output drain, then report fsm_timestamp
         bool preload_iter(int *latency);
         bool compute_iter(int *latency);
         bool store_iter(int *latency);
+
+        // Scratch shared across the three phases of one job (same for all blocks:
+        // one control plane issues one job shape to every inner block).
+        uint32_t job_num_active, job_row_count, job_row_base, job_compute_cyc;
+        int32_t  job_bias;
+        bool     job_skip_kb;
+
+        // Per-block step functions. Each advances ONE inner block by one cycle's
+        // worth of work and returns true when that block finished the phase; the
+        // phase wrapper owns fsm_timestamp and ends only when all blocks are done.
+        bool preload_block(Dimc_InnerBlock &blk);
+        bool compute_block(Dimc_InnerBlock &blk);
+        bool store_block(Dimc_InnerBlock &blk);
+        // Move every row a macro has finished into that macro's output buffer.
+        // compute_block needs this both at the top of a cycle and once more when
+        // the last row retires, so it lives in one place.
+        void drain_ready_rows(Dimc_InnerBlock &blk);
+
+        // ---- Cycle-accurate engine (light_redmule style) ----
+        // One cycle per fsm_event. TCDM accesses are async: on issue we record
+        // when the response is due, and each cycle we retire the beats that
+        // came back. outstanding_depth caps in-flight requests, so slow memory
+        // back-pressures the engine.
+        //
+        // The load walks (macro, row, offset). Keeping three counters in sync
+        // broke the first attempt, so the position is one linear beat index,
+        // decoded on demand.
+        uint32_t outstanding_depth;              // max in-flight TCDM beats per block
+        uint64_t fsm_timestamp;                  // cycles elapsed inside this job
+        // Derived per-job beat geometry (same for every block, computed once when
+        // the phase starts).
+        uint32_t kb_beats_per_row;               // beats to move one kernel row
+        uint32_t fb_beats_per_macro;             // beats to move one feature row
+        uint32_t beats_per_macro;                // kb rows*kb_beats + fb_beats
+        bool     phase_planned;                  // geometry latched for this phase
 
     private:
         static vp::IoReqStatus hwpe_slave(vp::Block *__this, vp::IoReq *req);
