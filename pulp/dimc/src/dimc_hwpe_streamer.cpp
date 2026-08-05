@@ -80,58 +80,51 @@ void Dimc_HWPE_Streamer::configure(
     );
 }
 
-void Dimc_HWPE_Streamer::set_base_addr(uint32_t addr) { this->base_addr = addr; }
-uint32_t Dimc_HWPE_Streamer::get_base_addr() { return this->base_addr; }
 // tot_len is a BYTE count; the linear DIMC stream is done once pos (bytes
 // consumed from base) reaches it. This keeps termination independent of the
 // per-call chunk size, which can be swept at run time.
 bool Dimc_HWPE_Streamer::is_done() { return this->pos >= this->tot_len; }
 
-int Dimc_HWPE_Streamer::rw_data(int width, void* buf, strobe_t strb) {
-    uint32_t offs = (this->base_addr + this->pos);
+// Issue one beat of at most inner_port_bytes and return the latency the memory
+// reported. The caller advances one beat per cycle and tracks the in-flight
+// response itself, which is what lets several accesses overlap.
+int Dimc_HWPE_Streamer::issue_beat(int width, void* buf) {
+    uint32_t base = this->base_addr + this->pos;
 
     if (this->is_done()) {
         return 1;
     }
-
-    // Functional transfer: one request of `width` bytes. The tile L1 interleaver
-    // (HWPEInterleaver) splits it across the 32 word-interleaved TCDM banks; we
-    // only need the data movement here and model the timing ourselves below.
-    if (buf != NULL) {
-        this->req->prepare();
-        this->req->set_addr(offs);
-        this->req->set_data((uint8_t *) buf);
-        this->req->set_size(width);
-        vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
-        if (err != vp::IO_REQ_OK) {
-            this->dimc->trace.fatal("There was an error while reading/writing data\n");
-            return 0;
-        }
+    if (width <= 0) {
+        return (int) this->dimc->port_sync_cycles;
     }
 
-    this->pos += (uint32_t)width;
+    uint32_t port_bytes = this->dimc->inner_port_bytes;
+    if (port_bytes == 0) port_bytes = 128;
+    uint32_t bank_word = this->dimc->bank_word_bytes;
+    if (bank_word == 0) bank_word = 4;
+
+    // One beat carries at most a port word; partial beats still occupy whole
+    // bank words (over-fetch: a bank always delivers a whole word).
+    int beat = (width < (int)port_bytes) ? width : (int)port_bytes;
+    int eff  = (int)(((uint32_t)beat + bank_word - 1) / bank_word * bank_word);
+    if (eff > (int)port_bytes) eff = (int)port_bytes;
+
+    int64_t latency = 1;
+    if (buf != NULL) {
+        this->req->prepare();
+        this->req->set_addr(base);
+        this->req->set_data((uint8_t *) buf);
+        this->req->set_size(beat);
+        vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
+        if (err != vp::IO_REQ_OK) {
+            this->dimc->trace.fatal("Error while issuing a TCDM beat\n");
+            return 0;
+        }
+        latency = (int64_t) this->req->get_latency();
+    }
+
+    this->pos += (uint32_t)beat;
     this->tot_iters++;
 
-    // ---- L1 bandwidth + bank-conflict timing model ----
-    // The TCDM delivers  l1_bw = (nb_banks * bank_width)  bytes per cycle for an
-    // aligned contiguous access. A request wider than l1_bw hits some banks more
-    // than once (intra-request bank conflict) and serialises into ceil(width/l1_bw)
-    // cycles. stream_bank_bytes carries l1_bw (bytes/cycle, default 128 = 32*4).
-    uint32_t l1_bw = this->dimc->stream_bank_bytes;
-    if (l1_bw == 0) l1_bw = 128;
-    // min_transfer_bank = bank word width: every bank access delivers a whole
-    // `min_bank` bytes, so a request is rounded UP to a multiple of min_bank
-    // (over-fetch waste when the access granularity is finer than the bank).
-    // MAGIA default = 4 B (DATA_W=32); for aligned 128 B rows any min_bank<=128
-    // is free, wider banks over-fetch.
-    uint32_t min_bank = this->dimc->stream_min_bank;
-    if (min_bank == 0) min_bank = 4;
-    uint32_t eff = ((uint32_t)width + min_bank - 1) / min_bank * min_bank;   // round up
-    int transfer = ((int)eff + (int)l1_bw - 1) / (int)l1_bw;     // ceil, >=1
-    return transfer + (int) this->dimc->stream_sync;
-}
-
-int Dimc_HWPE_Streamer::iterate(void* buf, strobe_t strb) {
-    int latency = 1;
-    return latency;
+    return (int)latency + (int)this->dimc->port_sync_cycles;
 }

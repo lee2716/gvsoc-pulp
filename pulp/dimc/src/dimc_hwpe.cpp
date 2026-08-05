@@ -25,36 +25,31 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
 {
     // Configuration from the systree. gvrun --param / set_stream_params set these
     // at launch without recompiling the SW test:
-    //   make run runner_args="--param dimc_chunk=64 --param dimc_l1bw=128 --param dimc_sync=0"
+    //   make run runner_args="--param dimc_inner_bw=128 --param dimc_sync=0"
     this->num_macros         = (uint32_t)this->get_js_config()->get_child_int("num_macros");
-    this->stream_chunk_bytes = (uint32_t)this->get_js_config()->get_child_int("stream_chunk_bytes");
-    this->stream_bank_bytes  = (uint32_t)this->get_js_config()->get_child_int("stream_bank_bytes");
-    this->stream_sync        = (uint32_t)this->get_js_config()->get_child_int("stream_sync");
-    this->stream_noc_lat     = (uint32_t)this->get_js_config()->get_child_int("stream_noc_lat");
-    this->stream_min_bank    = (uint32_t)this->get_js_config()->get_child_int("stream_min_bank");
-    this->stream_prefetch    = (uint32_t)this->get_js_config()->get_child_int("stream_prefetch");
-    if (this->stream_min_bank == 0)    this->stream_min_bank = 4;   // MAGIA bank word = 4 B
+    this->inner_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("inner_port_bytes");
+    this->port_sync_cycles        = (uint32_t)this->get_js_config()->get_child_int("port_sync_cycles");
+    this->inner_noc_lat     = (uint32_t)this->get_js_config()->get_child_int("inner_noc_lat");
+    this->bank_word_bytes    = (uint32_t)this->get_js_config()->get_child_int("bank_word_bytes");
+    if (this->bank_word_bytes == 0)    this->bank_word_bytes = 4;   // MAGIA bank word = 4 B
     if (this->num_macros == 0)         this->num_macros = 2;
-    if (this->stream_chunk_bytes == 0) this->stream_chunk_bytes = 128; // 1 KB row/cycle
-    if (this->stream_bank_bytes == 0)  this->stream_bank_bytes  = 128; // 32 banks * 4 B
-    // ---- OUTER BLOCK knobs (default = today's behavior => no-op) ----
-    // Read AFTER stream_bank_bytes / stream_noc_lat are finalized so the coupled
-    // defaults (l2bw=l1bw, noc_l2=noc_lat) resolve against the effective values.
-    int64_t nb = this->get_js_config()->get_child_int("stream_num_block");
-    int64_t ls = this->get_js_config()->get_child_int("stream_l2_shared");
-    int64_t ld = this->get_js_config()->get_child_int("stream_l1_depth");
-    int64_t lb = this->get_js_config()->get_child_int("stream_l2_bw");
-    int64_t n2 = this->get_js_config()->get_child_int("stream_noc_l2");
-    this->stream_num_block = (nb <= 0) ? 1 : (uint32_t)nb;
-    this->stream_l2_shared = (ls <  0) ? 1 : (uint32_t)ls;   // default 1; 0 is valid (parallel blocks)
-    this->stream_l1_depth  = (ld <= 0) ? 1 : (uint32_t)ld;
-    this->stream_l2_bw     = (lb <= 0) ? this->stream_bank_bytes : (uint32_t)lb; // 0 => same as l1bw
-    this->stream_noc_l2    = (n2 <  0) ? this->stream_noc_lat   : (uint32_t)n2;  // <0 => same as noc_lat
-    // stream_sync defaults to 0 (pipelined, RTL gnt=1). stream_noc_lat defaults
+    if (this->inner_port_bytes == 0)  this->inner_port_bytes  = 128; // 32 banks * 4 B
+    // ---- Outer block knobs ----
+    // Read after inner_port_bytes / inner_noc_lat are final, so the coupled
+    // defaults resolve against the effective values.
+    int64_t nb_blocks = this->get_js_config()->get_child_int("nb_inner_blocks");
+    int64_t shared = this->get_js_config()->get_child_int("outer_port_shared");
+    int64_t outer_bw = this->get_js_config()->get_child_int("outer_port_bytes");
+    int64_t outer_noc = this->get_js_config()->get_child_int("outer_noc_lat");
+    // Fallbacks when a property is absent = the D-tile architecture: 2 inner
+    // blocks x 2 macros = 4 macros, sharing one outer (L2) port.
+    this->nb_inner_blocks = (nb_blocks <= 0) ? 2 : (uint32_t)nb_blocks;
+    this->outer_port_shared = (shared <  0) ? 1 : (uint32_t)shared;   // 0 is valid (parallel blocks)
+    this->outer_port_bytes     = (outer_bw <= 0) ? this->inner_port_bytes : (uint32_t)outer_bw; // 0 => same as inner_bw
+    this->outer_noc_lat    = (outer_noc <  0) ? this->inner_noc_lat   : (uint32_t)outer_noc;  // <0 => same as noc_lat
+    // port_sync_cycles defaults to 0 (pipelined, RTL gnt=1). inner_noc_lat defaults
     // to 1 (dimc.py always sets it; 0 is a valid "ideal NoC" value so not forced).
-    // stream_prefetch defaults to 0 (off): keeps every existing figure's numbers.
     this->last_kb_src     = 0xFFFFFFFF;   // no resident weights yet
-    this->prev_drain_slack = 0;           // no previous trigger to prefetch from
     // HWPE slave port
     this->hwpe_slv.set_req_meth(&Dimc_HWPE::hwpe_slave);
     this->new_slave_port("hwpe_slv", &this->hwpe_slv);
@@ -63,15 +58,32 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->new_master_port("stream_mst", &this->stream_mst);
 
     // Completion interrupt master port (standard HWPE done_irq)
-    this->new_master_port("irq", &this->irq);
+    this->new_master_port("done_irq", &this->irq);
 
-    // Streamers
-    this->weight_stream = Dimc_HWPE_Streamer(this, false);
-    this->input_stream  = Dimc_HWPE_Streamer(this, false);
-    this->out_stream    = Dimc_HWPE_Streamer(this, true);
+    // ---- Inner blocks ----
+    // num_macros macros per block, nb_inner_blocks blocks. Each block owns its
+    // streamers and macros; this component drives them all, like redmule/ne16.
+    if (this->nb_inner_blocks == 0) this->nb_inner_blocks = 1;
+    this->inner_blocks.resize(this->nb_inner_blocks);
+    for (Dimc_InnerBlock &blk : this->inner_blocks) {
+        blk.weight_stream = Dimc_HWPE_Streamer(this, false);
+        blk.input_stream  = Dimc_HWPE_Streamer(this, false);
+        blk.out_stream    = Dimc_HWPE_Streamer(this, true);
+        blk.macros.resize(this->num_macros);
+        blk.reset_job_state();
+    }
 
-    // Macros
-    this->macros.resize(this->num_macros);
+    // ---- Outer ports ----
+    // One inner block reaches memory directly, so no port is created and the
+    // engine matches the single-block model bit for bit. With more blocks,
+    // outer_port_shared picks the topology: one shared port or one each.
+    if (this->nb_inner_blocks > 1) {
+        uint32_t nb_ports = this->outer_port_shared ? 1 : this->nb_inner_blocks;
+        uint32_t bw  = this->outer_port_bytes ? this->outer_port_bytes : this->inner_port_bytes;
+        uint32_t lat = this->outer_noc_lat;
+        this->outer_ports.resize(nb_ports);
+        for (Dimc_OuterPort &p : this->outer_ports) p.configure(bw, lat);
+    }
 
     // Event handlers
     this->fsm_start_event = this->event_new(&Dimc_HWPE::fsm_start_handler);
@@ -84,15 +96,34 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->next_job_id   = 0;
     this->finished_jobs = 0;
     this->job_running   = false;
+    this->acquired_ctx  = -1;
+    this->running_ctx   = -1;
+    this->next_ctx   = -1;
+    this->spare_ctx    = -1;
+    for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
+        this->ctx_busy[ctx]   = false;
+        this->ctx_job_id[ctx] = 0;
+        for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
+    }
+    this->outstanding_depth = 4;    // in-flight TCDM beats (light_redmule queue_depth)
+    this->fsm_timestamp     = 0;
+    this->kb_beats_per_row  = 1;
+    this->fb_beats_per_macro= 1;
+    this->beats_per_macro   = 1;
+    this->phase_planned     = false;
     this->state.set(DIMC_IDLE);
 
     // Traces
     this->traces.new_trace("trace", &this->trace);
 
     this->trace.msg(vp::TraceLevel::WARNING,
-        "DIMC systree config: num_macros=%u chunk=%u l1bw=%u sync=%u noc_lat=%u\n",
-        this->num_macros, this->stream_chunk_bytes,
-        this->stream_bank_bytes, this->stream_sync, this->stream_noc_lat);
+        "DIMC systree config: num_macros=%u l1bw=%u sync=%u noc_lat=%u "
+        "nb_blocks=%u blocks=%u ports=%u outer_bw=%u outer_noc=%u\n",
+        this->num_macros,
+        this->inner_port_bytes, this->port_sync_cycles, this->inner_noc_lat,
+        this->nb_inner_blocks, (uint32_t)this->inner_blocks.size(),
+        (uint32_t)this->outer_ports.size(), this->outer_port_bytes,
+        this->outer_noc_lat);
 }
 
 void Dimc_HWPE::reset(bool active)
@@ -101,16 +132,60 @@ void Dimc_HWPE::reset(bool active)
         for (uint32_t i = 0; i < N_CFG_REGS; i++) {
             this->register_file[i] = 0x0;
         }
-        for (auto &m : this->macros) m.reset();
+        for (Dimc_InnerBlock &blk : this->inner_blocks) for (auto &m : blk.macros) m.reset();
+        for (Dimc_OuterPort &p : this->outer_ports) p.reset();
         this->sel_dimc = 0;
         this->last_kb_src = 0xFFFFFFFF;
-        this->prev_drain_slack = 0;        // no prefetch across a reset boundary
         this->running_job   = 0;
         this->next_job_id   = 0;
         this->finished_jobs = 0;
         this->job_running   = false;
+        this->acquired_ctx  = -1;
+        this->running_ctx   = -1;
+        this->next_ctx   = -1;
+        this->spare_ctx    = -1;
+        for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
+            this->ctx_busy[ctx]   = false;
+            this->ctx_job_id[ctx] = 0;
+            for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
+        }
+        this->outstanding_depth = 4;    // in-flight TCDM beats (light_redmule queue_depth)
+        this->fsm_timestamp     = 0;
+        this->kb_beats_per_row  = 1;
+        this->fb_beats_per_macro= 1;
+        this->beats_per_macro   = 1;
+        this->phase_planned     = false;
+        for (Dimc_InnerBlock &blk : this->inner_blocks) blk.reset_job_state();
         this->state.set(DIMC_IDLE);
     }
+}
+
+// Reserve a free job context; -1 when every context is occupied.
+int Dimc_HWPE::ctx_alloc()
+{
+    for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++)
+        if (!this->ctx_busy[ctx]) return ctx;
+    return -1;
+}
+
+// Read a job-dependent register out of the context the engine is executing.
+uint32_t Dimc_HWPE::job_reg(uint32_t addr) const
+{
+    int ctx = (this->running_ctx >= 0) ? this->running_ctx : 0;
+    return this->ctx_regs[ctx][(addr - DIMC_HWPE_JOB_BASE) >> 2];
+}
+
+// Launch the committed-but-waiting context, if the engine is free.
+void Dimc_HWPE::start_next_job()
+{
+    if (this->job_running || this->next_ctx < 0) return;
+    this->running_ctx = this->next_ctx;
+    this->next_ctx = this->spare_ctx;   // a 2nd committed job moves up the queue
+    this->spare_ctx  = -1;
+    this->job_running = true;
+    this->running_job = this->ctx_job_id[this->running_ctx];
+    this->register_file[DIMC_HWPE_RUN_TASK >> 2] = this->running_job;
+    this->event_enqueue(this->fsm_start_event, 1);
 }
 
 vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
@@ -128,39 +203,112 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                 _this->trace.fatal("Trying to access invalid address 0x%x\n", address);
                 return vp::IO_REQ_INVALID;
             }
-            _this->register_file[(address >> 2)] = data;
+            if (address >= DIMC_HWPE_JOB_BASE) {
+                // Job-dependent write -> goes into the context SW acquired. Legacy
+                // software that never reads ACQUIRE gets one auto-allocated here so
+                // the old "configure then trigger" sequence keeps working.
+                if (_this->acquired_ctx < 0) _this->acquired_ctx = _this->ctx_alloc();
+                int ctx = (_this->acquired_ctx >= 0) ? _this->acquired_ctx : 0;
+                _this->ctx_busy[ctx] = true;
+                _this->ctx_regs[ctx][(address - DIMC_HWPE_JOB_BASE) >> 2] = data;
+            } else {
+                // Mandatory / generic (job-independent) registers stay unbanked.
+                _this->register_file[(address >> 2)] = data;
+            }
         } else {
             switch (address) {
-            case DIMC_HWPE_TRIG:   // commit_and_trigger: latch this job's id and start
-                _this->running_job = _this->next_job_id++;
-                _this->register_file[DIMC_HWPE_RUN_TASK >> 2] = _this->running_job;
-                _this->event_enqueue(_this->fsm_start_event, 1);
+            case DIMC_HWPE_TRIG: {
+                // commit_trigger (hwpe-ctrl): the written value selects the mode.
+                //   0 : commit the acquired job and start it
+                //   1 : commit only; it runs on a later trigger or on an explicit 0x2
+                //   2 : trigger the existing queue, commit nothing new
+                uint32_t mode = data & 0x3;
+
+                if (mode != 0x2) {                           // modes 0 and 1 commit
+                    int ctx = _this->acquired_ctx;
+                    if (ctx < 0) ctx = _this->ctx_alloc();       // commit with no writes
+                    if (ctx < 0) break;                        // all contexts busy: drop
+                    _this->ctx_busy[ctx]   = true;
+                    _this->ctx_job_id[ctx] = _this->next_job_id++;
+                    _this->acquired_ctx  = -1;               // SW must ACQUIRE again
+                    // Queue it. A job already waiting keeps its place: the queue is
+                    // FIFO over the contexts, next_ctx points at the head.
+                    if (_this->next_ctx < 0) _this->next_ctx = ctx;
+                    else                        _this->spare_ctx  = ctx;
+                }
+
+                // Modes 0 and 2 release the queue; mode 1 only commits.
+                if (mode != 0x1) _this->start_next_job();
                 break;
+            }
             case DIMC_HWPE_ACQ:    // acquire is observed on the read path; write is a no-op
                 break;
-            case DIMC_HWPE_SOFT_CLEAR:
-                for (auto &m : _this->macros) m.reset();
-                _this->sel_dimc = 0;
-                _this->last_kb_src = 0xFFFFFFFF;   // resident weights invalidated
-                _this->prev_drain_slack = 0;       // and no prefetch across soft_clear (single trigger)
-                for (uint32_t i = 0; i < N_CFG_REGS; i++)
-                    _this->register_file[i] = 0x0;
-                _this->state.set(DIMC_IDLE);
+            case DIMC_HWPE_SOFT_CLEAR: {
+                // soft_clear (hwpe-ctrl): the written value selects the scope.
+                //   0 : clear IP state and the register file
+                //   1 : clear IP state, keep the register file
+                //   2 : clear the register file only
+                uint32_t scope = data & 0x3;
+
+                if (scope != 0x2) {                 // scopes 0 and 1 clear IP state
+                    for (Dimc_InnerBlock &blk : _this->inner_blocks)
+                        for (auto &m : blk.macros) m.reset();
+                    _this->sel_dimc = 0;
+                    _this->last_kb_src = 0xFFFFFFFF;   // resident weights invalidated
+                    // Aborts any in-flight job: release every context, otherwise
+                    // ACQUIRE would report busy forever and acquire_block() hangs.
+                    _this->job_running  = false;
+                    _this->acquired_ctx = -1;
+                    _this->running_ctx  = -1;
+                    _this->next_ctx  = -1;
+                    _this->spare_ctx   = -1;
+                    for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) _this->ctx_busy[ctx] = false;
+                }
+                if (scope != 0x1) {                 // scopes 0 and 2 clear the regfile
+                    for (uint32_t i = 0; i < N_CFG_REGS; i++)
+                        _this->register_file[i] = 0x0;
+                    for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++)
+                        for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++)
+                            _this->ctx_regs[ctx][i] = 0x0;
+                }
+                if (scope != 0x2) _this->state.set(DIMC_IDLE);
+                // Re-publish the monotonic counters the register_file wipe cleared.
+                _this->register_file[DIMC_HWPE_FIN_JOBS >> 2] = _this->finished_jobs;
+                _this->register_file[DIMC_HWPE_RUN_TASK >> 2] = _this->running_job;
                 break;
+            }
             default:
                 break;
             }
         }
     } else {
-        // ACQUIRE: hand out a job id if a context is free, 0xFFFFFFFF (-1) if busy.
+        // ACQUIRE: on read, start a job offload and lock the controller.
+        // Reserving a context is the lock: job-dependent writes are routed into
+        // it and no other offload can claim it until commit_trigger (0x0/0x1)
+        // or soft_clear releases it. Returns 0xFFFFFFFF only when all contexts
+        // are busy, so with DIMC_NB_CONTEXT=2 a second job can be queued.
         if (address == DIMC_HWPE_ACQ) {
-            *(uint32_t *)req->get_data() = _this->job_running ? 0xFFFFFFFFu
-                                                              : _this->next_job_id;
+            if (_this->acquired_ctx < 0) _this->acquired_ctx = _this->ctx_alloc();
+            if (_this->acquired_ctx < 0) {
+                *(uint32_t *)req->get_data() = 0xFFFFFFFFu;
+            } else {
+                _this->ctx_busy[_this->acquired_ctx] = true;
+                *(uint32_t *)req->get_data() = _this->next_job_id;
+            }
             return vp::IO_REQ_OK;
         }
         if (address > DIMC_HWPE_REG_MAX) {
             _this->trace.fatal("Trying to access invalid address 0x%x\n", address);
             return vp::IO_REQ_INVALID;
+        }
+        if (address >= DIMC_HWPE_JOB_BASE) {
+            // Job-dependent reads must come from the same bank the writes went to,
+            // otherwise a read-back of a just-written job register returns 0.
+            int ctx = (_this->acquired_ctx >= 0) ? _this->acquired_ctx
+                  : (_this->running_ctx  >= 0) ? _this->running_ctx : 0;
+            *(uint32_t *)req->get_data() =
+                _this->ctx_regs[ctx][(address - DIMC_HWPE_JOB_BASE) >> 2];
+            return vp::IO_REQ_OK;
         }
         *(uint32_t *)req->get_data() = _this->register_file[(address >> 2)];
     }
