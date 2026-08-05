@@ -74,11 +74,15 @@ class Dimc_Macro {
         DimcPipeEntry drain();
 
         // Runtime configuration
-        uint8_t  compe      = DIMC_COMPE_COMPUTE;
+        uint8_t  compe      = DIMC_COMPE_COMPUTE;  // DANGLING: latched, never acted on
         uint8_t  ci         = DIMC_CI_8BIT;
         uint8_t  sign_mode  = DIMC_SIGN_UU;
         uint8_t  mct        = 0;
         int32_t  psin       = 0;
+        // Partial-sum chain: one accumulator per kernel row, so a K wider than
+        // one row can be covered by consecutive chunks without going to memory.
+        uint8_t  accumulate = 0;                       // 1 = add to accum[row]
+        int32_t  accum[DIMC_MACRO_KB_LEN] = {0};
 
         // Buffers
         uint8_t  KB[DIMC_MACRO_KB_LEN][DIMC_MACRO_KB_EW];
@@ -86,7 +90,7 @@ class Dimc_Macro {
 
         // Outputs
         int32_t  psout = 0;
-        uint8_t  sout  = 0;
+        uint8_t  sout  = 0;   // DANGLING: computed by final_compute, never wired out
 
         // Pipeline state: in-flight entries waiting to drain
         std::deque<DimcPipeEntry> pipe;
