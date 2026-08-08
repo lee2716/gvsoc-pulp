@@ -74,7 +74,7 @@ class Dimc_Macro {
         DimcPipeEntry drain();
 
         // Runtime configuration
-        uint8_t  compe      = DIMC_COMPE_COMPUTE;  // DANGLING: latched, never acted on
+        uint8_t  compe      = DIMC_COMPE_COMPUTE;  // latched, never acted on
         uint8_t  ci         = DIMC_CI_8BIT;
         uint8_t  sign_mode  = DIMC_SIGN_UU;
         uint8_t  mct        = 0;
@@ -90,7 +90,7 @@ class Dimc_Macro {
 
         // Outputs
         int32_t  psout = 0;
-        uint8_t  sout  = 0;   // DANGLING: computed by final_compute, never wired out
+        uint8_t  sout  = 0;   // computed by final_compute, never wired out
 
         // Pipeline state: in-flight entries waiting to drain
         std::deque<DimcPipeEntry> pipe;

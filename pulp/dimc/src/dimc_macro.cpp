@@ -85,8 +85,8 @@ void Dimc_Macro::write_row(int row, const uint8_t *src)
     std::memcpy(this->KB[row], src, DIMC_MACRO_KB_EW);
 }
 
-// Dangling: no caller. This is the COMPE=0 memory-mode read-back path; the
-// compute pipeline never uses it. Kept for register/behaviour fidelity.
+// The COMPE=0 memory-mode read-back path. No caller: the compute pipeline
+// never uses it. Kept for register/behaviour fidelity.
 void Dimc_Macro::read_row(int row, uint8_t *dst) const
 {
     if (row < 0 || row >= DIMC_MACRO_KB_LEN) return;
@@ -111,7 +111,7 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
     switch (this->ci) {
     case DIMC_CI_1BIT: {
         // 1-bit multiply = XNOR + popcount (bipolar encoding: bit 0 = -1, bit 1 = +1,
-        // so the product is +1 exactly when the two bits AGREE). Confirmed 2026-07-18.
+        // so the product is +1 exactly when the two bits AGREE).
         // Alternative convention: AND is the literal unsigned {0,1} multiply.
         for (uint32_t i = 0; i < valid_bytes; i++) {
             uint8_t x = ~((uint8_t)(this->KB[row_sel][i] ^ this->FB[i]));
@@ -185,12 +185,10 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
     return comp;
 }
 
-// DANGLING PATH: the value this returns is DISCARDED by issue(), and `sout` is
-// never read by the FSM (the pipeline carries `psout`). Consequences:
-//   * the `bias` argument NEVER reaches the 32-bit output the test reads;
-//   * the ReLU + 8-bit saturation result (`sout`) is not wired out anywhere;
-//   * there is no requantisation, so `sout` saturates for INT4/INT8 ranges.
-// Confirmed as an unused path on 2026-07-18; left as-is.
+// Unused path: issue() discards the return value and the FSM never reads
+// `sout`, since the pipeline carries `psout`. So `bias` does not reach the
+// 32-bit output, the ReLU + 8-bit saturation result goes nowhere, and there is
+// no requantisation before the saturation.
 int32_t Dimc_Macro::final_compute(int32_t bias)
 {
     int32_t psum = this->psout + bias;
