@@ -26,6 +26,7 @@ from pulp.chips.democritos.democritos_D_tile import Democritos_D_Tile
 from pulp.chips.democritos.democritos_arch import DemocritosArch
 from pulp.floonoc.floonoc import *
 from pulp.chips.magia_v2.fractal_sync.fractal_sync import *
+from pulp.chips.magia.kill_module.kill_module import KillModule
 from typing import List, Dict
 import math
 
@@ -65,6 +66,17 @@ class DemocritosSoc(gvsoc.systree.Component):
         cluster:List[Democritos_D_Tile] = []
         for id in range(0,DemocritosArch.NB_CLUSTERS):
             cluster.append(Democritos_D_Tile(self, f'democritos-D-tile-{id}', parser, id))
+
+        # End-of-simulation. crt0's exit sequence has every tile store a halfword
+        # at TEST_END_ADDR_START + 2*mhartid, which the D-tile maps out through
+        # its killer port. Waiting for all tiles keeps an early finisher from
+        # ending the run while the others are still printing.
+        killer = KillModule(self, 'kill-module',
+                            kill_addr_base=DemocritosArch.TEST_END_ADDR_START,
+                            kill_addr_size=DemocritosArch.TEST_END_SIZE,
+                            nb_cores_to_wait=DemocritosArch.NB_CLUSTERS)
+        for id in range(0, DemocritosArch.NB_CLUSTERS):
+            cluster[id].o_KILLER_OUTPUT(killer.i_INPUT())
 
         # L2 memory
         l2_mem:List[memory.Memory] = []
