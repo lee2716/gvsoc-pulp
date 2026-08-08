@@ -114,16 +114,10 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
         idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
 
-        # DIMC HWPE. Streamer knobs default in the Dimc systree; gvrun --param
-        # (via set_dimc_params below) sets them at launch for sweeps, and the SW
-        # can still override per-trigger via MMIO (STREAM_CHUNK / STREAM_BANK /
-        # STREAM_SYNC) for a one-run multi-config sweep.
-        # D-tile = ONE outer block: 2 inner blocks x 2 macros = 4 DIMC macros.
-        # `num_macros` is the macros PER INNER BLOCK (they share one inner port
-        # and double-buffer against each other); the 2 inner blocks and their
-        # outer ping-pong come from stream_num_block=2 / stream_l1_depth=2,
-        # whose defaults live in Dimc() and can be overridden with gvrun --param.
-        dimc = Dimc(self, 'dimc', num_macros=2)
+        # DIMC HWPE. One outer block = 2 inner blocks x 2 macros = 4 macros.
+        # The macros of a block share one inner port and double-buffer against
+        # each other; the rest of the architecture is fixed in Dimc().
+        dimc = Dimc(self, 'dimc', macros_per_block=2)
         self.dimc = dimc
 
         # Event unit (mirrors pulp/chips/magia_v2/tile.py). The address window is
@@ -238,10 +232,10 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         self.bind(dimc, 'done_irq', event_unit, 'in_event_10_pe_0')
         # FractalSync barrier completion -> event 24 (same slot as magia_v2).
         self.bind(fsync_mm_ctrl, 'fsync_done_irq', event_unit, 'in_event_24_pe_0')
-        # DANGLING event slots: magia_v2 additionally routes
+        # Unconnected event slots: magia_v2 also routes
         #   idma_mm_ctrl 'idma0_done_irq' -> in_event_2_pe_0
         #   idma_mm_ctrl 'idma1_done_irq' -> in_event_3_pe_0
-        # Those stay unconnected: the iDMA interrupts are not modelled yet.
+        # The iDMA interrupts are not modelled here.
 
         # FractalSync controller registers, so software can request a barrier.
         # Same address window magia_v2 uses (arch reserves FSYNC_CTRL_*).
@@ -345,16 +339,6 @@ class Democritos_D_Tile(gvsoc.systree.Component):
 
     def i_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL(self) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, 'north_south_neighbour_fractal_2_xif', signature='wire<PortResp<uint32_t>*>')
-
-    # Forward gvrun --param streamer knobs to the DIMC (called from the SoC/board
-    # configure() chain, mirrors PCM's set_weights_path propagation).
-    def set_dimc_params(self, inner_bw=None, sync=None, noc_lat=None,
-                        bank_word=None, nb_inner=None, outer_shared=None,
-                        outer_bw=None, outer_noc=None):
-        self.dimc.set_stream_params(inner_bw=inner_bw, sync=sync,
-                                    noc_lat=noc_lat, bank_word=bank_word,
-                                    nb_inner=nb_inner, outer_shared=outer_shared,
-                                    outer_bw=outer_bw, outer_noc=outer_noc)
 
     # Output (master) port to off-tile L2 memory
     def o_NARROW_OUTPUT(self, itf: gvsoc.systree.SlaveItf):

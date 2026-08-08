@@ -97,14 +97,14 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     _this->sel_dimc   = (uint8_t)(_this->register_file[DIMC_HWPE_SEL_DIMC  >> 2] & 0xFF);
     for (Dimc_InnerBlock &blk : _this->inner_blocks)
     for (auto &m : blk.macros) {
-        // DANGLING: `compe` (memory-vs-compute mode) is latched into every macro
-        // but nothing reads it. compute_PP always performs the dot product; the
-        // COMPE=0 memory mode is NOT implemented.
+        // `compe` (memory-vs-compute mode) is latched but never read: compute_PP
+        // always performs the dot product, and COMPE=0 memory mode is not
+        // implemented.
         m.compe = compe; m.ci = ci; m.sign_mode = sign_mode; m.mct = mct;
         m.accumulate = accum_en;
     }
-    // DANGLING: `sel_dimc` is stored but never consulted; macro selection is done
-    // by NUM_MACROS (num_active) instead. Kept only for register-map fidelity.
+    // `sel_dimc` is stored but never consulted: macro selection goes through
+    // NUM_MACROS (num_active). It exists for register-map fidelity.
 
     // job_running / running_job were latched by start_next_job() at commit.
     _this->register_file[DIMC_HWPE_STATUS >> 2] = 0x0;   // busy
@@ -154,10 +154,9 @@ void Dimc_HWPE::fsm_end_handler(vp::Block *__this, vp::ClockEvent *event)
 
 void Dimc_HWPE::fsm_loop()
 {
-    // Every phase returns latency=1, so this do-while runs fsm() once per call.
-    // It is left over from the pre-V3 model, where phases returned 0 and were
-    // chained in one instant. The job advances one cycle per fsm_event; the
-    // makespan accrues in fsm_timestamp, not here.
+    // Every phase returns latency=1, so this runs fsm() once per call. The job
+    // advances one cycle per fsm_event and the makespan accrues in
+    // fsm_timestamp, not here.
     uint32_t latency = 0;
 
     do {
@@ -165,8 +164,7 @@ void Dimc_HWPE::fsm_loop()
     } while (latency == 0 && state.get() != DIMC_FINISHED);
 
     // On completion fsm() returns 1, not the makespan: those cycles were already
-    // spent stepping, so fsm_end fires now. Returning the makespan here would
-    // double the job time seen by gvsoc and SW (see store_iter's tail).
+    // spent stepping. Returning the makespan here would count them twice.
     if (state.get() == DIMC_FINISHED && !this->fsm_end_event->is_enqueued()) {
         this->event_enqueue(this->fsm_end_event, latency);
     } else if (!this->fsm_event->is_enqueued()) {
@@ -267,7 +265,7 @@ uint64_t Dimc_HWPE::block_working_set() const
 bool Dimc_HWPE::preload_iter(int *latency)
 {
     *latency = 1;
-    const uint32_t port_bytes = this->inner_port_bytes ? this->inner_port_bytes : 128;
+    const uint32_t port_bytes = this->inner_port_bytes;
 
     // ---- first cycle of the phase: latch the job shape, plan every block ----
     if (!this->phase_planned) {
@@ -356,7 +354,7 @@ bool Dimc_HWPE::preload_iter(int *latency)
 // position state; (macro, row, offset) are derived, so they cannot drift apart.
 bool Dimc_HWPE::preload_block(Dimc_InnerBlock &blk)
 {
-    const uint32_t port_bytes = this->inner_port_bytes ? this->inner_port_bytes : 128;
+    const uint32_t port_bytes = this->inner_port_bytes;
 
     // The block's data has not landed from the outer port yet.
     if ((int64_t)this->fsm_timestamp < blk.data_ready_cycle) return false;
@@ -481,7 +479,7 @@ bool Dimc_HWPE::store_iter(int *latency)
     *latency = 1;
     const uint32_t num_active = this->job_num_active;
     const uint32_t row_count  = this->job_row_count;
-    const uint32_t port_bytes = this->inner_port_bytes ? this->inner_port_bytes : 128;
+    const uint32_t port_bytes = this->inner_port_bytes;
     const uint32_t out_bytes  = row_count * 4;
     const uint32_t out_beats  = (out_bytes + port_bytes - 1) / port_bytes;
 
@@ -551,12 +549,10 @@ bool Dimc_HWPE::store_iter(int *latency)
         }
     }
 
-    // The makespan has already been spent: each phase advanced the clock one
-    // cycle per beat, so job start to here already took `finish` cycles. The
-    // completion event fires after 1 cycle, not after `finish` more, which
-    // would double the job time seen by gvsoc and SW. `finish` only goes to the
-    // trace. Pre-V3 the phases were 0-latency and delay=finish was correct; the
-    // per-cycle rewrite turned that into a double count.
+    // Each phase advanced the clock one cycle per beat, so job start to here
+    // already took `finish` cycles. The completion event therefore fires after
+    // 1 cycle, not after `finish` more, which would count them twice. `finish`
+    // only goes to the trace.
     *latency = 1;
     this->trace.msg(vp::TraceLevel::WARNING,
         "DIMC double-buffer: num_active=%u row_count=%u l1bw=%u "
@@ -569,7 +565,7 @@ bool Dimc_HWPE::store_iter(int *latency)
 bool Dimc_HWPE::store_block(Dimc_InnerBlock &blk)
 {
     const uint32_t row_count  = this->job_row_count;
-    const uint32_t port_bytes = this->inner_port_bytes ? this->inner_port_bytes : 128;
+    const uint32_t port_bytes = this->inner_port_bytes;
     const uint32_t out_bytes  = row_count * 4;
     const uint32_t out_beats  = (out_bytes + port_bytes - 1) / port_bytes;
 

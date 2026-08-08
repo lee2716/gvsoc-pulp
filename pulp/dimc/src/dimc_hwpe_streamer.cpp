@@ -31,9 +31,6 @@ Dimc_HWPE_Streamer::Dimc_HWPE_Streamer(Dimc_HWPE* dimc, bool is_write) {
     this->d3_stride = 0;
     this->pos       = 0;
     this->tot_iters = 0;
-    this->d0_iters  = 0;
-    this->d1_iters  = 0;
-    this->d2_iters  = 0;
     this->req       = this->dimc->stream_mst.req_new(0, 0, 0, is_write);
     this->is_write  = is_write;
 }
@@ -64,9 +61,6 @@ void Dimc_HWPE_Streamer::configure(
     this->d3_stride = d3_stride;
     this->pos       = 0;
     this->tot_iters = 0;
-    this->d0_iters  = 0;
-    this->d1_iters  = 0;
-    this->d2_iters  = 0;
 
     this->dimc->trace.msg("base addr %x\ntot len %d\nd0 len %d\nd0 stride %d\nd1 len %d\nd1 stride %d\nd2 stride %d\nd3 stride %d\n",
         this->base_addr,
@@ -80,9 +74,9 @@ void Dimc_HWPE_Streamer::configure(
     );
 }
 
-// tot_len is a BYTE count; the linear DIMC stream is done once pos (bytes
-// consumed from base) reaches it. This keeps termination independent of the
-// per-call chunk size, which can be swept at run time.
+// tot_len is a BYTE count. This bound is looser than the engine's beat_total,
+// so it never ends a phase early: TOTAL_LENGTH and NUM_MACROS come from the same
+// num_jobs, and the engine only clamps num_active downwards.
 bool Dimc_HWPE_Streamer::is_done() { return this->pos >= this->tot_len; }
 
 // Issue one beat of at most inner_port_bytes and return the latency the memory
@@ -98,16 +92,10 @@ int Dimc_HWPE_Streamer::issue_beat(int width, void* buf) {
         return (int) this->dimc->port_sync_cycles;
     }
 
-    uint32_t port_bytes = this->dimc->inner_port_bytes;
-    if (port_bytes == 0) port_bytes = 128;
-    uint32_t bank_word = this->dimc->bank_word_bytes;
-    if (bank_word == 0) bank_word = 4;
-
-    // One beat carries at most a port word; partial beats still occupy whole
-    // bank words (over-fetch: a bank always delivers a whole word).
+    // One beat carries at most a port word. Bank-granularity over-fetch is not
+    // modelled: L1 is addressed at byte granularity here.
+    const uint32_t port_bytes = this->dimc->inner_port_bytes;
     int beat = (width < (int)port_bytes) ? width : (int)port_bytes;
-    int eff  = (int)(((uint32_t)beat + bank_word - 1) / bank_word * bank_word);
-    if (eff > (int)port_bytes) eff = (int)port_bytes;
 
     int64_t latency = 1;
     if (buf != NULL) {

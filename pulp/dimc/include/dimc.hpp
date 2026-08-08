@@ -69,9 +69,6 @@ class Dimc_HWPE_Streamer {
 
         uint32_t    pos;
         uint32_t    tot_iters;
-        uint32_t    d0_iters;
-        uint32_t    d1_iters;
-        uint32_t    d2_iters;
 
         uint32_t    base_addr;
         uint32_t    tot_len;
@@ -173,8 +170,8 @@ class Dimc_HWPE : public vp::Component {
         vp::WireMaster<bool> irq;
 
         // ---- Inner blocks (nb_inner_blocks of them) ----
-        // Each owns its streamers and macros. nb_inner_blocks == 1 reduces to
-        // exactly the previous single-block engine.
+        // Each owns its streamers and macros. nb_inner_blocks == 1 is a single
+        // block on the inner port, with no outer port.
         std::vector<Dimc_InnerBlock> inner_blocks;
 
         // ---- Outer ports ----
@@ -195,7 +192,6 @@ class Dimc_HWPE : public vp::Component {
         uint32_t inner_port_bytes;    // inner (L1) port bytes/cycle, e.g. 32 banks*4=128
         uint32_t port_sync_cycles;          // per-beat wrapper sync cycle (0/1)
         uint32_t inner_noc_lat;       // NoC round-trip latency per streamer burst (bandwidth-independent)
-        uint32_t bank_word_bytes;      // min transfer per bank = bank word width (bytes); over-fetch when finer
         // ---- Outer block ----
         // An inner block is num_macros macros on one inner port. An outer block
         // is nb_inner_blocks of them, each a real Dimc_InnerBlock reaching L2

@@ -23,32 +23,19 @@
 
 Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
 {
-    // Configuration from the systree. gvrun --param / set_stream_params set these
-    // at launch without recompiling the SW test:
-    //   make run runner_args="--param dimc_inner_bw=128 --param dimc_sync=0"
-    this->num_macros         = (uint32_t)this->get_js_config()->get_child_int("num_macros");
+    // Registered first so the systree check below can report through it.
+    this->traces.new_trace("trace", &this->trace);
+
+    // Architecture, from the systree. Dimc() in dimc.py writes every property.
+    this->num_macros        = (uint32_t)this->get_js_config()->get_child_int("num_macros");
     this->inner_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("inner_port_bytes");
-    this->port_sync_cycles        = (uint32_t)this->get_js_config()->get_child_int("port_sync_cycles");
+    this->port_sync_cycles  = (uint32_t)this->get_js_config()->get_child_int("port_sync_cycles");
     this->inner_noc_lat     = (uint32_t)this->get_js_config()->get_child_int("inner_noc_lat");
-    this->bank_word_bytes    = (uint32_t)this->get_js_config()->get_child_int("bank_word_bytes");
-    if (this->bank_word_bytes == 0)    this->bank_word_bytes = 4;   // MAGIA bank word = 4 B
-    if (this->num_macros == 0)         this->num_macros = 2;
-    if (this->inner_port_bytes == 0)  this->inner_port_bytes  = 128; // 32 banks * 4 B
-    // ---- Outer block knobs ----
-    // Read after inner_port_bytes / inner_noc_lat are final, so the coupled
-    // defaults resolve against the effective values.
-    int64_t nb_blocks = this->get_js_config()->get_child_int("nb_inner_blocks");
-    int64_t shared = this->get_js_config()->get_child_int("outer_port_shared");
-    int64_t outer_bw = this->get_js_config()->get_child_int("outer_port_bytes");
-    int64_t outer_noc = this->get_js_config()->get_child_int("outer_noc_lat");
-    // Fallbacks when a property is absent = the D-tile architecture: 2 inner
-    // blocks x 2 macros = 4 macros, sharing one outer (L2) port.
-    this->nb_inner_blocks = (nb_blocks <= 0) ? 2 : (uint32_t)nb_blocks;
-    this->outer_port_shared = (shared <  0) ? 1 : (uint32_t)shared;   // 0 is valid (parallel blocks)
-    this->outer_port_bytes     = (outer_bw <= 0) ? this->inner_port_bytes : (uint32_t)outer_bw; // 0 => same as inner_bw
-    this->outer_noc_lat    = (outer_noc <  0) ? this->inner_noc_lat   : (uint32_t)outer_noc;  // <0 => same as noc_lat
-    // port_sync_cycles defaults to 0 (pipelined, RTL gnt=1). inner_noc_lat defaults
-    // to 1 (dimc.py always sets it; 0 is a valid "ideal NoC" value so not forced).
+    this->nb_inner_blocks   = (uint32_t)this->get_js_config()->get_child_int("nb_inner_blocks");
+    this->outer_port_shared = (uint32_t)this->get_js_config()->get_child_int("outer_port_shared");
+    this->outer_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("outer_port_bytes");
+    this->outer_noc_lat     = (uint32_t)this->get_js_config()->get_child_int("outer_noc_lat");
+
     this->last_kb_src     = 0xFFFFFFFF;   // no resident weights yet
     // HWPE slave port
     this->hwpe_slv.set_req_meth(&Dimc_HWPE::hwpe_slave);
@@ -63,7 +50,6 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     // ---- Inner blocks ----
     // num_macros macros per block, nb_inner_blocks blocks. Each block owns its
     // streamers and macros; this component drives them all, like redmule/ne16.
-    if (this->nb_inner_blocks == 0) this->nb_inner_blocks = 1;
     this->inner_blocks.resize(this->nb_inner_blocks);
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
         blk.weight_stream = Dimc_HWPE_Streamer(this, false);
@@ -79,10 +65,9 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     // outer_port_shared picks the topology: one shared port or one each.
     if (this->nb_inner_blocks > 1) {
         uint32_t nb_ports = this->outer_port_shared ? 1 : this->nb_inner_blocks;
-        uint32_t bw  = this->outer_port_bytes ? this->outer_port_bytes : this->inner_port_bytes;
-        uint32_t lat = this->outer_noc_lat;
         this->outer_ports.resize(nb_ports);
-        for (Dimc_OuterPort &p : this->outer_ports) p.configure(bw, lat);
+        for (Dimc_OuterPort &p : this->outer_ports)
+            p.configure(this->outer_port_bytes, this->outer_noc_lat);
     }
 
     // Event handlers
@@ -113,9 +98,6 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->phase_planned     = false;
     this->state.set(DIMC_IDLE);
 
-    // Traces
-    this->traces.new_trace("trace", &this->trace);
-
     this->trace.msg(vp::TraceLevel::WARNING,
         "DIMC systree config: num_macros=%u l1bw=%u sync=%u noc_lat=%u "
         "nb_blocks=%u blocks=%u ports=%u outer_bw=%u outer_noc=%u\n",
@@ -129,6 +111,22 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
 void Dimc_HWPE::reset(bool active)
 {
     if (active) {
+        // A zero means the property never reached the model. Abort rather than
+        // substitute a default, which would run a different machine silently.
+        // trace_file is only valid once the trace engine has started, so this
+        // check cannot live in the constructor.
+        if (this->num_macros == 0 || this->inner_port_bytes == 0 ||
+            this->nb_inner_blocks == 0 || this->outer_port_bytes == 0) {
+            // trace.fatal writes to stdout and ends in abort(), which does not
+            // flush stdio, so its message is lost whenever stdout is a pipe.
+            // stderr is unbuffered and always reaches the user.
+            fprintf(stderr,
+                    "DIMC systree incomplete: num_macros=%u inner_port_bytes=%u "
+                    "nb_inner_blocks=%u outer_port_bytes=%u (all must be non-zero)\n",
+                    this->num_macros, this->inner_port_bytes,
+                    this->nb_inner_blocks, this->outer_port_bytes);
+            this->trace.fatal("DIMC systree incomplete\n");
+        }
         for (uint32_t i = 0; i < N_CFG_REGS; i++) {
             this->register_file[i] = 0x0;
         }
@@ -204,9 +202,9 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                 return vp::IO_REQ_INVALID;
             }
             if (address >= DIMC_HWPE_JOB_BASE) {
-                // Job-dependent write -> goes into the context SW acquired. Legacy
-                // software that never reads ACQUIRE gets one auto-allocated here so
-                // the old "configure then trigger" sequence keeps working.
+                // Job-dependent write -> goes into the context SW acquired.
+                // Software that never reads ACQUIRE gets one allocated here, so
+                // a plain "configure then trigger" sequence also works.
                 if (_this->acquired_ctx < 0) _this->acquired_ctx = _this->ctx_alloc();
                 int ctx = (_this->acquired_ctx >= 0) ? _this->acquired_ctx : 0;
                 _this->ctx_busy[ctx] = true;
