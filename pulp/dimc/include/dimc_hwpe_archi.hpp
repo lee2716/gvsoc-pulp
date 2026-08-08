@@ -85,9 +85,9 @@
 #define DIMC_HWPE_CFG_BIAS           (DIMC_HWPE_BASE + 0x80)
 #define DIMC_HWPE_PSIN               (DIMC_HWPE_BASE + 0x84)
 
-// Streamer bandwidth (chunk/l1bw/sync) and kernel reuse are NOT MMIO: bandwidth
-// is a fixed hardware property set from the systree / gvrun --param, and reuse is
-// auto-detected in the FSM by comparing the KB/FB source address to the last job.
+/* Streamer bandwidth and kernel reuse are not MMIO: bandwidth is fixed in the
+ * systree, and reuse is detected in the FSM by comparing the KB source address
+ * to the previous job's. */
 /* Partial-sum chain control. A dot product wider than one macro row (K > the
  * row width) is split into chunks that run back to back on the same macro:
  *   0 = start a fresh sum, the chunk's result replaces the accumulator
