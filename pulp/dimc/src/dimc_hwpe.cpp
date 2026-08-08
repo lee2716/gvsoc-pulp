@@ -130,7 +130,11 @@ void Dimc_HWPE::reset(bool active)
         for (uint32_t i = 0; i < N_CFG_REGS; i++) {
             this->register_file[i] = 0x0;
         }
-        for (Dimc_InnerBlock &blk : this->inner_blocks) for (auto &m : blk.macros) m.reset();
+        for (Dimc_InnerBlock &blk : this->inner_blocks) {
+            for (auto &m : blk.macros) m.reset();
+            blk.out_accum.clear();
+            blk.out_accum.enable = 0;
+        }
         for (Dimc_OuterPort &p : this->outer_ports) p.reset();
         this->sel_dimc = 0;
         this->last_kb_src = 0xFFFFFFFF;
@@ -201,6 +205,19 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                 _this->trace.fatal("Trying to access invalid address 0x%x\n", address);
                 return vp::IO_REQ_INVALID;
             }
+            // Job-independent, so handle it before the per-context banking.
+            if (address == DIMC_HWPE_ACC_CTRL) {
+                for (Dimc_InnerBlock &blk : _this->inner_blocks) {
+                    blk.out_accum.enable = (data & DIMC_HWPE_ACC_CTRL_EN_BIT) ? 1 : 0;
+                    if (data & DIMC_HWPE_ACC_CTRL_CLR_BIT) blk.out_accum.clear();
+                }
+                _this->register_file[address >> 2] = data & DIMC_HWPE_ACC_CTRL_EN_BIT;
+                return vp::IO_REQ_OK;
+            }
+            if (address == DIMC_HWPE_ACC_VAL_0 || address == DIMC_HWPE_ACC_VAL_1) {
+                _this->trace.fatal("ACC_VAL is read-only (address 0x%x)\n", address);
+                return vp::IO_REQ_INVALID;
+            }
             if (address >= DIMC_HWPE_JOB_BASE) {
                 // Job-dependent write -> goes into the context SW acquired.
                 // Software that never reads ACQUIRE gets one allocated here, so
@@ -249,8 +266,10 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                 uint32_t scope = data & 0x3;
 
                 if (scope != 0x2) {                 // scopes 0 and 1 clear IP state
-                    for (Dimc_InnerBlock &blk : _this->inner_blocks)
+                    for (Dimc_InnerBlock &blk : _this->inner_blocks) {
                         for (auto &m : blk.macros) m.reset();
+                        blk.out_accum.clear();      // accumulator.sv clear_i
+                    }
                     _this->sel_dimc = 0;
                     _this->last_kb_src = 0xFFFFFFFF;   // resident weights invalidated
                     // Aborts any in-flight job: release every context, otherwise
@@ -298,6 +317,14 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
         if (address > DIMC_HWPE_REG_MAX) {
             _this->trace.fatal("Trying to access invalid address 0x%x\n", address);
             return vp::IO_REQ_INVALID;
+        }
+        // acc_o. Read-only; a write faults on the path above.
+        if (address == DIMC_HWPE_ACC_VAL_0 || address == DIMC_HWPE_ACC_VAL_1) {
+            uint32_t blk_id = (address == DIMC_HWPE_ACC_VAL_0) ? 0 : 1;
+            int32_t v = (blk_id < _this->inner_blocks.size())
+                      ? _this->inner_blocks[blk_id].out_accum.acc : 0;
+            *(uint32_t *)req->get_data() = (uint32_t)v;
+            return vp::IO_REQ_OK;
         }
         if (address >= DIMC_HWPE_JOB_BASE) {
             // Job-dependent reads must come from the same bank the writes went to,
