@@ -435,6 +435,8 @@ void Dimc_HWPE::drain_ready_rows(Dimc_InnerBlock &blk)
             DimcPipeEntry e = blk.macros[m].drain();
             uint32_t psout_u = (uint32_t)e.psout;
             std::memcpy(out_buf + e.job_row * out_w, &psout_u, out_w);
+            // The same pop clocks the output accumulator (cleopatra.sv).
+            blk.out_accum.push(e.psout);
         }
     }
 }
@@ -546,6 +548,11 @@ bool Dimc_HWPE::store_iter(int *latency)
             this->trace.msg(vp::TraceLevel::WARNING,
                 "macro[%u]: load_done=%u compute=%u OUT=%u\n",
                 b * num_active + m, blk.load_done[m], compute_cyc, blk.out_lat);
+        }
+        if (blk.out_accum.enable) {
+            this->trace.msg(vp::TraceLevel::WARNING,
+                "block[%u] out_accum: acc=%d n=%u\n",
+                b, blk.out_accum.acc, blk.out_accum.count);
         }
     }
 

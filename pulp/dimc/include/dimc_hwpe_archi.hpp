@@ -53,6 +53,16 @@
  * exposes `finished` at 0x08. Job-INDEPENDENT, so it is not banked per context. */
 #define DIMC_HWPE_AUTOTRIGGER_N      (DIMC_HWPE_BASE + 0x38)
 
+/* Output accumulator, one per inner block (rtl/accumulator.sv via cleopatra.sv).
+ * Sums every result the block emits, across rows and across jobs.
+ * Job-INDEPENDENT: ACC_CTRL must stay below JOB_BASE or it gets banked per
+ * context and the accumulator turns per-job. */
+#define DIMC_HWPE_ACC_CTRL           (DIMC_HWPE_BASE + 0x3C)  /* b0=enable b1=clear */
+#define DIMC_HWPE_ACC_CTRL_EN_BIT    (1 << 0)
+#define DIMC_HWPE_ACC_CTRL_CLR_BIT   (1 << 1)
+#define DIMC_HWPE_ACC_VAL_0          (DIMC_HWPE_BASE + 0x8C)  /* read-only acc_o, block 0 */
+#define DIMC_HWPE_ACC_VAL_1          (DIMC_HWPE_BASE + 0x90)  /* read-only acc_o, block 1 */
+
 /* ============== Job-DEPENDENT registers @ 0x40 ==============
  * Per-job context: data pointers, stream geometry, per-job scalars.
  * This block is BANKED PER CONTEXT (DIMC_NB_CONTEXT copies): software ACQUIREs
@@ -96,6 +106,6 @@
  * no extra memory traffic. Software reads the final result from DST after the
  * last chunk. */
 #define DIMC_HWPE_ACCUM_EN           (DIMC_HWPE_BASE + 0x88)
-#define DIMC_HWPE_REG_MAX            (DIMC_HWPE_BASE + 0x88)
+#define DIMC_HWPE_REG_MAX            (DIMC_HWPE_BASE + 0x90)
 
 #endif

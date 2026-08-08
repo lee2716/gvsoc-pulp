@@ -100,6 +100,36 @@ class Dimc_OuterPort {
         uint32_t burst_latency;
 };
 
+// ---- rtl/accumulator.sv, instantiated by rtl/cleopatra.sv ----
+// Sums every result popped from the block's output FIFO into one register.
+// The FIFO is 24 bits wide, so each value wraps to 24 bits before being added.
+class Dimc_OutAccum {
+    public:
+        void push(int32_t psout)
+        {
+            if (!this->enable) return;
+            this->acc += Dimc_OutAccum::to_int24(psout);
+            this->count++;
+        }
+
+        void clear()
+        {
+            this->acc = 0;
+            this->count = 0;
+        }
+
+        // 24-bit FIFO word, sign-extended back to the host's int32.
+        static int32_t to_int24(int32_t v)
+        {
+            int32_t masked = v & 0xFFFFFF;
+            return (masked & 0x800000) ? (masked - 0x1000000) : masked;
+        }
+
+        int32_t  acc    = 0;   // acc_q
+        uint32_t count  = 0;   // values summed, trace only
+        uint8_t  enable = 0;   // acc_enable_i
+};
+
 // ---- Inner block: num_macros macros on one inner (L1) port ----
 // A plain class, not a vp::Component, like redmule.hpp:22 RedMule_Engine.
 // One control plane drives N of these.
@@ -133,6 +163,9 @@ class Dimc_InnerBlock {
         std::vector<std::vector<uint8_t>> out_buf;
         std::vector<uint32_t> load_done;   // per-macro L1-load completion cycle
         uint32_t out_lat;
+
+        // Accumulates across jobs, so reset_job_state() must not touch it.
+        Dimc_OutAccum out_accum;
 
         // Clear everything the engine tracks for one job. Called from the
         // constructor, from reset(), and at every job start, so the three sites
