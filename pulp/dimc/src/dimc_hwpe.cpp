@@ -62,6 +62,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
         blk.weight_stream = Dimc_HWPE_Streamer(this, false);
         blk.input_stream  = Dimc_HWPE_Streamer(this, false);
         blk.out_stream    = Dimc_HWPE_Streamer(this, true);
+        blk.psin_stream   = Dimc_HWPE_Streamer(this, false);
         blk.macros.resize(this->num_macros);
         blk.reset_job_state();
     }
@@ -118,6 +119,8 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->fb_beats_per_macro= 1;
     this->beats_per_macro   = 1;
     this->phase_planned     = false;
+    this->psin_beats_per_macro = 0;
+    this->job_psin_rows        = 0;
     this->state.set(DIMC_IDLE);
 
     this->trace.msg(vp::TraceLevel::WARNING,
@@ -179,6 +182,8 @@ void Dimc_HWPE::reset(bool active)
         this->fb_beats_per_macro= 1;
         this->beats_per_macro   = 1;
         this->phase_planned     = false;
+        this->psin_beats_per_macro = 0;
+        this->job_psin_rows        = 0;
         for (Dimc_InnerBlock &blk : this->inner_blocks) blk.reset_job_state();
         this->state.set(DIMC_IDLE);
 

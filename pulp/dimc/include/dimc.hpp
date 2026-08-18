@@ -143,6 +143,7 @@ class Dimc_InnerBlock {
         Dimc_HWPE_Streamer weight_stream;
         Dimc_HWPE_Streamer input_stream;
         Dimc_HWPE_Streamer out_stream;
+        Dimc_HWPE_Streamer psin_stream;   // per-row partial sums in, when PSIN_EN
         std::vector<Dimc_Macro> macros;
 
         // Cycle-accurate cursor. ONE linear beat index is the only position
@@ -329,6 +330,8 @@ class Dimc_HWPE : public vp::Component {
         uint64_t fsm_timestamp;                  // cycles elapsed inside this job
         // Derived per-job beat geometry (same for every block, computed once when
         // the phase starts).
+        uint32_t psin_beats_per_macro;   // 0 while PSIN_EN is clear
+        uint32_t job_psin_rows;          // latched PSIN_EN for the running job
         uint32_t kb_beats_per_row;               // beats to move one kernel row
         uint32_t fb_beats_per_macro;             // beats to move one feature row
         uint32_t beats_per_macro;                // kb rows*kb_beats + fb_beats

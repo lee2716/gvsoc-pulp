@@ -73,6 +73,13 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     );
 
     // Configuration of the output streamer
+    // Per-row partial sums in. Same per-block slicing as the outputs, since a
+    // psum belongs to the row that produced it.
+    blk.psin_stream.configure(
+        _this->job_reg(DIMC_HWPE_JOB_PSIN_SRC_ADDR) + blk_id * out_span,
+        out_span, 0, 0, 0, 0, 0, 0, 0
+    );
+
     blk.out_stream.configure(
         _this->job_reg(DIMC_HWPE_JOB_DST_ADDR) + blk_id * out_span,  // base_addr
         _this->job_reg(DIMC_HWPE_OUT_TOTAL_LENGTH),  // tot_len
@@ -94,6 +101,8 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     uint8_t sign_mode = (uint8_t)(_this->register_file[DIMC_HWPE_SIGN_MODE >> 2] & 0x3);
     uint8_t mct       = (uint8_t)(_this->register_file[DIMC_HWPE_MCT       >> 2] & 0xFF);
     uint8_t accum_en  = (uint8_t)(_this->job_reg(DIMC_HWPE_ACCUM_EN) & 0x1);
+    uint8_t psin_rows = (uint8_t)(_this->job_reg(DIMC_HWPE_PSIN_EN) & 0x1);
+    _this->job_psin_rows = psin_rows;
     _this->sel_dimc   = (uint8_t)(_this->register_file[DIMC_HWPE_SEL_DIMC  >> 2] & 0xFF);
     for (Dimc_InnerBlock &blk : _this->inner_blocks)
     for (auto &m : blk.macros) {
@@ -102,6 +111,7 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
         // implemented.
         m.compe = compe; m.ci = ci; m.sign_mode = sign_mode; m.mct = mct;
         m.accumulate = accum_en;
+        m.psin_rows  = psin_rows;
     }
     // `sel_dimc` is stored but never consulted: macro selection goes through
     // NUM_MACROS (num_active). It exists for register-map fidelity.
@@ -272,9 +282,10 @@ Dimc_OuterPort *Dimc_HWPE::block_port(uint32_t blk)
 // the weights are already resident in the IMC array, so only features travel.
 uint64_t Dimc_HWPE::block_working_set() const
 {
+    uint64_t psin_bytes = this->job_psin_rows ? (uint64_t)this->job_row_count * 4 : 0;
     uint64_t per_macro = this->job_skip_kb
-        ? (uint64_t)DIMC_MACRO_FB_EW
-        : ((uint64_t)this->job_row_count * DIMC_MACRO_KB_EW + DIMC_MACRO_FB_EW);
+        ? ((uint64_t)DIMC_MACRO_FB_EW + psin_bytes)
+        : ((uint64_t)this->job_row_count * DIMC_MACRO_KB_EW + DIMC_MACRO_FB_EW + psin_bytes);
     return (uint64_t)this->job_num_active * per_macro;
 }
 
@@ -305,8 +316,13 @@ bool Dimc_HWPE::preload_iter(int *latency)
 
         this->kb_beats_per_row   = (DIMC_MACRO_KB_EW + port_bytes - 1) / port_bytes;
         this->fb_beats_per_macro = (DIMC_MACRO_FB_EW + port_bytes - 1) / port_bytes;
+        // One 32-bit psum per row, only when the per-row path is on.
+        this->psin_beats_per_macro = this->job_psin_rows
+            ? (row_count * 4 + port_bytes - 1) / port_bytes : 0;
         uint32_t kb_rows = skip_kb ? 0 : row_count;
-        this->beats_per_macro = kb_rows * this->kb_beats_per_row + this->fb_beats_per_macro;
+        this->beats_per_macro = kb_rows * this->kb_beats_per_row
+                              + this->fb_beats_per_macro
+                              + this->psin_beats_per_macro;
 
         for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
             Dimc_InnerBlock &blk = this->inner_blocks[b];
@@ -398,7 +414,7 @@ bool Dimc_HWPE::preload_block(Dimc_InnerBlock &blk)
             uint32_t row_idx = (this->job_row_base + row) % DIMC_MACRO_KB_LEN;
             blk.macros[macro].write_row((int)row_idx, blk.row_buffer);
         }
-    } else {                                      // ---- feature beat ----
+    } else if (within < kb_span + this->fb_beats_per_macro) {  // ---- feature beat ----
         uint32_t sub = within - kb_span;
         uint32_t off = sub * port_bytes;
         uint32_t w   = DIMC_MACRO_FB_EW - off;
@@ -409,14 +425,28 @@ bool Dimc_HWPE::preload_block(Dimc_InnerBlock &blk)
             blk.macros[macro].kb_ready = true;
             blk.macros[macro].fb_ready = true;
             blk.macros[macro].pipe.clear();
-            blk.macros[macro].psin = (int32_t)this->job_reg(DIMC_HWPE_PSIN);
+            blk.macros[macro].psin_scalar = (int32_t)this->job_reg(DIMC_HWPE_PSIN);
             blk.load_done[macro] = (uint32_t)(this->fsm_timestamp + 1);
+        }
+    } else {                                      // ---- partial-sum beat ----
+        uint32_t sub  = within - kb_span - this->fb_beats_per_macro;
+        uint32_t off  = sub * port_bytes;
+        uint32_t left = this->job_row_count * 4 - off;
+        uint32_t w    = left > port_bytes ? port_bytes : left;
+        lat = blk.psin_stream.issue_beat((int)w, blk.row_buffer + off);
+        // A beat carries several rows; commit them once the last one lands.
+        if (sub == this->psin_beats_per_macro - 1) {
+            for (uint32_t r = 0; r < this->job_row_count; r++) {
+                uint32_t row_idx = (this->job_row_base + r) % DIMC_MACRO_KB_LEN;
+                blk.macros[macro].write_psin_row((int)row_idx, blk.row_buffer + r * 4);
+            }
         }
     }
 
     if (lat < 1) lat = 1;
     blk.pending_req_queue.push(this->fsm_timestamp + (uint64_t)lat);
     blk.beat_index++;
+    blk.beat_event.event((uint8_t *)&blk.beat_index);
     return false;
 }
 

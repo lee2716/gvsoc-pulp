@@ -60,6 +60,7 @@ class Dimc_Macro {
         void write_row(int row, const uint8_t *src);
         void read_row(int row, uint8_t *dst) const;
         void write_fb(const uint8_t *src);
+        void write_psin_row(int row, const uint8_t *src);
 
         // Compute mode (COMPE = 1)
         int32_t compute_PP(int row_sel);
@@ -78,7 +79,13 @@ class Dimc_Macro {
         uint8_t  ci         = DIMC_CI_8BIT;
         uint8_t  sign_mode  = DIMC_SIGN_UU;
         uint8_t  mct        = 0;
-        int32_t  psin       = 0;
+        // Per-row partial-sum input, mirroring the RTL's ADDIN, which is sampled
+        // together with the row address on every compute trigger
+        // (spatz_DIMC.sv:224). psin_scalar is the legacy per-job constant and is
+        // what compute_PP uses while psin_rows is off.
+        int32_t  psin_scalar = 0;
+        uint8_t  psin_rows   = 0;                        // 1 = take psin from psin_buf
+        int32_t  psin_buf[DIMC_MACRO_KB_LEN] = {0};
         // Partial-sum chain: one accumulator per kernel row, so a K wider than
         // one row can be covered by consecutive chunks without going to memory.
         uint8_t  accumulate = 0;                       // 1 = add to accum[row]

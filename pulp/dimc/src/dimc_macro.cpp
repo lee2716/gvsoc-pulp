@@ -34,10 +34,11 @@ void Dimc_Macro::reset()
     this->ci        = DIMC_CI_8BIT;
     this->sign_mode = DIMC_SIGN_UU;
     this->mct       = 0;
-    this->psin      = 0;
+    this->psin_scalar = 0;
+    this->psin_rows   = 0;
     this->psout     = 0;
     this->accumulate = 0;
-    for (int r = 0; r < DIMC_MACRO_KB_LEN; r++) this->accum[r] = 0;
+    for (int r = 0; r < DIMC_MACRO_KB_LEN; r++) { this->accum[r] = 0; this->psin_buf[r] = 0; }
     this->sout      = 0;
 
     this->kb_ready = false;
@@ -96,6 +97,13 @@ void Dimc_Macro::read_row(int row, uint8_t *dst) const
 void Dimc_Macro::write_fb(const uint8_t *src)
 {
     std::memcpy(this->FB, src, DIMC_MACRO_FB_EW);
+}
+
+// One 32-bit partial sum, for the row the next compute trigger will select.
+void Dimc_Macro::write_psin_row(int row, const uint8_t *src)
+{
+    if (row < 0 || row >= DIMC_MACRO_KB_LEN) return;
+    std::memcpy(&this->psin_buf[row], src, 4);
 }
 
 int32_t Dimc_Macro::compute_PP(int row_sel)
@@ -173,7 +181,7 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
     }
     }
 
-    comp += this->psin;
+    comp += this->psin_rows ? this->psin_buf[row_sel] : this->psin_scalar;
 
     // Partial-sum chain. accumulate=0 starts a fresh sum for this row, so no
     // explicit clear is needed between chains; accumulate=1 continues the one
