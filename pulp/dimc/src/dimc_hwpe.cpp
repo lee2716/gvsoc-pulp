@@ -19,12 +19,19 @@
 #include <algorithm>
 #include <stdio.h>
 
+#include <string>
 #include <dimc.hpp>
 
 Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
 {
     // Registered first so the systree check below can report through it.
     this->traces.new_trace("trace", &this->trace);
+
+    // VCD events. Names become <component path>.<leaf> in the dump, which is what
+    // the --include filter of gvsoc2perfetto matches on.
+    this->traces.new_trace_event("state", &this->state_event, 8);
+    this->traces.new_trace_event("busy", &this->busy_event, 1);
+    this->traces.new_trace_event("job_id", &this->job_event, 32);
 
     // Architecture, from the systree. Dimc() in dimc.py writes every property.
     this->num_macros        = (uint32_t)this->get_js_config()->get_child_int("num_macros");
@@ -68,6 +75,21 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
         this->outer_ports.resize(nb_ports);
         for (Dimc_OuterPort &p : this->outer_ports)
             p.configure(this->outer_port_bytes, this->outer_noc_lat);
+    }
+
+    // Per-block and per-port events. Registered after the vectors are sized --
+    // registering earlier silently loops zero times. The "/" makes gvsoc nest
+    // them, so they appear as dimc.block_0.beat_index and the like.
+    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
+        std::string pfx = "block_" + std::to_string(b) + "/";
+        this->traces.new_trace_event(pfx + "beat_index",  &this->inner_blocks[b].beat_event,  32);
+        this->traces.new_trace_event(pfx + "rows_issued", &this->inner_blocks[b].rows_event,  32);
+        this->traces.new_trace_event(pfx + "data_ready",  &this->inner_blocks[b].ready_event, 32);
+        this->traces.new_trace_event(pfx + "drain_ready", &this->inner_blocks[b].drain_event, 32);
+    }
+    for (uint32_t i = 0; i < this->outer_ports.size(); i++) {
+        this->traces.new_trace_event("outer_port_" + std::to_string(i) + "/next_free",
+                                     &this->outer_ports[i].free_event, 32);
     }
 
     // Event handlers
@@ -159,6 +181,21 @@ void Dimc_HWPE::reset(bool active)
         this->phase_planned     = false;
         for (Dimc_InnerBlock &blk : this->inner_blocks) blk.reset_job_state();
         this->state.set(DIMC_IDLE);
+
+        // Every event gets a value at time zero, so no track starts part-way in.
+        uint8_t st = DIMC_IDLE, zero8 = 0;
+        uint32_t zero32 = 0;
+        this->state_event.event(&st);
+        this->busy_event.event(&zero8);
+        this->job_event.event((uint8_t *)&zero32);
+        for (Dimc_InnerBlock &blk : this->inner_blocks) {
+            blk.beat_event.event((uint8_t *)&zero32);
+            blk.rows_event.event((uint8_t *)&zero32);
+            blk.ready_event.event((uint8_t *)&zero32);
+            blk.drain_event.event((uint8_t *)&zero32);
+        }
+        for (Dimc_OuterPort &p : this->outer_ports)
+            p.free_event.event((uint8_t *)&zero32);
     }
 }
 

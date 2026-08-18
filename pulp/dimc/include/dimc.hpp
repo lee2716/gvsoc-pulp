@@ -98,6 +98,10 @@ class Dimc_OuterPort {
         int64_t  next_free_cycle;   // <- the state interco/router calls next_burst_cycle
         uint32_t bandwidth_bytes;
         uint32_t burst_latency;
+
+        // VCD event, registered by the parent as outer_port_<i>/next_free.
+        // Rising steps in it are exactly the contention this port models.
+        vp::Trace free_event;
 };
 
 // ---- rtl/accumulator.sv, instantiated by rtl/cleopatra.sv ----
@@ -166,6 +170,13 @@ class Dimc_InnerBlock {
 
         // Accumulates across jobs, so reset_job_state() must not touch it.
         Dimc_OutAccum out_accum;
+
+        // VCD events for this block, registered by the parent as
+        // block_<i>/<leaf>. Cycle values are fsm_timestamp, not simulated time.
+        vp::Trace beat_event;    // beat_index, the linear cursor of the phase
+        vp::Trace rows_event;    // rows_issued during COMPUTING
+        vp::Trace ready_event;   // data_ready_cycle, when the outer fill lands
+        vp::Trace drain_event;   // data_ready_cycle, when the outer drain lands
 
         // Clear everything the engine tracks for one job. Called from the
         // constructor, from reset(), and at every job start, so the three sites
@@ -243,6 +254,13 @@ class Dimc_HWPE : public vp::Component {
 
         // Traces
         vp::Trace trace;
+
+        // VCD event traces for waveform and Perfetto profiling. Written from the
+        // FSM handlers; an event costs no cycle. Mark a value stale by writing
+        // the next one -- event_highz() is dropped by the Perfetto converter.
+        vp::Trace state_event;   // three-phase FSM, one byte
+        vp::Trace busy_event;    // 1 while a job runs, drawn as one Perfetto slice
+        vp::Trace job_event;     // id of the running job, to line up with software
 
         // Internal state
         vp::reg_32 state;
