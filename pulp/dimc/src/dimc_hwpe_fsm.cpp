@@ -119,6 +119,12 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     for (Dimc_OuterPort &p : _this->outer_ports) p.reset();
 
     _this->state.set(DIMC_STARTING);
+
+    uint8_t one = 1, st = DIMC_STARTING;
+    _this->busy_event.event(&one);
+    _this->job_event.event((uint8_t *)&_this->running_job);
+    _this->state_event.event(&st);
+
     _this->fsm_loop();
 }
 
@@ -132,6 +138,11 @@ void Dimc_HWPE::fsm_end_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     Dimc_HWPE *_this = (Dimc_HWPE *)__this;
     _this->state.set(DIMC_IDLE);
+
+    uint8_t zero = 0, st = DIMC_IDLE;
+    _this->busy_event.event(&zero);
+    _this->state_event.event(&st);
+
     // Retire the context this job used, then launch whatever is queued behind it.
     if (_this->running_ctx >= 0) _this->ctx_busy[_this->running_ctx] = false;
     _this->running_ctx = -1;
@@ -197,6 +208,10 @@ int Dimc_HWPE::fsm()
         this->trace.fatal("DIMC HWPE FSM: UNKNOWN STATE (%d)!\n", this->state.get());
     }
 
+    if (next_state != this->state.get()) {
+        uint8_t st = (uint8_t)next_state;
+        this->state_event.event(&st);
+    }
     this->state.set(next_state);
     return latency;
 }
@@ -240,6 +255,8 @@ int64_t Dimc_OuterPort::request(int64_t now, uint64_t bytes)
     int64_t burst = (int64_t)((bytes + this->bandwidth_bytes - 1) / this->bandwidth_bytes);
     int64_t start = std::max(now, this->next_free_cycle);
     this->next_free_cycle = start + burst;
+    uint32_t nf = (uint32_t)this->next_free_cycle;
+    this->free_event.event((uint8_t *)&nf);
     return this->next_free_cycle + (int64_t)this->burst_latency;
 }
 
@@ -319,6 +336,8 @@ bool Dimc_HWPE::preload_iter(int *latency)
         if (port != NULL) {
             blk.data_ready_cycle =
                 port->request((int64_t)this->fsm_timestamp, this->block_working_set());
+            uint32_t dr = (uint32_t)blk.data_ready_cycle;
+            blk.ready_event.event((uint8_t *)&dr);
         }
         blk.fill_requested = true;
     }
@@ -460,6 +479,7 @@ bool Dimc_HWPE::compute_block(Dimc_InnerBlock &blk)
             for (uint32_t m = 0; m < num_active; m++)
                 blk.macros[m].issue((int)row_idx, (int)blk.rows_issued, this->job_bias);
             blk.rows_issued++;
+            blk.rows_event.event((uint8_t *)&blk.rows_issued);
         }
     }
     for (uint32_t m = 0; m < num_active; m++) blk.macros[m].tick();
@@ -505,6 +525,8 @@ bool Dimc_HWPE::store_iter(int *latency)
             } else {
                 blk.data_ready_cycle = 0;
             }
+            uint32_t dr = (uint32_t)blk.data_ready_cycle;
+            blk.drain_event.event((uint8_t *)&dr);
         }
         this->fsm_timestamp += this->inner_noc_lat;   // drain burst head
         this->phase_planned = true;
@@ -589,5 +611,6 @@ bool Dimc_HWPE::store_block(Dimc_InnerBlock &blk)
     blk.pending_req_queue.push(this->fsm_timestamp + (uint64_t)lat);
     blk.out_lat = (uint32_t)(lat * (int)out_beats);
     blk.beat_index++;
+    blk.beat_event.event((uint8_t *)&blk.beat_index);
     return false;
 }
