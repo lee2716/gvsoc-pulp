@@ -71,7 +71,8 @@
  */
 #define DIMC_NB_CONTEXT              2
 #define DIMC_HWPE_JOB_BASE           (DIMC_HWPE_BASE + 0x40)
-#define DIMC_HWPE_NB_JOB_REGS        19   /* 0x40 .. 0x88 inclusive */
+#define DIMC_HWPE_NB_JOB_REGS        23   /* 0x40 .. 0x98 inclusive; 0x8C/0x90 are
+                                          * intercepted as ACC_VAL and leave holes */
 #define DIMC_HWPE_JOB_KB_SRC_ADDR    (DIMC_HWPE_BASE + 0x40)
 #define DIMC_HWPE_JOB_FB_SRC_ADDR    (DIMC_HWPE_BASE + 0x44)
 #define DIMC_HWPE_JOB_DST_ADDR       (DIMC_HWPE_BASE + 0x48)
@@ -106,6 +107,15 @@
  * no extra memory traffic. Software reads the final result from DST after the
  * last chunk. */
 #define DIMC_HWPE_ACCUM_EN           (DIMC_HWPE_BASE + 0x88)
-#define DIMC_HWPE_REG_MAX            (DIMC_HWPE_BASE + 0x90)
+
+/* Per-row partial-sum input, the model of the RTL's ADDIN. With PSIN_EN set the
+ * engine streams one 32-bit psum per kernel row from PSIN_SRC_ADDR and adds it to
+ * that row's dot product; with it clear the per-job PSIN scalar is used instead
+ * and nothing extra is loaded. This is what lets a K-chain keep several partial
+ * sums alive at once, so weights can be reused across a batch. */
+#define DIMC_HWPE_PSIN_EN            (DIMC_HWPE_BASE + 0x94)
+#define DIMC_HWPE_JOB_PSIN_SRC_ADDR  (DIMC_HWPE_BASE + 0x98)
+
+#define DIMC_HWPE_REG_MAX            (DIMC_HWPE_BASE + 0x98)
 
 #endif
