@@ -106,13 +106,13 @@ class Dimc_OuterPort {
 
 // ---- rtl/accumulator.sv, instantiated by rtl/cleopatra.sv ----
 // Sums every result popped from the block's output FIFO into one register.
-// The FIFO is 24 bits wide, so each value wraps to 24 bits before being added.
+// The FIFO is 32 bits wide, the same as PSOUT, so nothing is truncated.
 class Dimc_OutAccum {
     public:
         void push(int32_t psout)
         {
             if (!this->enable) return;
-            this->acc += Dimc_OutAccum::to_int24(psout);
+            this->acc += psout;
             this->count++;
         }
 
@@ -120,13 +120,6 @@ class Dimc_OutAccum {
         {
             this->acc = 0;
             this->count = 0;
-        }
-
-        // 24-bit FIFO word, sign-extended back to the host's int32.
-        static int32_t to_int24(int32_t v)
-        {
-            int32_t masked = v & 0xFFFFFF;
-            return (masked & 0x800000) ? (masked - 0x1000000) : masked;
         }
 
         int32_t  acc    = 0;   // acc_q

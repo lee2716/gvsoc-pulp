@@ -95,12 +95,12 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     }
 
     // Latch the per-job compute configuration once at commit, then broadcast it
-    // to every macro (precision, sign mode, thermometric mask, dimc select).
-    uint8_t compe     = (uint8_t)(_this->register_file[DIMC_HWPE_COMPE     >> 2] & 0x1);
-    uint8_t ci        = (uint8_t)(_this->register_file[DIMC_HWPE_CFG_CI    >> 2] & 0x3);
-    uint8_t sign_mode = (uint8_t)(_this->register_file[DIMC_HWPE_SIGN_MODE >> 2] & 0x3);
-    uint8_t mct       = (uint8_t)(_this->register_file[DIMC_HWPE_MCT       >> 2] & 0xFF);
-    uint8_t psin_rows = (uint8_t)(_this->job_reg(DIMC_HWPE_PSIN_EN) & 0x1);
+    // to every macro (ci, sign_8b, compute_mask, sel_dimc).
+    uint8_t  compe     = (uint8_t) (_this->register_file[DIMC_HWPE_COMPE        >> 2] & 0x1);
+    uint8_t  ci        = (uint8_t) (_this->register_file[DIMC_HWPE_CFG_CI       >> 2] & 0x3);
+    uint8_t  sign_8b   = (uint8_t) (_this->register_file[DIMC_HWPE_SIGN_8B      >> 2] & 0x3);
+    uint16_t cmask     = (uint16_t)(_this->register_file[DIMC_HWPE_COMPUTE_MASK >> 2] & 0x3FF);
+    uint8_t  psin_rows = (uint8_t) (_this->job_reg(DIMC_HWPE_PSIN_EN) & 0x1);
     _this->job_psin_rows = psin_rows;
     _this->sel_dimc   = (uint8_t)(_this->register_file[DIMC_HWPE_SEL_DIMC  >> 2] & 0xFF);
     for (Dimc_InnerBlock &blk : _this->inner_blocks)
@@ -108,7 +108,7 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
         // `compe` (memory-vs-compute mode) is latched but never read: compute_PP
         // always performs the dot product, and COMPE=0 memory mode is not
         // implemented.
-        m.compe = compe; m.ci = ci; m.sign_mode = sign_mode; m.mct = mct;
+        m.compe = compe; m.ci = ci; m.sign_8b = sign_8b; m.compute_mask = cmask;
         m.psin_rows  = psin_rows;
     }
     // `sel_dimc` is stored but never consulted: macro selection goes through
