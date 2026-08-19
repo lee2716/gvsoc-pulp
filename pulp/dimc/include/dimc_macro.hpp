@@ -43,10 +43,10 @@ struct DimcPipeEntry {
 #define DIMC_CI_4BIT        2
 #define DIMC_CI_8BIT        3
 
-// Sign mode for INT8 (bit 1 = K_signed, bit 0 = F_signed)
+// sign_8b, read only at INT8: bit 0 signs the kernel, bit 1 the feature.
 #define DIMC_SIGN_UU        0
-#define DIMC_SIGN_US        1
-#define DIMC_SIGN_SU        2
+#define DIMC_SIGN_SU        1
+#define DIMC_SIGN_US        2
 #define DIMC_SIGN_SS        3
 
 
@@ -75,10 +75,10 @@ class Dimc_Macro {
         DimcPipeEntry drain();
 
         // Runtime configuration
-        uint8_t  compe      = DIMC_COMPE_COMPUTE;  // latched, never acted on
-        uint8_t  ci         = DIMC_CI_8BIT;
-        uint8_t  sign_mode  = DIMC_SIGN_UU;
-        uint8_t  mct        = 0;
+        uint8_t  compe        = DIMC_COMPE_COMPUTE;  // latched, never acted on
+        uint8_t  ci           = DIMC_CI_8BIT;
+        uint8_t  sign_8b      = DIMC_SIGN_UU;
+        uint16_t compute_mask = 0;   // bits masked off the 1024-bit row
         // Per-row partial-sum input, mirroring the RTL's ADDIN, which is sampled
         // together with the row address on every compute trigger
         // (spatz_DIMC.sv:224). psin_scalar is the legacy per-job constant and is

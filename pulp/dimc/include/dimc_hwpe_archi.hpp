@@ -40,9 +40,9 @@
  * broadcast to all macros; NOT part of a per-job context.
  */
 #define DIMC_HWPE_CFG_CI             (DIMC_HWPE_BASE + 0x20)  /* INT1/2/4/8      */
-#define DIMC_HWPE_SIGN_MODE          (DIMC_HWPE_BASE + 0x24)  /* INT8 sign combo */
+#define DIMC_HWPE_SIGN_8B            (DIMC_HWPE_BASE + 0x24)  /* INT8 sign combo */
 #define DIMC_HWPE_COMPE              (DIMC_HWPE_BASE + 0x28)  /* memory/compute  */
-#define DIMC_HWPE_MCT                (DIMC_HWPE_BASE + 0x2C)  /* thermometric mask */
+#define DIMC_HWPE_COMPUTE_MASK       (DIMC_HWPE_BASE + 0x2C)  /* bits masked off */
 #define DIMC_HWPE_NUM_MACROS         (DIMC_HWPE_BASE + 0x30)
 #define DIMC_HWPE_SEL_DIMC           (DIMC_HWPE_BASE + 0x34)
 /* autotrigger (hwpe-ctrl semantics, RDL puts it at 0x08):

@@ -32,8 +32,8 @@ void Dimc_Macro::reset()
 
     this->compe     = DIMC_COMPE_COMPUTE;
     this->ci        = DIMC_CI_8BIT;
-    this->sign_mode = DIMC_SIGN_UU;
-    this->mct       = 0;
+    this->sign_8b   = DIMC_SIGN_UU;
+    this->compute_mask = 0;
     this->psin_scalar = 0;
     this->psin_rows   = 0;
     this->psout     = 0;
@@ -107,8 +107,8 @@ void Dimc_Macro::write_psin_row(int row, const uint8_t *src)
 
 int32_t Dimc_Macro::compute_PP(int row_sel)
 {
-    // Apply thermometric MCT mask: valid_bits = 1024 - MCT*4
-    uint32_t valid_bits = 1024u - (uint32_t)this->mct * 4u;
+    // compute_mask is thermometric: it masks off that many bits from the top.
+    uint32_t valid_bits = 1024u - (uint32_t)this->compute_mask;
     if (valid_bits > 1024u) valid_bits = 0;
     uint32_t valid_bytes = valid_bits / 8u;
     uint32_t tail_bits   = valid_bits & 7u;
@@ -139,8 +139,8 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
             for (int s = 0; s < 4; s++)
                 comp += ((k >> (s*2)) & 0x3) * ((f >> (s*2)) & 0x3);
         }
-        // Partial trailing byte: the MCT mask moves in 4-bit steps, so a masked
-        // row can end mid-byte. Only WHOLE 2-bit elements inside it still count.
+        // Partial trailing byte: the mask can end mid-byte, and only WHOLE
+        // 2-bit elements inside it still count.
         if (tail_bits) {
             uint8_t k = this->KB[row_sel][valid_bytes];
             uint8_t f = this->FB[valid_bytes];
@@ -167,13 +167,13 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
     }
     case DIMC_CI_8BIT:
     default: {
-        // No tail handling needed: the mask steps in 4-bit units, so a partial
-        // trailing byte can never hold a whole 8-bit element, so it is dropped.
+        // No tail handling needed: a partial trailing byte can never hold a whole
+        // 8-bit element, so it is dropped.
         for (uint32_t i = 0; i < valid_bytes; i++) {
-            int32_t k = (this->sign_mode & 0x2) ? (int32_t)(int8_t)this->KB[row_sel][i]
-                                                : (int32_t)(uint8_t)this->KB[row_sel][i];
-            int32_t f = (this->sign_mode & 0x1) ? (int32_t)(int8_t)this->FB[i]
-                                                : (int32_t)(uint8_t)this->FB[i];
+            int32_t k = (this->sign_8b & 0x1) ? (int32_t)(int8_t)this->KB[row_sel][i]
+                                              : (int32_t)(uint8_t)this->KB[row_sel][i];
+            int32_t f = (this->sign_8b & 0x2) ? (int32_t)(int8_t)this->FB[i]
+                                              : (int32_t)(uint8_t)this->FB[i];
             comp += k * f;
         }
         break;
