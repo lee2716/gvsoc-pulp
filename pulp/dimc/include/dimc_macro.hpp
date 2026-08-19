@@ -86,10 +86,6 @@ class Dimc_Macro {
         int32_t  psin_scalar = 0;
         uint8_t  psin_rows   = 0;                        // 1 = take psin from psin_buf
         int32_t  psin_buf[DIMC_MACRO_KB_LEN] = {0};
-        // Partial-sum chain: one accumulator per kernel row, so a K wider than
-        // one row can be covered by consecutive chunks without going to memory.
-        uint8_t  accumulate = 0;                       // 1 = add to accum[row]
-        int32_t  accum[DIMC_MACRO_KB_LEN] = {0};
 
         // Buffers
         uint8_t  KB[DIMC_MACRO_KB_LEN][DIMC_MACRO_KB_EW];

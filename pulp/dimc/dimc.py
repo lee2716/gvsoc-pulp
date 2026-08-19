@@ -26,27 +26,27 @@ class Dimc(gvsoc.systree.Component):
                  name: str,
                  macros_per_block: int = 2,
                  inner_port_bytes: int = 32,   # inner (L1) port, 256 bit/cycle
-                 port_sync_cycles: int = 0,    # MAGIA l1_spm gnt=1 -> pipelined
-                 inner_noc_lat: int = 1,       # TCDM bank read latency
+                 port_sync_cycles: int = 0,    # extra cycle per beat (0 = pipelined port)
+                 tcdm_burst_latency: int = 1,
                  nb_inner_blocks: int = 2,     # 2 blocks x 2 macros = 4 macros
                  outer_port_shared: int = 1,   # 1 = both blocks contend on one L2 port
                  outer_port_bytes: int = 64,   # outer (L2) port, 512 bit/cycle
-                 outer_noc_lat: int = 1):      # L2 burst latency
+                 l2_burst_latency: int = 1):
         super().__init__(parent, name)
 
         self.set_component('pulp.dimc.dimc')
 
-        # inner_noc_lat / outer_noc_lat are charged once per streamer burst and
+        # tcdm_burst_latency / l2_burst_latency are charged once per streamer burst and
         # do not scale with bandwidth.
         self.add_properties({
             "num_macros":        macros_per_block,
             "inner_port_bytes":  inner_port_bytes,
             "port_sync_cycles":  port_sync_cycles,
-            "inner_noc_lat":     inner_noc_lat,
+            "tcdm_burst_latency": tcdm_burst_latency,
             "nb_inner_blocks":   nb_inner_blocks,
             "outer_port_shared": outer_port_shared,
             "outer_port_bytes":  outer_port_bytes,
-            "outer_noc_lat":     outer_noc_lat,
+            "l2_burst_latency":  l2_burst_latency,
         })
 
     def i_hwpe_slv(self) -> gvsoc.systree.SlaveItf:
