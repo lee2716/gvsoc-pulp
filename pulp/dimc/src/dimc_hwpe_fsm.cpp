@@ -100,7 +100,6 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     uint8_t ci        = (uint8_t)(_this->register_file[DIMC_HWPE_CFG_CI    >> 2] & 0x3);
     uint8_t sign_mode = (uint8_t)(_this->register_file[DIMC_HWPE_SIGN_MODE >> 2] & 0x3);
     uint8_t mct       = (uint8_t)(_this->register_file[DIMC_HWPE_MCT       >> 2] & 0xFF);
-    uint8_t accum_en  = (uint8_t)(_this->job_reg(DIMC_HWPE_ACCUM_EN) & 0x1);
     uint8_t psin_rows = (uint8_t)(_this->job_reg(DIMC_HWPE_PSIN_EN) & 0x1);
     _this->job_psin_rows = psin_rows;
     _this->sel_dimc   = (uint8_t)(_this->register_file[DIMC_HWPE_SEL_DIMC  >> 2] & 0xFF);
@@ -110,7 +109,6 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
         // always performs the dot product, and COMPE=0 memory mode is not
         // implemented.
         m.compe = compe; m.ci = ci; m.sign_mode = sign_mode; m.mct = mct;
-        m.accumulate = accum_en;
         m.psin_rows  = psin_rows;
     }
     // `sel_dimc` is stored but never consulted: macro selection goes through
@@ -335,7 +333,7 @@ bool Dimc_HWPE::preload_iter(int *latency)
             blk.load_done.assign(num_active, 0);
             blk.out_lat         = 0;
         }
-        this->fsm_timestamp += this->inner_noc_lat;   // burst head, paid once
+        this->fsm_timestamp += this->tcdm_burst_latency;   // burst head, paid once
         this->phase_planned = true;
     }
 
@@ -558,7 +556,7 @@ bool Dimc_HWPE::store_iter(int *latency)
             uint32_t dr = (uint32_t)blk.data_ready_cycle;
             blk.drain_event.event((uint8_t *)&dr);
         }
-        this->fsm_timestamp += this->inner_noc_lat;   // drain burst head
+        this->fsm_timestamp += this->tcdm_burst_latency;   // drain burst head
         this->phase_planned = true;
     }
 

@@ -37,8 +37,7 @@ void Dimc_Macro::reset()
     this->psin_scalar = 0;
     this->psin_rows   = 0;
     this->psout     = 0;
-    this->accumulate = 0;
-    for (int r = 0; r < DIMC_MACRO_KB_LEN; r++) { this->accum[r] = 0; this->psin_buf[r] = 0; }
+    for (int r = 0; r < DIMC_MACRO_KB_LEN; r++) this->psin_buf[r] = 0;
     this->sout      = 0;
 
     this->kb_ready = false;
@@ -182,12 +181,6 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
     }
 
     comp += this->psin_rows ? this->psin_buf[row_sel] : this->psin_scalar;
-
-    // Partial-sum chain. accumulate=0 starts a fresh sum for this row, so no
-    // explicit clear is needed between chains; accumulate=1 continues the one
-    // the previous chunk left in accum[row_sel].
-    if (this->accumulate) comp += this->accum[row_sel];
-    this->accum[row_sel] = comp;
 
     this->psout = comp;
     return comp;

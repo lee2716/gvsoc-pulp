@@ -30,8 +30,8 @@
 
 typedef uint64_t strobe_t;
 
-// Standard HWPE states, as in redmule. A job is offloaded with the
-// acquire/commit protocol, then the FSM runs preload -> compute -> store.
+// A job is offloaded with the acquire/commit protocol, then the FSM runs
+// preload -> compute -> store.
 enum dimc_hwpe_state_t {
     DIMC_IDLE,
     DIMC_STARTING,
@@ -135,8 +135,7 @@ class Dimc_OutAccum {
 };
 
 // ---- Inner block: num_macros macros on one inner (L1) port ----
-// A plain class, not a vp::Component, like redmule.hpp:22 RedMule_Engine.
-// One control plane drives N of these.
+// A plain class, not a vp::Component. One control plane drives N of these.
 class Dimc_InnerBlock {
     public:
         // Data path: this block's own three streamers and its own macros.
@@ -236,7 +235,7 @@ class Dimc_HWPE : public vp::Component {
         // systree / gvrun --param (no per-trigger MMIO override).
         uint32_t inner_port_bytes;    // inner (L1) port bytes/cycle, e.g. 32 banks*4=128
         uint32_t port_sync_cycles;          // per-beat wrapper sync cycle (0/1)
-        uint32_t inner_noc_lat;       // NoC round-trip latency per streamer burst (bandwidth-independent)
+        uint32_t tcdm_burst_latency;  // round-trip latency per streamer burst (bandwidth-independent)
         // ---- Outer block ----
         // An inner block is num_macros macros on one inner port. An outer block
         // is nb_inner_blocks of them, each a real Dimc_InnerBlock reaching L2
@@ -247,7 +246,7 @@ class Dimc_HWPE : public vp::Component {
         uint32_t outer_port_shared;     // 1 = all blocks contend on ONE L2 port (fills serialize);
                                        // 0 = one L2 port per block (fills proceed in parallel)
         uint32_t outer_port_bytes;         // L2 port bytes/cycle (0 sentinel => same as inner_port_bytes)
-        uint32_t outer_noc_lat;        // L2 burst latency (sentinel <0 => same as inner_noc_lat)
+        uint32_t l2_burst_latency;     // Dimc_OuterPort::burst_latency
         // Reuse auto-detect: the KB (weight) source address of the last loaded
         // job. A trigger whose KB address matches reuses the resident weights
         // (skips that load), like a real weight cache. 0xFFFFFFFF = none yet.
@@ -317,7 +316,7 @@ class Dimc_HWPE : public vp::Component {
         // the last row retires, so it lives in one place.
         void drain_ready_rows(Dimc_InnerBlock &blk);
 
-        // ---- Cycle-accurate engine (light_redmule style) ----
+        // ---- Cycle-accurate engine ----
         // One cycle per fsm_event. TCDM accesses are async: on issue we record
         // when the response is due, and each cycle we retire the beats that
         // came back. outstanding_depth caps in-flight requests, so slow memory

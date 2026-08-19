@@ -37,11 +37,11 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->num_macros        = (uint32_t)this->get_js_config()->get_child_int("num_macros");
     this->inner_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("inner_port_bytes");
     this->port_sync_cycles  = (uint32_t)this->get_js_config()->get_child_int("port_sync_cycles");
-    this->inner_noc_lat     = (uint32_t)this->get_js_config()->get_child_int("inner_noc_lat");
+    this->tcdm_burst_latency = (uint32_t)this->get_js_config()->get_child_int("tcdm_burst_latency");
     this->nb_inner_blocks   = (uint32_t)this->get_js_config()->get_child_int("nb_inner_blocks");
     this->outer_port_shared = (uint32_t)this->get_js_config()->get_child_int("outer_port_shared");
     this->outer_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("outer_port_bytes");
-    this->outer_noc_lat     = (uint32_t)this->get_js_config()->get_child_int("outer_noc_lat");
+    this->l2_burst_latency  = (uint32_t)this->get_js_config()->get_child_int("l2_burst_latency");
 
     this->last_kb_src     = 0xFFFFFFFF;   // no resident weights yet
     // HWPE slave port
@@ -55,8 +55,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->new_master_port("done_irq", &this->irq);
 
     // ---- Inner blocks ----
-    // num_macros macros per block, nb_inner_blocks blocks. Each block owns its
-    // streamers and macros; this component drives them all, like redmule/ne16.
+    // Each block owns its streamers and macros; this component drives them all.
     this->inner_blocks.resize(this->nb_inner_blocks);
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
         blk.weight_stream = Dimc_HWPE_Streamer(this, false);
@@ -75,7 +74,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
         uint32_t nb_ports = this->outer_port_shared ? 1 : this->nb_inner_blocks;
         this->outer_ports.resize(nb_ports);
         for (Dimc_OuterPort &p : this->outer_ports)
-            p.configure(this->outer_port_bytes, this->outer_noc_lat);
+            p.configure(this->outer_port_bytes, this->l2_burst_latency);
     }
 
     // Per-block and per-port events. Registered after the vectors are sized --
@@ -113,7 +112,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
         this->ctx_job_id[ctx] = 0;
         for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
     }
-    this->outstanding_depth = 4;    // in-flight TCDM beats (light_redmule queue_depth)
+    this->outstanding_depth = 4;    // max in-flight TCDM beats per block
     this->fsm_timestamp     = 0;
     this->kb_beats_per_row  = 1;
     this->fb_beats_per_macro= 1;
@@ -124,13 +123,13 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->state.set(DIMC_IDLE);
 
     this->trace.msg(vp::TraceLevel::WARNING,
-        "DIMC systree config: num_macros=%u l1bw=%u sync=%u noc_lat=%u "
-        "nb_blocks=%u blocks=%u ports=%u outer_bw=%u outer_noc=%u\n",
+        "DIMC systree config: num_macros=%u l1bw=%u sync=%u tcdm_lat=%u "
+        "nb_blocks=%u blocks=%u ports=%u outer_bw=%u l2_lat=%u\n",
         this->num_macros,
-        this->inner_port_bytes, this->port_sync_cycles, this->inner_noc_lat,
+        this->inner_port_bytes, this->port_sync_cycles, this->tcdm_burst_latency,
         this->nb_inner_blocks, (uint32_t)this->inner_blocks.size(),
         (uint32_t)this->outer_ports.size(), this->outer_port_bytes,
-        this->outer_noc_lat);
+        this->l2_burst_latency);
 }
 
 void Dimc_HWPE::reset(bool active)
@@ -176,7 +175,7 @@ void Dimc_HWPE::reset(bool active)
             this->ctx_job_id[ctx] = 0;
             for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
         }
-        this->outstanding_depth = 4;    // in-flight TCDM beats (light_redmule queue_depth)
+        this->outstanding_depth = 4;    // max in-flight TCDM beats per block
         this->fsm_timestamp     = 0;
         this->kb_beats_per_row  = 1;
         this->fb_beats_per_macro= 1;
