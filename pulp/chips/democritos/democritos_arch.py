@@ -76,7 +76,7 @@ class DemocritosArch:
     SPATZ_BOOTROM_SIZE  = 0x100
     # Absolute, so it resolves from whichever directory builds the V-tile.
     # v-tile_test produces it with `make bootrom`.
-    SPATZ_ROMFILE       = '/home/cong/pulp_proj/Dtile_Test/democritos_tests/v-tile_test/spatz_init.bin'
+    SPATZ_ROMFILE       = '/home/cong/pulp_proj/Dtile_Test/democritos_tests/v-tile_test/build/spatz_init.bin'
     SPATZ_VLEN          = 256
     SPATZ_NB_LANES      = 4
     SPATZ_LANE_WIDTH    = 4
