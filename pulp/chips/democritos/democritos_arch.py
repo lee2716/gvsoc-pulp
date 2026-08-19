@@ -30,6 +30,12 @@ class DemocritosArch:
     RESERVED_ADDR_START     = EVENT_UNIT_ADDR_END + 1
     RESERVED_SIZE           = 0x0000_E7FF
     RESERVED_ADDR_END       = RESERVED_ADDR_START + RESERVED_SIZE
+    # Spatz control block. A literal, carved out of the reserved hole above:
+    # chaining it after the event unit would move PCM/DIMC, whose address the HAL
+    # repeats by hand.
+    SPATZ_CTRL_START        = 0x0000_1700
+    SPATZ_CTRL_SIZE         = 0x0000_00FF
+    SPATZ_CTRL_END          = SPATZ_CTRL_START + SPATZ_CTRL_SIZE
     # A-tile-local HWPE address segment (PCM)
     PCM_START               = RESERVED_ADDR_END + 1
     PCM_SIZE                = 0x0000_00DF
@@ -63,6 +69,18 @@ class DemocritosArch:
     TILE_CLK_FREQ       = 50 * (10 ** 6)
 
     ENABLE_NOC          = True
+    # Snitch+Spatz vector core, one component for both the scalar host and the
+    # vector unit. It runs its own binary, entered from the boot rom. Only the
+    # V-tile instantiates it.
+    SPATZ_BOOTROM_ADDR  = 0x1000_0000
+    SPATZ_BOOTROM_SIZE  = 0x100
+    # Absolute, so it resolves from whichever directory builds the V-tile.
+    # v-tile_test produces it with `make bootrom`.
+    SPATZ_ROMFILE       = '/home/cong/pulp_proj/Dtile_Test/democritos_tests/v-tile_test/spatz_init.bin'
+    SPATZ_VLEN          = 256
+    SPATZ_NB_LANES      = 4
+    SPATZ_LANE_WIDTH    = 4
+    SPATZ_NB_VLSU_PORTS = 4
     N_TILES_X           = 2 # 16
     N_TILES_Y           = 2 # 16
     NB_CLUSTERS         = N_TILES_X*N_TILES_Y # to be removed when we'll use the DemocritosTree properties instead of hardcoding the number of clusters in the components
@@ -76,6 +94,7 @@ class DemocritosTree(Tree):
             description='Number of tiles on Y dimension')
 
         self.nb_clusters = self.n_tiles_x*self.n_tiles_y
+
 
 class DemocritosDSE:
     SOC_L2_LATENCY              = 2
