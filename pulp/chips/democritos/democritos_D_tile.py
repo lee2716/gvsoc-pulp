@@ -50,8 +50,10 @@ class Democritos_D_TileTcdm(gvsoc.systree.Component):
         L1_masters = 3
         interleaver = L1_interleaver(self, 'interleaver', nb_slaves=nb_banks, nb_masters=L1_masters, interleaving_bits=2)
 
-        # 3 masters: OBI
-        dma_masters = 1
+        # OBI plus the two iDMAs. They share one DmaInterleaver input, the way
+        # magia_v2/tile.py:59 does it; the count is how many composite ports the
+        # tile exposes, not how many interleaver inputs exist.
+        dma_masters = 3
         dma_interleaver = DmaInterleaver(self, 'dma_interleaver', nb_master_ports=dma_masters, nb_banks=nb_banks, bank_width=DemocritosArch.BYTES_PER_WORD)
 
         # 1 master: DIMC HWPE
@@ -61,7 +63,13 @@ class Democritos_D_TileTcdm(gvsoc.systree.Component):
         banks = []
         for i in range(nb_banks):
             # Instantiate a new memory bank
-            bank = memory.Memory(self, f'bank_{i}', size=bank_size, latency=1)
+            # atomics and truncate_size match magia_v2/tile.py:74. Without
+            # atomics the banks reject RISC-V atomic instructions; truncate_size
+            # masks an incoming address with (size - 1), so a bank sees an
+            # in-range offset instead of running past its end.
+            bank = memory.Memory(self, f'bank_{i}', atomics=True, size=bank_size,
+                                 latency=DemocritosDSE.TILE_TCDM_LATENCY,
+                                 truncate_size=bank_size)
             banks.append(bank)
 
             # Bind the new bank (slave) to the interleaver (master)
@@ -232,10 +240,12 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         self.bind(dimc, 'done_irq', event_unit, 'in_event_10_pe_0')
         # FractalSync barrier completion -> event 24 (same slot as magia_v2).
         self.bind(fsync_mm_ctrl, 'fsync_done_irq', event_unit, 'in_event_24_pe_0')
-        # Unconnected event slots: magia_v2 also routes
-        #   idma_mm_ctrl 'idma0_done_irq' -> in_event_2_pe_0
-        #   idma_mm_ctrl 'idma1_done_irq' -> in_event_3_pe_0
-        # The iDMA interrupts are not modelled here.
+        # iDMA completion -> events 2 and 3, the slots magia_v2 uses. These are
+        # master ports on iDMA_mm_ctrl and it drives them on every completion
+        # (idma_mm_ctrl.cpp:240), so leaving them unbound is a null dereference
+        # the moment software issues a transfer, not merely a missing feature.
+        self.bind(idma_mm_ctrl, 'idma0_done_irq', event_unit, 'in_event_2_pe_0')
+        self.bind(idma_mm_ctrl, 'idma1_done_irq', event_unit, 'in_event_3_pe_0')
 
         # FractalSync controller registers, so software can request a barrier.
         # Same address window magia_v2 uses (arch reserves FSYNC_CTRL_*).
@@ -259,13 +269,16 @@ class Democritos_D_Tile(gvsoc.systree.Component):
 
         # Bind iDMA0
         idma0.o_AXI(tile_xbar.i_INPUT())
-        idma0.o_TCDM(l1_tcdm.i_INPUT(1)) # here we don't use the iDMA interleaver because here iDMA is directly connected to TCDM and iDMA has it's own interleaver for TCDM access (in iDMA-BE)
+        # DmaInterleaver, not the core-side L1_interleaver: the latter is
+        # interleaved every 4 bytes, so a DMA bound to it lands one eighth of
+        # the bytes it was asked for. magia_v2/tile.py:343 binds the same way.
+        idma0.o_TCDM(l1_tcdm.i_DMA_INPUT(1))
         idma_mm_ctrl.o_OFFLOAD_iDMA0_AXI2OBI(idma0.i_OFFLOAD())
         idma0.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA0_AXI2OBI())
 
         # Bind iDMA1
         idma1.o_AXI(tile_xbar.i_INPUT())
-        idma1.o_TCDM(l1_tcdm.i_INPUT(2)) # here we don't use the iDMA interleaver because here iDMA is directly connected to TCDM and iDMA has it's own interleaver for TCDM access (in iDMA-BE)
+        idma1.o_TCDM(l1_tcdm.i_DMA_INPUT(2))
         idma_mm_ctrl.o_OFFLOAD_iDMA1_OBI2AXI(idma1.i_OFFLOAD())
         idma1.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA1_OBI2AXI())
 
