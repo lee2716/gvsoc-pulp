@@ -14,6 +14,8 @@
 # limitations under the License.
 #
 
+import os
+
 from gvrun.attribute import Tree, Value
 
 class DemocritosArch:
@@ -74,9 +76,11 @@ class DemocritosArch:
     # V-tile instantiates it.
     SPATZ_BOOTROM_ADDR  = 0x1000_0000
     SPATZ_BOOTROM_SIZE  = 0x100
-    # Absolute, so it resolves from whichever directory builds the V-tile.
-    # v-tile_test produces it with `make bootrom`.
-    SPATZ_ROMFILE       = '/home/cong/pulp_proj/Dtile_Test/democritos_tests/v-tile_test/build/spatz_init.bin'
+    # Produced by `make bootrom` in democritos_tests/v-tile_test. The testbench
+    # normally passes an explicit path (rom_file=) computed next to itself; this
+    # is the fallback for a target that does not, and SPATZ_ROMFILE in the
+    # environment overrides both. A bare name is searched on the systree path.
+    SPATZ_ROMFILE       = os.environ.get('SPATZ_ROMFILE', 'spatz_init.bin')
     SPATZ_VLEN          = 256
     SPATZ_NB_LANES      = 4
     SPATZ_LANE_WIDTH    = 4
