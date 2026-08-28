@@ -16,6 +16,7 @@
 
 
 import os
+
 import gvsoc.systree
 import memory.memory as memory
 import interco.router as router
@@ -24,15 +25,13 @@ from pulp.stdout.stdout_v3 import Stdout
 
 import pulp.cpu.iss.pulp_cores as iss
 from pulp.cluster.l1_interleaver import L1_interleaver
-from pulp.light_redmule.hwpe_interleaver import HWPEInterleaver
 from pulp.snitch.snitch_cluster.dma_interleaver import DmaInterleaver
 from pulp.chips.democritos.hierarchical_cache import Hierarchical_cache
 
 from pulp.chips.democritos.democritos_arch import *
 from pulp.chips.magia_v2.cv32.core import CV32CoreTest
-from pulp.dimc.dimc import Dimc
 # SnitchFast, not the newer Spatz class: that one needs LsuV2, which this
-# gvsoc core does not have.
+# tree's gvsoc/core does not have.
 from pulp.snitch.snitch_core import SnitchFast
 from pulp.chips.magia_v2.spatz.snitch_spatz_regs import SnitchSpatzRegs
 from pulp.idma.snitch_dma import SnitchDma
@@ -55,15 +54,13 @@ class Democritos_V_TileTcdm(gvsoc.systree.Component):
         L1_masters = 3
         interleaver = L1_interleaver(self, 'interleaver', nb_slaves=nb_banks, nb_masters=L1_masters, interleaving_bits=2)
 
-        # 3 masters: OBI
-        dma_masters = 1
+        # OBI plus the two iDMAs. They share one DmaInterleaver input, the way
+        # magia_v2/tile.py:59 does it; the count is how many composite ports the
+        # tile exposes, not how many interleaver inputs exist.
+        dma_masters = 3
         dma_interleaver = DmaInterleaver(self, 'dma_interleaver', nb_master_ports=dma_masters, nb_banks=nb_banks, bank_width=DemocritosArch.BYTES_PER_WORD)
 
-        # 1 master: DIMC HWPE
-        dimc_hwpe_masters = 1
-        dimc_interleaver = HWPEInterleaver(self, "dimc_interleaver", nb_master_ports=dimc_hwpe_masters, nb_banks=nb_banks, bank_width=DemocritosArch.BYTES_PER_WORD)
-
-        # Spatz gets its own interleaver, one port per VLSU lane group, so it
+        # Spatz: one port per VLSU lane group, on its own interleaver so it
         # meets the other masters only at the banks.
         spatz_masters = DemocritosArch.SPATZ_NB_VLSU_PORTS
         spatz_interleaver = L1_interleaver(self, 'spatz_interleaver', nb_slaves=nb_banks,
@@ -73,13 +70,18 @@ class Democritos_V_TileTcdm(gvsoc.systree.Component):
         banks = []
         for i in range(nb_banks):
             # Instantiate a new memory bank
-            bank = memory.Memory(self, f'bank_{i}', size=bank_size, latency=1)
+            # atomics and truncate_size match magia_v2/tile.py:74. Without
+            # atomics the banks reject RISC-V atomic instructions; truncate_size
+            # masks an incoming address with (size - 1), so a bank sees an
+            # in-range offset instead of running past its end.
+            bank = memory.Memory(self, f'bank_{i}', atomics=True, size=bank_size,
+                                 latency=DemocritosDSE.TILE_TCDM_LATENCY,
+                                 truncate_size=bank_size)
             banks.append(bank)
 
             # Bind the new bank (slave) to the interleaver (master)
             self.bind(interleaver, f'out_{i}', bank, 'input')
             self.bind(dma_interleaver, f'out_{i}', bank, 'input')
-            self.bind(dimc_interleaver, f'out_{i}', bank, 'input')
             self.bind(spatz_interleaver, f'out_{i}', bank, 'input')
 
         # Bind the external porrts (input->[internal]output->interleaver)
@@ -88,10 +90,6 @@ class Democritos_V_TileTcdm(gvsoc.systree.Component):
 
         for i in range(dma_masters):
             self.bind(self, f'IDMA_input_{i}', dma_interleaver, f'input')
-
-        # CHECK correct binding, i.e. name of the ports
-        for i in range(dimc_hwpe_masters):
-            self.bind(self, f'DIMC_HWPE_input', dimc_interleaver, f'input')
 
         for i in range(spatz_masters):
             self.bind(self, f'SPATZ_input_{i}', spatz_interleaver, f'in_{i}')
@@ -103,14 +101,11 @@ class Democritos_V_TileTcdm(gvsoc.systree.Component):
     def i_DMA_INPUT(self, id: int) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, f'IDMA_input_{id}', signature='io')
 
-    def i_DIMC_HWPE_INPUT(self) -> gvsoc.systree.SlaveItf:
-        return gvsoc.systree.SlaveItf(self, f'DIMC_HWPE_input', signature='io')
-
     def i_SPATZ_INPUT(self, id: int) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, f'SPATZ_input_{id}', signature='io')
 
 class Democritos_V_Tile(gvsoc.systree.Component):
-    def __init__(self, parent, name, parser, tid: int=0):
+    def __init__(self, parent, name, parser, tid: int=0, rom_file: str=None):
         super().__init__(parent, name)
 
         # Core
@@ -133,32 +128,27 @@ class Democritos_V_Tile(gvsoc.systree.Component):
         idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
         idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
 
-        # DIMC HWPE. One outer block = 2 inner blocks x 2 macros = 4 macros.
-        # The macros of a block share one inner port and double-buffer against
-        # each other; the rest of the architecture is fixed in Dimc().
-        dimc = Dimc(self, 'dimc', macros_per_block=2)
-        self.dimc = dimc
-
-        # Snitch+Spatz vector core. fetch_enable is off, so a write to CLK_EN is
-        # what starts it; its first instruction comes from the boot rom below.
+        # Snitch+Spatz vector core. fetch_enable is off, so a write to CLK_EN
+        # is what starts it; its first instruction comes from the boot rom.
         # An absolute path is used as given; a relative one is searched for
         # on sys.path.
+        rom_spec = rom_file or DemocritosArch.SPATZ_ROMFILE
         rom_stim = None
-        if DemocritosArch.SPATZ_ROMFILE:
-            rom_stim = DemocritosArch.SPATZ_ROMFILE
+        if rom_spec:
+            rom_stim = rom_spec
             if not os.path.isabs(rom_stim):
                 rom_stim = self.get_file_path(rom_stim)
             elif not os.path.exists(rom_stim):
                 rom_stim = None
             if rom_stim is None:
                 raise RuntimeError(
-                    f"Spatz boot rom not found on sys.path: "
-                    f"{DemocritosArch.SPATZ_ROMFILE}. Build it with "
-                    f"'make bootrom' in democritos_tests/v-tile_test.")
+                    f"Spatz boot rom not found: {rom_spec}. Build it with "
+                    f"'make bootrom' in democritos_tests/v-tile_test, or point "
+                    f"SPATZ_ROMFILE at an existing spatz_init.bin.")
         spatz_rom = memory.Memory(self, f'tile-{tid}-spatz-rom',
             size=DemocritosArch.SPATZ_BOOTROM_SIZE, stim_file=rom_stim)
         spatz = SnitchFast(self, f'tile-{tid}-snitch-spatz',
-            isa="rv32imfdcav", fetch_enable=False,
+            isa="rv32imfdcav_zfh", fetch_enable=False,
             boot_addr=DemocritosArch.SPATZ_BOOTROM_ADDR,
             core_id=tid + DemocritosArch.NB_CLUSTERS, htif=False,
             inc_spatz=True,
@@ -169,6 +159,7 @@ class Democritos_V_Tile(gvsoc.systree.Component):
         spatz_i_cache = Hierarchical_cache(self, f'tile-{tid}-spatz-i-cache',
             nb_cores=1, has_cc=0, l1_line_size_bits=7)
         spatz_regs = SnitchSpatzRegs(self, f'tile-{tid}-spatz-regs')
+        self.spatz = spatz
 
         # Event unit (mirrors pulp/chips/magia_v2/tile.py). The address window is
         # already reserved in DemocritosArch; the HWPE raises done_irq into it so
@@ -203,23 +194,6 @@ class Democritos_V_Tile(gvsoc.systree.Component):
         stdout = Stdout(self, f'tile-{tid}-stdout', max_cluster=DemocritosArch.NB_CLUSTERS, max_core_per_cluster=1, user_set_core_id=0, user_set_cluster_id=tid)
 
         # Bind: CV32 core data -> OBI interconnect
-        # The whole dispatch protocol: CLK_EN raises fetch_enable, START
-        # pulses IRQ 11 to wake Spatz in its dispatcher loop.
-        spatz_regs.o_CLK_EN(spatz.i_FETCHEN())
-        spatz_regs.o_START(spatz.i_IRQ(11))
-
-        spatz.o_FETCH(spatz_i_cache.i_INPUT(0))
-        spatz.o_FLUSH_CACHE(spatz_i_cache.i_FLUSH())
-        spatz_i_cache.o_FLUSH_ACK(spatz.i_FLUSH_CACHE_ACK())
-        # Refill through the OBI crossbar, not the AXI one: that is where the
-        # boot rom Spatz resets into is mapped.
-        spatz_i_cache.o_REFILL(obi_xbar.i_INPUT())
-
-        spatz.o_DATA(obi_xbar.i_INPUT())
-        spatz.o_DATA_DEBUG(obi_xbar.i_INPUT())
-        for i in range(DemocritosArch.SPATZ_NB_VLSU_PORTS):
-            spatz.o_VLSU(i, l1_tcdm.i_SPATZ_INPUT(i))
-
         core_cv32.o_DATA(obi_xbar.i_INPUT())
         core_cv32.o_DATA_DEBUG(obi_xbar.i_INPUT())
 
@@ -281,20 +255,15 @@ class Democritos_V_Tile(gvsoc.systree.Component):
                        base=DemocritosArch.STDOUT_START,
                        size=DemocritosArch.STDOUT_SIZE, rm_base=False)
 
-        # Bind OBI Xbar so that it can communicate to DIMC HWPE
+        # Bind OBI Xbar to the Spatz boot rom and control registers
         obi_xbar.o_MAP(spatz_rom.i_INPUT(), name='spatz-bootrom',
-                    base=DemocritosArch.SPATZ_BOOTROM_ADDR,
-                    size=DemocritosArch.SPATZ_BOOTROM_SIZE, rm_base=True)
+                       base=DemocritosArch.SPATZ_BOOTROM_ADDR,
+                       size=DemocritosArch.SPATZ_BOOTROM_SIZE, rm_base=True)
         obi_xbar.o_MAP(spatz_regs.i_INPUT(), name='spatz-regs',
-                    base=DemocritosArch.SPATZ_CTRL_START,
-                    size=DemocritosArch.SPATZ_CTRL_SIZE, rm_base=True)
+                       base=DemocritosArch.SPATZ_CTRL_START,
+                       size=DemocritosArch.SPATZ_CTRL_SIZE, rm_base=True)
 
-        obi_xbar.o_MAP(dimc.i_hwpe_slv(), name='local-dimc-hwpe',
-                       base=DemocritosArch.DIMC_START,
-                       size=DemocritosArch.DIMC_SIZE,
-                       rm_base=True)
-
-        # Event unit: map it on the OBI xbar and route the DIMC completion
+        # Event unit: map it on the OBI xbar and route the Spatz completion
         # interrupt into it (magia_v2 pattern: bind(<hwpe>, 'done_irq', ...)).
         obi_xbar.add_mapping('event_unit', **self.get_property('event_unit/mapping'))
         self.bind(obi_xbar, 'event_unit', event_unit, 'input')
@@ -302,17 +271,16 @@ class Democritos_V_Tile(gvsoc.systree.Component):
         self.bind(event_unit, 'clock_0', core_cv32, 'clock')
         self.bind(core_cv32, 'irq_ack', event_unit, 'irq_ack_0')
         self.bind(event_unit, 'irq_req_0', core_cv32, 'irq_req')
-        # DIMC completion -> event 10 (same slot magia_v2 gives RedMule).
-        self.bind(dimc, 'done_irq', event_unit, 'in_event_10_pe_0')
-        # Raised when a task returns. Bind it even though nothing waits on
-        # event 8: the register model syncs the port unconditionally.
+        # Spatz completion -> event 8 (same slot magia_v2 gives its vector core).
         self.bind(spatz_regs, 'spatz_done_irq', event_unit, 'in_event_8_pe_0')
         # FractalSync barrier completion -> event 24 (same slot as magia_v2).
         self.bind(fsync_mm_ctrl, 'fsync_done_irq', event_unit, 'in_event_24_pe_0')
-        # Unconnected event slots: magia_v2 also routes
-        #   idma_mm_ctrl 'idma0_done_irq' -> in_event_2_pe_0
-        #   idma_mm_ctrl 'idma1_done_irq' -> in_event_3_pe_0
-        # The iDMA interrupts are not modelled here.
+        # iDMA completion -> events 2 and 3, the slots magia_v2 uses. These are
+        # master ports on iDMA_mm_ctrl and it drives them on every completion
+        # (idma_mm_ctrl.cpp:240), so leaving them unbound is a null dereference
+        # the moment software issues a transfer, not merely a missing feature.
+        self.bind(idma_mm_ctrl, 'idma0_done_irq', event_unit, 'in_event_2_pe_0')
+        self.bind(idma_mm_ctrl, 'idma1_done_irq', event_unit, 'in_event_3_pe_0')
 
         # FractalSync controller registers, so software can request a barrier.
         # Same address window magia_v2 uses (arch reserves FSYNC_CTRL_*).
@@ -336,18 +304,34 @@ class Democritos_V_Tile(gvsoc.systree.Component):
 
         # Bind iDMA0
         idma0.o_AXI(tile_xbar.i_INPUT())
-        idma0.o_TCDM(l1_tcdm.i_INPUT(1)) # here we don't use the iDMA interleaver because here iDMA is directly connected to TCDM and iDMA has it's own interleaver for TCDM access (in iDMA-BE)
+        # DmaInterleaver, not the core-side L1_interleaver: the latter is
+        # interleaved every 4 bytes, so a DMA bound to it lands one eighth of
+        # the bytes it was asked for. magia_v2/tile.py:343 binds the same way.
+        idma0.o_TCDM(l1_tcdm.i_DMA_INPUT(1))
         idma_mm_ctrl.o_OFFLOAD_iDMA0_AXI2OBI(idma0.i_OFFLOAD())
         idma0.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA0_AXI2OBI())
 
         # Bind iDMA1
         idma1.o_AXI(tile_xbar.i_INPUT())
-        idma1.o_TCDM(l1_tcdm.i_INPUT(2)) # here we don't use the iDMA interleaver because here iDMA is directly connected to TCDM and iDMA has it's own interleaver for TCDM access (in iDMA-BE)
+        idma1.o_TCDM(l1_tcdm.i_DMA_INPUT(2))
         idma_mm_ctrl.o_OFFLOAD_iDMA1_OBI2AXI(idma1.i_OFFLOAD())
         idma1.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA1_OBI2AXI())
 
-        # Bind DIMC
-        dimc.o_stream_mst(l1_tcdm.i_DIMC_HWPE_INPUT())
+        # Bind Spatz. CLK_EN releases the fetch, START pulses IRQ 11 to wake
+        # the core inside its dispatcher loop.
+        spatz_regs.o_CLK_EN(spatz.i_FETCHEN())
+        spatz_regs.o_START(spatz.i_IRQ(11))
+
+        spatz.o_FETCH(spatz_i_cache.i_INPUT(0))
+        spatz.o_FLUSH_CACHE(spatz_i_cache.i_FLUSH())
+        spatz_i_cache.o_FLUSH_ACK(spatz.i_FLUSH_CACHE_ACK())
+        # Refill goes to OBI, not AXI: that is where the boot rom is mapped.
+        spatz_i_cache.o_REFILL(obi_xbar.i_INPUT())
+
+        spatz.o_DATA(obi_xbar.i_INPUT())
+        spatz.o_DATA_DEBUG(obi_xbar.i_INPUT())
+        for i in range(DemocritosArch.SPATZ_NB_VLSU_PORTS):
+            spatz.o_VLSU(i, l1_tcdm.i_SPATZ_INPUT(i))
 
         # Bind FractalSync ports
         fsync_mm_ctrl.o_XIF_2_FRACTAL_EAST_WEST(self.__o_SLAVE_EAST_WEST_FRACTAL())
