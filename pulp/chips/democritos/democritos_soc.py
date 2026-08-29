@@ -21,8 +21,8 @@ import utils.loader.loader
 import interco.router as router
 
 from pulp.chips.democritos.democritos_D_tile import Democritos_D_Tile
-# from pulp.chips.democritos.democritos_A_tile import Democritos_A_Tile
-# from pulp.chips.democritos.democritos_V_tile import Democritos_V_Tile
+from pulp.chips.democritos.democritos_A_tile import Democritos_A_Tile
+from pulp.chips.democritos.democritos_V_tile import Democritos_V_Tile
 from pulp.chips.democritos.democritos_arch import DemocritosArch
 from pulp.floonoc.floonoc import *
 from pulp.chips.magia_v2.fractal_sync.fractal_sync import *
@@ -60,12 +60,24 @@ class DemocritosSoc(gvsoc.systree.Component):
                                              frequency=DemocritosArch.TILE_CLK_FREQ)
         clock.o_CLOCK(self.i_CLOCK())
 
-        # TODO: Create a mechanism to create the tiles according to specifications
-        #       This might be a collection of lists that are then indexed for the instantiation 
-        # Create Tiles
-        cluster:List[Democritos_D_Tile] = []
+        # Create Tiles. All three classes expose the same ports to the SoC, so
+        # the wiring below does not branch on the type.
+        types = DemocritosArch.TILE_TYPES
+        if len(types) != DemocritosArch.NB_CLUSTERS:
+            raise RuntimeError(
+                f"TILE_TYPES has {len(types)} entries, mesh has "
+                f"{DemocritosArch.NB_CLUSTERS} positions")
+        tile_class = {'d': Democritos_D_Tile,
+                      'a': Democritos_A_Tile,
+                      'v': Democritos_V_Tile}
+        cluster:List[gvsoc.systree.Component] = []
         for id in range(0,DemocritosArch.NB_CLUSTERS):
-            cluster.append(Democritos_D_Tile(self, f'democritos-D-tile-{id}', parser, id))
+            t = types[id]
+            if t not in tile_class:
+                raise RuntimeError(f"tile {id}: unknown type '{t}', "
+                                   f"expected one of {sorted(tile_class)}")
+            cluster.append(tile_class[t](
+                self, f'democritos-{t.upper()}-tile-{id}', parser, id))
 
         # End-of-simulation. crt0's exit sequence has every tile store a halfword
         # at TEST_END_ADDR_START + 2*mhartid, which the D-tile maps out through
