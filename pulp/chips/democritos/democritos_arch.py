@@ -88,6 +88,10 @@ class DemocritosArch:
     N_TILES_X           = 2 # 16
     N_TILES_Y           = 2 # 16
     NB_CLUSTERS         = N_TILES_X*N_TILES_Y # to be removed when we'll use the DemocritosTree properties instead of hardcoding the number of clusters in the components
+    # Which accelerator each mesh position carries, indexed by tile id. Keep
+    # NB_CLUSTERS a power of two: democritos_soc.py sizes the FractalSync tree
+    # by int(log2(NB_CLUSTERS)) and under-provisions it silently otherwise.
+    TILE_TYPES          = ['d'] * NB_CLUSTERS
 
 class DemocritosTree(Tree):
     def __init__(self, parent, name):
