@@ -33,9 +33,15 @@ class SnitchDma(gvsoc.systree.Component):
     burst_queue_size: int
         Maximum number of outstanding burst requests.
     loc_base: int
-        Base address of the local area.
+        Base address of the local area. A burst is served locally when it falls
+        entirely within [loc_base, loc_base + loc_size).
     loc_size: int
         Size of the local area.
+    tcdm_base: int
+        Address the local interconnect counts from; the backend subtracts it
+        from every local burst address before handing it to the interleaver.
+        Defaults to loc_base, which is right whenever the local area is mapped
+        at the same address the interleaver starts at.
     tcdm_width: int
         Width of the local interconnect, in bytes.
     """
@@ -46,6 +52,7 @@ class SnitchDma(gvsoc.systree.Component):
             burst_size: int=0,
             loc_base: int=0,
             loc_size: int=0,
+            tcdm_base: int=None,
             tcdm_width: int=0):
 
         super().__init__(parent, name)
@@ -65,6 +72,7 @@ class SnitchDma(gvsoc.systree.Component):
             "burst_size" : burst_size,
             "loc_base": loc_base,
             "loc_size": loc_size,
+            "tcdm_base": loc_base if tcdm_base is None else tcdm_base,
             "tcdm_width": tcdm_width,
         })
 

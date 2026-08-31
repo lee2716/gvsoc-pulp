@@ -45,7 +45,13 @@ IDmaBeTcdm::IDmaBeTcdm(vp::Component *idma, std::string itf_name, IdmaBeProducer
     this->burst_queue_maxsize = idma->get_js_config()->get_int("burst_queue_size");
 
     // Local memory base
+    // The address the TCDM interleaver expects is not the address the backend
+    // classifies on. loc_base answers "is this request local?" (idma_be.cpp:52)
+    // and is a slave-map base; tcdm_base is what the interleaver subtracts to
+    // land in a bank. They coincide only when the tile's L1 map starts at the
+    // same address the interleaver counts from, which is not the case here.
     this->loc_base = idma->get_js_config()->get_int("loc_base");
+    this->tcdm_base = idma->get_js_config()->get_int("tcdm_base");
 }
 
 
@@ -172,7 +178,7 @@ void IDmaBeTcdm::write_line()
 
         req->prepare();
         req->set_is_write(true);
-        req->set_addr(base - this->loc_base);
+        req->set_addr(base - this->tcdm_base);
         req->set_size(size);
         req->set_data(this->write_current_chunk_data);
 
@@ -291,7 +297,7 @@ void IDmaBeTcdm::read_line()
     // Prepare the IO request to TCDM
     req->prepare();
     req->set_is_write(false);
-    req->set_addr(base - this->loc_base);
+    req->set_addr(base - this->tcdm_base);
     req->set_size(size);
     // Since the destination backend may keep the data until the write is done, we need
     // to dynamically allocate the data since we may read several times before data is acknowledged

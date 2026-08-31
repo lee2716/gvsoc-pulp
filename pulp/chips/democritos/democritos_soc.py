@@ -98,10 +98,15 @@ class DemocritosSoc(gvsoc.systree.Component):
         # same work with the port to itself, and only 38,874 for a tile two hops
         # away. Two columns put every tile one hop from a slice of its own.
         DEMOCRITOS_L2_SLICES = 2 * DemocritosArch.N_TILES_Y
+        # L2_SIZE is a last offset, so the span is L2_SIZE + 1; round the slice
+        # down to a page so that every slice base is page aligned, not just the
+        # first. Dividing L2_SIZE directly leaves every later base on an odd
+        # address, which cost tile 3 44% in the four-tile mesh.
+        DEMOCRITOS_L2_SLICE = ((DemocritosArch.L2_SIZE + 1) // DEMOCRITOS_L2_SLICES) & ~0xFFF
         l2_mem:List[memory.Memory] = []
         for id in range(0, DEMOCRITOS_L2_SLICES):
             l2_mem.append(memory.Memory(self, f'L2-mem-{id}',
-                                        size=DemocritosArch.L2_SIZE // DEMOCRITOS_L2_SLICES,
+                                        size=DEMOCRITOS_L2_SLICE,
                                         latency=1))
 
         # Create Tile matrix for IDs
@@ -236,7 +241,7 @@ class DemocritosSoc(gvsoc.systree.Component):
             # first (ids 0..N_TILES_Y-1, by descending y), then the right
             # column, so slice id = (x_index * N_TILES_Y) + y_index and a tile
             # can pick the slice it is adjacent to from its own id.
-            l2_slice = DemocritosArch.L2_SIZE // DEMOCRITOS_L2_SLICES
+            l2_slice = DEMOCRITOS_L2_SLICE
             id = 0
             for x_l2 in (0, DemocritosArch.N_TILES_X + 1):
                 for y in reversed(range(0,DemocritosArch.N_TILES_Y)):
@@ -264,7 +269,7 @@ class DemocritosSoc(gvsoc.systree.Component):
             id = 0   
             for y in reversed(range(0,DemocritosArch.N_TILES_Y)):
                 print(f"[G-XBAR] Adding L2 {id} at position x={0} y={y}")
-                soc_xbar.o_MAP(l2_mem[id].i_INPUT(),name=f'l2-map-{id}',base=DemocritosArch.L2_ADDR_START + id*(DemocritosArch.L2_SIZE // DEMOCRITOS_L2_SLICES),size=DemocritosArch.L2_SIZE // DEMOCRITOS_L2_SLICES,rm_base=True)
+                soc_xbar.o_MAP(l2_mem[id].i_INPUT(),name=f'l2-map-{id}',base=DemocritosArch.L2_ADDR_START + id*DEMOCRITOS_L2_SLICE,size=DEMOCRITOS_L2_SLICE,rm_base=True)
                 id=id+1
 
         # Fractal tree routing

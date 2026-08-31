@@ -121,8 +121,8 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         idma_mm_ctrl= iDMA_mm_ctrl(self,f'tile-{tid}-idma-ctrl-mm')
 
         # iDMA
-        idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
-        idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
+        idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=DemocritosArch.L1_ADDR_START,loc_size=DemocritosArch.L1_SIZE,tcdm_base=0,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
+        idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=DemocritosArch.L1_ADDR_START,loc_size=DemocritosArch.L1_SIZE,tcdm_base=0,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
 
         # DIMC HWPE. One outer block = 2 inner blocks x 2 macros = 4 macros.
         # The macros of a block share one inner port and double-buffer against
@@ -293,6 +293,14 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         # Bind: iDMA controller
         obi_xbar.o_MAP(idma_mm_ctrl.i_INPUT(), name=f'iDMA-ctrl-mm-{tid}-mem', base=DemocritosArch.IDMA_CTRL_ADDR_START, size=DemocritosArch.IDMA_CTRL_SIZE, rm_base=True)
 
+        # idma_be.cpp:51 classifies a transfer as local purely by
+        # [loc_base, loc_base+loc_size), so this window has to BE the L1 window.
+        # It used to be tid*L1_TILE_OFFSET, which described a different address
+        # space from the one the core uses: every tile but tile 0 then treated
+        # its own L1 as remote and sent the transfer out over AXI instead of
+        # into the local TCDM, and tile 0's window was itself short of L1 by the
+        # 0x1FEE0 the stack occupies. Copied verbatim from magia_v2/tile.py:196;
+        # only the mesh could expose it, because tid=0 hides all of it.
         # Bind iDMA0
         # Out the WIDE port, not tile_xbar. tile_xbar is 4 bytes/cycle and its
         # L2 route leaves through the 4-byte narrow NoC; measured on that path

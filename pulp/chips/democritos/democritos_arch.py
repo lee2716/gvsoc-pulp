@@ -54,6 +54,10 @@ class DemocritosArch:
     L1_ADDR_END             = L1_ADDR_START + L1_SIZE
     L1_TILE_OFFSET          = 0x0010_0000
     L2_ADDR_START           = 0xC000_0000
+    # Last offset, not a byte count: TEST_END_ADDR_START below is L2_ADDR_END + 1,
+    # and a-tile_test/kernel/crt0.S:76 hard-codes that address as 0xCCFF_0000.
+    # So this value is pinned. Anything slicing L2 must use the span L2_SIZE + 1
+    # and round each slice down to a page -- see DEMOCRITOS_L2_SLICE_BYTES.
     L2_SIZE                 = 0x0CFE_FFFF
     L2_ADDR_END             = L2_ADDR_START + L2_SIZE
     TEST_END_ADDR_START     = L2_ADDR_END + 1

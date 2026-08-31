@@ -89,6 +89,7 @@ private:
     int burst_queue_maxsize;
     // Top parameter giving base address of local memory
     uint64_t loc_base;
+    uint64_t tcdm_base;
 
     // Request used for TCDM accesses, only one at the same time is possible
     vp::IoReq req;
