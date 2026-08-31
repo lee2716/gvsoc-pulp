@@ -113,6 +113,6 @@ class DemocritosDSE:
     TILE_OBI_XBAR_LATENCY       = 2
     TILE_OBI_XBAR_SYNC          = True
     TILE_IDMA0_BQUEUE_SIZE      = 2
-    TILE_IDMA0_B_SIZE           = 32
+    TILE_IDMA0_B_SIZE           = 1024
     TILE_IDMA1_BQUEUE_SIZE      = 2
-    TILE_IDMA1_B_SIZE           = 32
+    TILE_IDMA1_B_SIZE           = 1024
