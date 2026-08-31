@@ -99,6 +99,13 @@ private:
     std::queue<vp::IoReq *> read_bursts_waiting_ack;
     // List of timestamps for each burst where they can be considered as finished
     std::vector<int64_t> read_timestamps;
+    // A burst is released to the middle-end only when it is the OLDEST one
+    // issued. read_waiting_bursts is filled by the response callback, which
+    // fires in completion order -- and an interconnect is free to answer out of
+    // order. Handing the data over in that order writes a burst's bytes at
+    // another burst's offset; it stayed invisible only because a small
+    // NumAxInFlight leaves no room to reorder.
+    std::vector<bool> read_done;
 
     // Queue of pending bursts. This contains both read and write bursts. This is mostly used
     // to process them in order. The front burst is removed from the queue once it is fully

@@ -52,7 +52,6 @@ struct DimcPipeEntry {
 #define DIMC_SIGN_US        2
 #define DIMC_SIGN_SS        3
 
-
 class Dimc_Macro {
     public:
         Dimc_Macro();
@@ -105,20 +104,16 @@ class Dimc_Macro {
         int32_t  psout = 0;
         uint8_t  sout  = 0;   // computed by final_compute, never wired out
 
-        // Pipeline state: in-flight entries waiting to drain
-        // Preload cursor for this macro. Serving the lowest-index macro that
-        // still has beats left reproduces the old block-wide beat_index order
-        // exactly, so splitting the counter is behaviour-neutral on its own.
-        uint32_t beat_index = 0;
-        uint32_t beat_total = 0;
         // Which in-flight job this macro is working on, and the kernel base it
         // last pulled in. Per macro because once two jobs overlap the macros
         // are on different ones, and a single engine-wide last_kb_src would be
         // overwritten by whichever macro filled most recently -- every reuse
         // would then miss and reload weights that were already resident.
-        // "the operands for the job I am executing are in cur". Separate from
-        // the beat counters, which belong to the fill stage and get reset under
-        // this macro the moment a prefetch for the next job starts.
+
+        // "the operands for the job I am executing are in cur". A flag of its
+        // own, not a comparison on the fill's beat counters: those live in the
+        // fill cursor and a prefetch resets its own copy under this macro at
+        // any time.
         bool     exec_ready = false;
         // Job-relative timestamps, instrumentation only.
         uint32_t trace_fill_start = 0, trace_fill_done = 0;

@@ -64,11 +64,13 @@
 
 /* ============== Job-DEPENDENT registers @ 0x40 ==============
  * Per-job context: data pointers, stream geometry, per-job scalars.
- * This block is BANKED PER CONTEXT (DIMC_NB_CONTEXT copies): software ACQUIREs
- * a context, writes this block into it, then commits. A second job can be
- * offloaded while the first one is still running.
+ * This block is ONE live bundle. Software writes it and COMMIT snapshots the
+ * whole thing into a job FIFO of depth DIMC_NB_CONTEXT, so several jobs can be
+ * offloaded while one runs and a value only has to be rewritten when it
+ * changes. A queue slot is not addressable: ACQUIRE returns a job id, never a
+ * slot index (hwpe_ctrl_target.sv a52dc9cd, rtl/hwpe_ctrl_target.sv:49,73).
  */
-#define DIMC_NB_CONTEXT              4
+#define DIMC_NB_CONTEXT              8
 #define DIMC_HWPE_JOB_BASE           (DIMC_HWPE_BASE + 0x40)
 #define DIMC_HWPE_NB_JOB_REGS        23   /* 0x40 .. 0x98 inclusive; 0x8C/0x90 are
                                           * intercepted as ACC_VAL and leave holes */
