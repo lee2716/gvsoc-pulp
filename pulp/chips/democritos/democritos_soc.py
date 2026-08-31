@@ -201,6 +201,12 @@ class DemocritosSoc(gvsoc.systree.Component):
                     print(f"[NoC] Adding cluster {id} at position x={x} y={y}")
                     cluster[id].o_NARROW_OUTPUT(noc.i_NARROW_INPUT(x,y))
                     noc.o_NARROW_MAP(cluster[id].i_NARROW_INPUT(),name=f'tile-{id}-l1-mem',base=DemocritosArch.L1_ADDR_START+(id*DemocritosArch.L1_TILE_OFFSET),size=DemocritosArch.L1_SIZE,x=x,y=y,rm_base=False)
+                    # Wide channel carries the iDMA traffic. Only the tile types
+                    # that expose the port get wired; the tile list is
+                    # heterogeneous and the A-tile has no wide port.
+                    if hasattr(cluster[id], 'o_WIDE_OUTPUT'):
+                        cluster[id].o_WIDE_OUTPUT(noc.i_WIDE_INPUT(x,y))
+                        noc.o_WIDE_MAP(cluster[id].i_WIDE_INPUT(),name=f'wide-tile-{id}-l1-mem',base=DemocritosArch.L1_ADDR_START+(id*DemocritosArch.L1_TILE_OFFSET),size=DemocritosArch.L1_SIZE,x=x,y=y,rm_base=False)
                     id += 1
 
             # Bind memory to noc
@@ -221,6 +227,7 @@ class DemocritosSoc(gvsoc.systree.Component):
             for y in reversed(range(0,DemocritosArch.N_TILES_Y)):
                 print(f"[NoC] Adding L2 {id} at position x={0} y={y}")
                 noc.o_NARROW_MAP(l2_mem[id].i_INPUT(),name=f'l2-map-{id}',base=DemocritosArch.L2_ADDR_START + id*(DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y),size=DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y,x=0,y=y,rm_base=True)
+                noc.o_WIDE_MAP(l2_mem[id].i_INPUT(),name=f'l2-wide-map-{id}',base=DemocritosArch.L2_ADDR_START + id*(DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y),size=DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y,x=0,y=y,rm_base=True)
                 id=id+1
 
         else:
@@ -231,6 +238,12 @@ class DemocritosSoc(gvsoc.systree.Component):
                 print(f"[G-XBAR] Adding cluster {id}")
                 cluster[id].o_NARROW_OUTPUT(soc_xbar.i_INPUT())
                 soc_xbar.o_MAP(cluster[id].i_NARROW_INPUT(),f'tile-{id}-l1-mem',base=DemocritosArch.L1_ADDR_START+(id*DemocritosArch.L1_TILE_OFFSET),size=DemocritosArch.L1_SIZE,rm_base=False)
+                # No NoC in this configuration, so the wide port shares the SoC
+                # xbar. It is then no wider than the narrow one -- this branch
+                # is a functional fallback, not a bandwidth model.
+                if hasattr(cluster[id], 'o_WIDE_OUTPUT'):
+                    cluster[id].o_WIDE_OUTPUT(soc_xbar.i_INPUT())
+                    soc_xbar.o_MAP(cluster[id].i_WIDE_INPUT(),f'wide-tile-{id}-l1-mem',base=DemocritosArch.L1_ADDR_START+(id*DemocritosArch.L1_TILE_OFFSET),size=DemocritosArch.L1_SIZE,rm_base=False)
 
             id = 0   
             for y in reversed(range(0,DemocritosArch.N_TILES_Y)):
