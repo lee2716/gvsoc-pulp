@@ -53,7 +53,9 @@ class Democritos_D_TileTcdm(gvsoc.systree.Component):
         # OBI plus the two iDMAs. They share one DmaInterleaver input, the way
         # magia_v2/tile.py:59 does it; the count is how many composite ports the
         # tile exposes, not how many interleaver inputs exist.
-        dma_masters = 3
+        # 0: OBI xbar (core-issued L1 access through the DMA interleaver)
+        # 1: iDMA0 TCDM side   2: iDMA1 TCDM side   3: NoC wide channel inbound
+        dma_masters = 4
         dma_interleaver = DmaInterleaver(self, 'dma_interleaver', nb_master_ports=dma_masters, nb_banks=nb_banks, bank_width=DemocritosArch.BYTES_PER_WORD)
 
         # 1 master: DIMC HWPE
@@ -260,6 +262,11 @@ class Democritos_D_Tile(gvsoc.systree.Component):
 
         self.__o_NARROW_INPUT(tile_xbar.i_INPUT())
 
+        # Wide channel inbound: a remote DMA writing this tile's L1 lands on the
+        # DmaInterleaver, not the core-side one. magia_v2/tile.py:313 binds the
+        # same way.
+        self.__o_WIDE_INPUT(l1_tcdm.i_DMA_INPUT(3))
+
         # Bind CV32 core enable prots -> matching composite ports
         self.__o_ENTRY(core_cv32.i_ENTRY())
         self.__o_FETCHEN(core_cv32.i_FETCHEN())
@@ -268,7 +275,12 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         obi_xbar.o_MAP(idma_mm_ctrl.i_INPUT(), name=f'iDMA-ctrl-mm-{tid}-mem', base=DemocritosArch.IDMA_CTRL_ADDR_START, size=DemocritosArch.IDMA_CTRL_SIZE, rm_base=True)
 
         # Bind iDMA0
-        idma0.o_AXI(tile_xbar.i_INPUT())
+        # Out the WIDE port, not tile_xbar. tile_xbar is 4 bytes/cycle and its
+        # L2 route leaves through the 4-byte narrow NoC; measured on that path
+        # the DMA ran at exactly 4.0 B/cycle and the weight transfers were 99%
+        # of the psin runtime. The wide network is what exists for DMA traffic;
+        # magia_v2/tile.py:342 binds it the same way.
+        idma0.o_AXI(self.__i_WIDE_OUTPUT())
         # DmaInterleaver, not the core-side L1_interleaver: the latter is
         # interleaved every 4 bytes, so a DMA bound to it lands one eighth of
         # the bytes it was asked for. magia_v2/tile.py:343 binds the same way.
@@ -277,7 +289,12 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         idma0.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA0_AXI2OBI())
 
         # Bind iDMA1
-        idma1.o_AXI(tile_xbar.i_INPUT())
+        # Out the WIDE port, not tile_xbar. tile_xbar is 4 bytes/cycle and its
+        # L2 route leaves through the 4-byte narrow NoC; measured on that path
+        # the DMA ran at exactly 4.0 B/cycle and the weight transfers were 99%
+        # of the psin runtime. The wide network is what exists for DMA traffic;
+        # magia_v2/tile.py:342 binds it the same way.
+        idma1.o_AXI(self.__i_WIDE_OUTPUT())
         idma1.o_TCDM(l1_tcdm.i_DMA_INPUT(2))
         idma_mm_ctrl.o_OFFLOAD_iDMA1_OBI2AXI(idma1.i_OFFLOAD())
         idma1.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA1_OBI2AXI())
@@ -365,6 +382,20 @@ class Democritos_D_Tile(gvsoc.systree.Component):
 
     def __o_NARROW_INPUT(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('narrow_input', itf, signature='io', composite_bind=True)
+
+    # Output (master) wide port to off-tile L2 memory. Carries DMA traffic only;
+    # core accesses keep using the narrow port.
+    def o_WIDE_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('wide_output', itf, signature='io')
+
+    def __i_WIDE_OUTPUT(self) -> gvsoc.systree.SlaveItf:
+        return gvsoc.systree.SlaveItf(self, 'wide_output', signature='io')
+
+    def i_WIDE_INPUT(self) -> gvsoc.systree.SlaveItf:
+        return gvsoc.systree.SlaveItf(self, 'wide_input', signature='io')
+
+    def __o_WIDE_INPUT(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('wide_input', itf, signature='io', composite_bind=True)
 
     # Input port for the loader
     def i_LOADER(self) -> gvsoc.systree.SlaveItf:
