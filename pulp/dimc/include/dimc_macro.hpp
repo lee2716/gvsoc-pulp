@@ -26,6 +26,9 @@
 #define DIMC_MACRO_FB_EW    128
 // Pipeline depth: 4 cycles per spatz_DIMC.sv (1 result/cycle throughput after fill)
 #define DIMC_MACRO_LATENCY  4
+// Kernel, feature and partial-sum storage is double banked: one bank feeds the
+// running job while the other takes the next one's operands.
+#define DIMC_MACRO_NB_BANKS 2
 
 struct DimcPipeEntry {
     int32_t  psout;
@@ -85,18 +88,72 @@ class Dimc_Macro {
         // what compute_PP uses while psin_rows is off.
         int32_t  psin_scalar = 0;
         uint8_t  psin_rows   = 0;                        // 1 = take psin from psin_buf
-        int32_t  psin_buf[DIMC_MACRO_KB_LEN] = {0};
+        // Two banks of everything a compute trigger reads, so the next job's
+        // data can land while this one still runs. The kernel and the feature
+        // side need their own pair of pointers: on a reuse job the kernel is
+        // not reloaded and has to stay where it is, while the features and the
+        // partial sums change every job.
+        uint8_t  kb_cur = 0, kb_fill = 0;
+        uint8_t  fb_cur = 0, fb_fill = 0;
+        int32_t  psin_buf[DIMC_MACRO_NB_BANKS][DIMC_MACRO_KB_LEN] = {{0}};
 
         // Buffers
-        uint8_t  KB[DIMC_MACRO_KB_LEN][DIMC_MACRO_KB_EW];
-        uint8_t  FB[DIMC_MACRO_FB_EW];
+        uint8_t  KB[DIMC_MACRO_NB_BANKS][DIMC_MACRO_KB_LEN][DIMC_MACRO_KB_EW];
+        uint8_t  FB[DIMC_MACRO_NB_BANKS][DIMC_MACRO_FB_EW];
 
         // Outputs
         int32_t  psout = 0;
         uint8_t  sout  = 0;   // computed by final_compute, never wired out
 
         // Pipeline state: in-flight entries waiting to drain
+        // Preload cursor for this macro. Serving the lowest-index macro that
+        // still has beats left reproduces the old block-wide beat_index order
+        // exactly, so splitting the counter is behaviour-neutral on its own.
+        uint32_t beat_index = 0;
+        uint32_t beat_total = 0;
+        // Which in-flight job this macro is working on, and the kernel base it
+        // last pulled in. Per macro because once two jobs overlap the macros
+        // are on different ones, and a single engine-wide last_kb_src would be
+        // overwritten by whichever macro filled most recently -- every reuse
+        // would then miss and reload weights that were already resident.
+        // "the operands for the job I am executing are in cur". Separate from
+        // the beat counters, which belong to the fill stage and get reset under
+        // this macro the moment a prefetch for the next job starts.
+        bool     exec_ready = false;
+        // Job-relative timestamps, instrumentation only.
+        uint32_t trace_fill_start = 0, trace_fill_done = 0;
+        uint32_t trace_compute_start = 0, trace_compute_end   = 0;
+        uint32_t job_slot   = 0;
+        uint32_t last_kb_src = 0xFFFFFFFFu;
+        bool     skip_kb    = false;
+        // Cycle its last preload beat lands. A macro may not compute before it:
+        // can_accept() only tracks kb_ready/fb_ready, which are raised at the
+        // feature beat, and the partial sums arrive after that.
+        uint64_t fill_done_cycle = 0;
+        // Rows pushed into this macro's pipe. Per macro, not per block, so a
+        // macro that finished filling does not wait for its sibling.
+        uint32_t rows_issued = 0;
+        // Rows this macro has retired from its pipe into out_buf. The store
+        // watermark: beat k may go once rows_retired covers the rows it carries.
+        uint32_t rows_retired = 0;
+
+        // Staging for the beat in flight. Per macro, not per block: once two
+        // macros fill concurrently a shared buffer would let one overwrite the
+        // other's half-assembled row. Three preload paths use it -- a kernel
+        // row, a feature vector, and the whole per-row partial-sum block -- and
+        // all three end at exactly DIMC_MACRO_KB_EW, which nothing else
+        // declares, so assert it.
+        uint8_t  row_buffer[DIMC_MACRO_KB_EW] = {0};
+        static_assert(DIMC_MACRO_FB_EW <= DIMC_MACRO_KB_EW,
+                      "row_buffer holds a feature vector; FB_EW must fit KB_EW");
+        static_assert(DIMC_MACRO_KB_LEN * 4 <= DIMC_MACRO_KB_EW,
+                      "row_buffer holds row_count 32-bit partial sums");
+
         std::deque<DimcPipeEntry> pipe;
+        // kb_ready and fb_ready are both raised when the FEATURE vector lands,
+        // which is the last thing a macro waits for; on a reuse job no kernel
+        // moves at all. The pair means "this macro has what it needs", not
+        // "the kernel arrived".
         bool     kb_ready         = false;
         bool     fb_ready         = false;
 };

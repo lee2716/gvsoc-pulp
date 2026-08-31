@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cstring>
 #include <vp/vp.hpp>
 #include <vp/itf/io.hpp>
 #include <algorithm>
@@ -43,6 +44,8 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->outer_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("outer_port_bytes");
     this->l2_burst_latency  = (uint32_t)this->get_js_config()->get_child_int("l2_burst_latency");
 
+    this->cross_job_prefetch = (bool)this->get_js_config()->get_child_int("cross_job_prefetch");
+    this->outer_cut_through  = (bool)this->get_js_config()->get_child_int("outer_cut_through");
     this->last_kb_src     = 0xFFFFFFFF;   // no resident weights yet
     // HWPE slave port
     this->hwpe_slv.set_req_meth(&Dimc_HWPE::hwpe_slave);
@@ -58,11 +61,13 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     // Each block owns its streamers and macros; this component drives them all.
     this->inner_blocks.resize(this->nb_inner_blocks);
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
-        blk.weight_stream = Dimc_HWPE_Streamer(this, false);
-        blk.input_stream  = Dimc_HWPE_Streamer(this, false);
-        blk.out_stream    = Dimc_HWPE_Streamer(this, true);
-        blk.psin_stream   = Dimc_HWPE_Streamer(this, false);
         blk.macros.resize(this->num_macros);
+        for (uint32_t m = 0; m < this->num_macros; m++) {
+            blk.weight_stream.emplace_back(this, false);
+            blk.input_stream .emplace_back(this, false);
+            blk.out_stream   .emplace_back(this, true);
+            blk.psin_stream  .emplace_back(this, false);
+        }
         blk.reset_job_state();
     }
 
@@ -105,8 +110,8 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->job_running   = false;
     this->acquired_ctx  = -1;
     this->running_ctx   = -1;
-    this->next_ctx   = -1;
-    this->spare_ctx    = -1;
+    this->ctx_queue.clear();
+    std::memset(this->live_regs, 0, sizeof(this->live_regs));
     for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
         this->ctx_busy[ctx]   = false;
         this->ctx_job_id[ctx] = 0;
@@ -114,12 +119,13 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     }
     this->outstanding_depth = 4;    // max in-flight TCDM beats per block
     this->fsm_timestamp     = 0;
-    this->kb_beats_per_row  = 1;
-    this->fb_beats_per_macro= 1;
-    this->beats_per_macro   = 1;
+    this->job_start_cycle   = 0;
+    this->job_geom[0].kb_beats_per_row  = 1;
+    this->job_geom[0].fb_beats_per_macro= 1;
+    this->job_geom[0].beats_per_macro   = 1;
     this->phase_planned     = false;
-    this->psin_beats_per_macro = 0;
-    this->job_psin_rows        = 0;
+    this->job_geom[0].psin_beats_per_macro = 0;
+    this->job_geom[0].psin_rows        = 0;
     this->state.set(DIMC_IDLE);
 
     this->trace.msg(vp::TraceLevel::WARNING,
@@ -168,8 +174,8 @@ void Dimc_HWPE::reset(bool active)
         this->job_running   = false;
         this->acquired_ctx  = -1;
         this->running_ctx   = -1;
-        this->next_ctx   = -1;
-        this->spare_ctx    = -1;
+        this->ctx_queue.clear();
+    std::memset(this->live_regs, 0, sizeof(this->live_regs));
         for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
             this->ctx_busy[ctx]   = false;
             this->ctx_job_id[ctx] = 0;
@@ -177,12 +183,14 @@ void Dimc_HWPE::reset(bool active)
         }
         this->outstanding_depth = 4;    // max in-flight TCDM beats per block
         this->fsm_timestamp     = 0;
-        this->kb_beats_per_row  = 1;
-        this->fb_beats_per_macro= 1;
-        this->beats_per_macro   = 1;
+        this->job_start_cycle   = 0;
+    this->job_start_cycle   = 0;
+        this->job_geom[0].kb_beats_per_row  = 1;
+        this->job_geom[0].fb_beats_per_macro= 1;
+        this->job_geom[0].beats_per_macro   = 1;
         this->phase_planned     = false;
-        this->psin_beats_per_macro = 0;
-        this->job_psin_rows        = 0;
+        this->job_geom[0].psin_beats_per_macro = 0;
+        this->job_geom[0].psin_rows        = 0;
         for (Dimc_InnerBlock &blk : this->inner_blocks) blk.reset_job_state();
         this->state.set(DIMC_IDLE);
 
@@ -212,6 +220,12 @@ int Dimc_HWPE::ctx_alloc()
 }
 
 // Read a job-dependent register out of the context the engine is executing.
+uint32_t Dimc_HWPE::job_reg_ctx(int ctx, uint32_t addr) const
+{
+    if (ctx < 0) ctx = 0;
+    return this->ctx_regs[ctx][(addr - DIMC_HWPE_JOB_BASE) >> 2];
+}
+
 uint32_t Dimc_HWPE::job_reg(uint32_t addr) const
 {
     int ctx = (this->running_ctx >= 0) ? this->running_ctx : 0;
@@ -221,10 +235,9 @@ uint32_t Dimc_HWPE::job_reg(uint32_t addr) const
 // Launch the committed-but-waiting context, if the engine is free.
 void Dimc_HWPE::start_next_job()
 {
-    if (this->job_running || this->next_ctx < 0) return;
-    this->running_ctx = this->next_ctx;
-    this->next_ctx = this->spare_ctx;   // a 2nd committed job moves up the queue
-    this->spare_ctx  = -1;
+    if (this->job_running || this->ctx_queue.empty()) return;
+    this->running_ctx = this->ctx_queue.front();
+    this->ctx_queue.pop_front();
     this->job_running = true;
     this->running_job = this->ctx_job_id[this->running_ctx];
     this->register_file[DIMC_HWPE_RUN_TASK >> 2] = this->running_job;
@@ -260,13 +273,15 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                 return vp::IO_REQ_INVALID;
             }
             if (address >= DIMC_HWPE_JOB_BASE) {
-                // Job-dependent write -> goes into the context SW acquired.
-                // Software that never reads ACQUIRE gets one allocated here, so
-                // a plain "configure then trigger" sequence also works.
-                if (_this->acquired_ctx < 0) _this->acquired_ctx = _this->ctx_alloc();
-                int ctx = (_this->acquired_ctx >= 0) ? _this->acquired_ctx : 0;
-                _this->ctx_busy[ctx] = true;
-                _this->ctx_regs[ctx][(address - DIMC_HWPE_JOB_BASE) >> 2] = data;
+                // Job-dependent write -> the live bundle. No queue slot is
+                // chosen here; a commit is what snapshots this into one.
+                // Straight into the live bundle. No slot is chosen here and
+                // none can be full: the queue only fills at COMMIT, and it is
+                // ACQUIRE that reports that. Writes that precede a commit
+                // simply update what the next commit will snapshot -- which is
+                // why a value written once (a length, a stride) still reaches
+                // every later job without being rewritten.
+                _this->live_regs[(address - DIMC_HWPE_JOB_BASE) >> 2] = data;
             } else {
                 // Mandatory / generic (job-independent) registers stay unbanked.
                 _this->register_file[(address >> 2)] = data;
@@ -286,11 +301,14 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                     if (ctx < 0) break;                        // all contexts busy: drop
                     _this->ctx_busy[ctx]   = true;
                     _this->ctx_job_id[ctx] = _this->next_job_id++;
+                    // The snapshot. i_job_fifo pushes the whole job_dep_regs
+                    // bundle, so a committed job carries a complete descriptor.
+                    std::memcpy(_this->ctx_regs[ctx], _this->live_regs,
+                                sizeof(_this->live_regs));
                     _this->acquired_ctx  = -1;               // SW must ACQUIRE again
                     // Queue it. A job already waiting keeps its place: the queue is
-                    // FIFO over the contexts, next_ctx points at the head.
-                    if (_this->next_ctx < 0) _this->next_ctx = ctx;
-                    else                        _this->spare_ctx  = ctx;
+                    // FIFO over the contexts; the head is what runs next.
+                    _this->ctx_queue.push_back(ctx);
                 }
 
                 // Modes 0 and 2 release the queue; mode 1 only commits.
@@ -313,13 +331,14 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                     }
                     _this->sel_dimc = 0;
                     _this->last_kb_src = 0xFFFFFFFF;   // resident weights invalidated
+                    for (Dimc_InnerBlock &b : _this->inner_blocks)
+                        for (Dimc_Macro &mc : b.macros) mc.last_kb_src = 0xFFFFFFFF;
                     // Aborts any in-flight job: release every context, otherwise
                     // ACQUIRE would report busy forever and acquire_block() hangs.
                     _this->job_running  = false;
                     _this->acquired_ctx = -1;
                     _this->running_ctx  = -1;
-                    _this->next_ctx  = -1;
-                    _this->spare_ctx   = -1;
+                    _this->ctx_queue.clear();
                     for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) _this->ctx_busy[ctx] = false;
                 }
                 if (scope != 0x1) {                 // scopes 0 and 2 clear the regfile
@@ -346,8 +365,14 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
         // or soft_clear releases it. Returns 0xFFFFFFFF only when all contexts
         // are busy, so with DIMC_NB_CONTEXT=2 a second job can be queued.
         if (address == DIMC_HWPE_ACQ) {
-            if (_this->acquired_ctx < 0) _this->acquired_ctx = _this->ctx_alloc();
-            if (_this->acquired_ctx < 0) {
+            // hwpe_ctrl_target.sv:194-195 defines two distinct codes, and the
+            // difference matters: -1 is "the queue is full, back off", -2 is
+            // "you already hold an uncommitted job". The model used to return
+            // the same id on a repeated ACQUIRE, which silently made the second
+            // read look like a fresh acquisition.
+            if (_this->acquired_ctx >= 0) {
+                *(uint32_t *)req->get_data() = 0xFFFFFFFEu;
+            } else if ((_this->acquired_ctx = _this->ctx_alloc()) < 0) {
                 *(uint32_t *)req->get_data() = 0xFFFFFFFFu;
             } else {
                 _this->ctx_busy[_this->acquired_ctx] = true;
@@ -368,12 +393,11 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
             return vp::IO_REQ_OK;
         }
         if (address >= DIMC_HWPE_JOB_BASE) {
-            // Job-dependent reads must come from the same bank the writes went to,
-            // otherwise a read-back of a just-written job register returns 0.
-            int ctx = (_this->acquired_ctx >= 0) ? _this->acquired_ctx
-                  : (_this->running_ctx  >= 0) ? _this->running_ctx : 0;
+            // The live bundle, the same place the writes go. The FIFO holds
+            // committed snapshots and is not addressable; reading a job
+            // register reads back what software last wrote, running job or not.
             *(uint32_t *)req->get_data() =
-                _this->ctx_regs[ctx][(address - DIMC_HWPE_JOB_BASE) >> 2];
+                _this->live_regs[(address - DIMC_HWPE_JOB_BASE) >> 2];
             return vp::IO_REQ_OK;
         }
         *(uint32_t *)req->get_data() = _this->register_file[(address >> 2)];

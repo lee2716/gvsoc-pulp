@@ -49,13 +49,13 @@
  *   0 (default) = automatically start the next queued job when one finishes
  *   1           = wait for an explicit trigger (commit_trigger 0x0 / 0x2)
  * It lives here because 0x08 exposes `finished`. Job-INDEPENDENT, so it is not
- * banked per context. */
+ * part of the bundle a commit snapshots. */
 #define DIMC_HWPE_AUTOTRIGGER_N      (DIMC_HWPE_BASE + 0x38)
 
 /* Output accumulator, one per inner block (rtl/accumulator.sv via cleopatra.sv).
  * Sums every result the block emits, across rows and across jobs.
- * Job-INDEPENDENT: ACC_CTRL must stay below JOB_BASE or it gets banked per
- * context and the accumulator turns per-job. */
+ * Job-INDEPENDENT: ACC_CTRL must stay below JOB_BASE, or a commit would
+ * snapshot it and the accumulator would turn per-job. */
 #define DIMC_HWPE_ACC_CTRL           (DIMC_HWPE_BASE + 0x3C)  /* b0=enable b1=clear */
 #define DIMC_HWPE_ACC_CTRL_EN_BIT    (1 << 0)
 #define DIMC_HWPE_ACC_CTRL_CLR_BIT   (1 << 1)
@@ -68,7 +68,7 @@
  * a context, writes this block into it, then commits. A second job can be
  * offloaded while the first one is still running.
  */
-#define DIMC_NB_CONTEXT              2
+#define DIMC_NB_CONTEXT              4
 #define DIMC_HWPE_JOB_BASE           (DIMC_HWPE_BASE + 0x40)
 #define DIMC_HWPE_NB_JOB_REGS        23   /* 0x40 .. 0x98 inclusive; 0x8C/0x90 are
                                           * intercepted as ACC_VAL and leave holes */

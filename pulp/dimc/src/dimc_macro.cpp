@@ -26,9 +26,9 @@ void Dimc_Macro::reset()
 {
     for (int r = 0; r < DIMC_MACRO_KB_LEN; r++)
         for (int c = 0; c < DIMC_MACRO_KB_EW; c++)
-            this->KB[r][c] = 0;
+            for (int b = 0; b < DIMC_MACRO_NB_BANKS; b++) this->KB[b][r][c] = 0;
     for (int c = 0; c < DIMC_MACRO_FB_EW; c++)
-        this->FB[c] = 0;
+        for (int b = 0; b < DIMC_MACRO_NB_BANKS; b++) this->FB[b][c] = 0;
 
     this->compe     = DIMC_COMPE_COMPUTE;
     this->ci        = DIMC_CI_8BIT;
@@ -37,7 +37,8 @@ void Dimc_Macro::reset()
     this->psin_scalar = 0;
     this->psin_rows   = 0;
     this->psout     = 0;
-    for (int r = 0; r < DIMC_MACRO_KB_LEN; r++) this->psin_buf[r] = 0;
+    for (int b = 0; b < DIMC_MACRO_NB_BANKS; b++)
+        for (int r = 0; r < DIMC_MACRO_KB_LEN; r++) this->psin_buf[b][r] = 0;
     this->sout      = 0;
 
     this->kb_ready = false;
@@ -82,7 +83,7 @@ DimcPipeEntry Dimc_Macro::drain()
 void Dimc_Macro::write_row(int row, const uint8_t *src)
 {
     if (row < 0 || row >= DIMC_MACRO_KB_LEN) return;
-    std::memcpy(this->KB[row], src, DIMC_MACRO_KB_EW);
+    std::memcpy(this->KB[this->kb_fill][row], src, DIMC_MACRO_KB_EW);
 }
 
 // The COMPE=0 memory-mode read-back path. No caller: the compute pipeline
@@ -90,19 +91,19 @@ void Dimc_Macro::write_row(int row, const uint8_t *src)
 void Dimc_Macro::read_row(int row, uint8_t *dst) const
 {
     if (row < 0 || row >= DIMC_MACRO_KB_LEN) return;
-    std::memcpy(dst, this->KB[row], DIMC_MACRO_KB_EW);
+    std::memcpy(dst, this->KB[this->kb_cur][row], DIMC_MACRO_KB_EW);
 }
 
 void Dimc_Macro::write_fb(const uint8_t *src)
 {
-    std::memcpy(this->FB, src, DIMC_MACRO_FB_EW);
+    std::memcpy(this->FB[this->fb_fill], src, DIMC_MACRO_FB_EW);
 }
 
 // One 32-bit partial sum, for the row the next compute trigger will select.
 void Dimc_Macro::write_psin_row(int row, const uint8_t *src)
 {
     if (row < 0 || row >= DIMC_MACRO_KB_LEN) return;
-    std::memcpy(&this->psin_buf[row], src, 4);
+    std::memcpy(&this->psin_buf[this->fb_fill][row], src, 4);
 }
 
 int32_t Dimc_Macro::compute_PP(int row_sel)
@@ -121,12 +122,12 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
         // so the product is +1 exactly when the two bits AGREE).
         // Alternative convention: AND is the literal unsigned {0,1} multiply.
         for (uint32_t i = 0; i < valid_bytes; i++) {
-            uint8_t x = ~((uint8_t)(this->KB[row_sel][i] ^ this->FB[i]));
+            uint8_t x = ~((uint8_t)(this->KB[this->kb_cur][row_sel][i] ^ this->FB[this->fb_cur][i]));
             for (int b = 0; b < 8; b++)
                 comp += (x >> b) & 1;
         }
         if (tail_bits) {
-            uint8_t x = ~((uint8_t)(this->KB[row_sel][valid_bytes] ^ this->FB[valid_bytes]));
+            uint8_t x = ~((uint8_t)(this->KB[this->kb_cur][row_sel][valid_bytes] ^ this->FB[this->fb_cur][valid_bytes]));
             for (uint32_t b = 0; b < tail_bits; b++)
                 comp += (x >> b) & 1;
         }
@@ -134,16 +135,16 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
     }
     case DIMC_CI_2BIT: {
         for (uint32_t i = 0; i < valid_bytes; i++) {
-            uint8_t k = this->KB[row_sel][i];
-            uint8_t f = this->FB[i];
+            uint8_t k = this->KB[this->kb_cur][row_sel][i];
+            uint8_t f = this->FB[this->fb_cur][i];
             for (int s = 0; s < 4; s++)
                 comp += ((k >> (s*2)) & 0x3) * ((f >> (s*2)) & 0x3);
         }
         // Partial trailing byte: the mask can end mid-byte, and only WHOLE
         // 2-bit elements inside it still count.
         if (tail_bits) {
-            uint8_t k = this->KB[row_sel][valid_bytes];
-            uint8_t f = this->FB[valid_bytes];
+            uint8_t k = this->KB[this->kb_cur][row_sel][valid_bytes];
+            uint8_t f = this->FB[this->fb_cur][valid_bytes];
             for (uint32_t s = 0; s < tail_bits / 2u; s++)
                 comp += ((k >> (s*2)) & 0x3) * ((f >> (s*2)) & 0x3);
         }
@@ -151,15 +152,15 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
     }
     case DIMC_CI_4BIT: {
         for (uint32_t i = 0; i < valid_bytes; i++) {
-            uint8_t k = this->KB[row_sel][i];
-            uint8_t f = this->FB[i];
+            uint8_t k = this->KB[this->kb_cur][row_sel][i];
+            uint8_t f = this->FB[this->fb_cur][i];
             comp += ( k        & 0xF) * ( f        & 0xF)
                   + ((k >> 4) & 0xF) * ((f >> 4) & 0xF);
         }
         // Partial trailing byte: only WHOLE 4-bit elements inside it count.
         if (tail_bits) {
-            uint8_t k = this->KB[row_sel][valid_bytes];
-            uint8_t f = this->FB[valid_bytes];
+            uint8_t k = this->KB[this->kb_cur][row_sel][valid_bytes];
+            uint8_t f = this->FB[this->fb_cur][valid_bytes];
             for (uint32_t n = 0; n < tail_bits / 4u; n++)
                 comp += ((k >> (n*4)) & 0xF) * ((f >> (n*4)) & 0xF);
         }
@@ -170,17 +171,17 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
         // No tail handling needed: a partial trailing byte can never hold a whole
         // 8-bit element, so it is dropped.
         for (uint32_t i = 0; i < valid_bytes; i++) {
-            int32_t k = (this->sign_8b & 0x1) ? (int32_t)(int8_t)this->KB[row_sel][i]
-                                              : (int32_t)(uint8_t)this->KB[row_sel][i];
-            int32_t f = (this->sign_8b & 0x2) ? (int32_t)(int8_t)this->FB[i]
-                                              : (int32_t)(uint8_t)this->FB[i];
+            int32_t k = (this->sign_8b & 0x1) ? (int32_t)(int8_t)this->KB[this->kb_cur][row_sel][i]
+                                              : (int32_t)(uint8_t)this->KB[this->kb_cur][row_sel][i];
+            int32_t f = (this->sign_8b & 0x2) ? (int32_t)(int8_t)this->FB[this->fb_cur][i]
+                                              : (int32_t)(uint8_t)this->FB[this->fb_cur][i];
             comp += k * f;
         }
         break;
     }
     }
 
-    comp += this->psin_rows ? this->psin_buf[row_sel] : this->psin_scalar;
+    comp += this->psin_rows ? this->psin_buf[this->fb_cur][row_sel] : this->psin_scalar;
 
     this->psout = comp;
     return comp;
