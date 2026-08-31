@@ -91,9 +91,18 @@ class DemocritosSoc(gvsoc.systree.Component):
             cluster[id].o_KILLER_OUTPUT(killer.i_INPUT())
 
         # L2 memory
+        # One L2 slice per tile, on a column at each side of the mesh. With a
+        # single column every tile on a row shares that column's network
+        # interface, and the sharing costs more than the extra hop does:
+        # measured 36,281 cycles for a tile one hop away against 31,672 for the
+        # same work with the port to itself, and only 38,874 for a tile two hops
+        # away. Two columns put every tile one hop from a slice of its own.
+        DEMOCRITOS_L2_SLICES = 2 * DemocritosArch.N_TILES_Y
         l2_mem:List[memory.Memory] = []
-        for id in range(0,DemocritosArch.N_TILES_Y):
-            l2_mem.append(memory.Memory(self, f'L2-mem-{id}', size=DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y,latency=1))
+        for id in range(0, DEMOCRITOS_L2_SLICES):
+            l2_mem.append(memory.Memory(self, f'L2-mem-{id}',
+                                        size=DemocritosArch.L2_SIZE // DEMOCRITOS_L2_SLICES,
+                                        latency=1))
 
         # Create Tile matrix for IDs
         # --------------> X direction
@@ -171,11 +180,11 @@ class DemocritosSoc(gvsoc.systree.Component):
                                         wide_width=32,
                                         ni_outstanding_reqs=8, #need to double check this with RTL
                                         router_input_queue_size=4, #matches magia_v2
-                                        dim_x=DemocritosArch.N_TILES_X+1, dim_y=DemocritosArch.N_TILES_Y)
+                                        dim_x=DemocritosArch.N_TILES_X+2, dim_y=DemocritosArch.N_TILES_Y)
             
 
             # Create noc routers
-            for x in range(0,DemocritosArch.N_TILES_X+1):
+            for x in range(0,DemocritosArch.N_TILES_X+2):
                 for y in range(0,DemocritosArch.N_TILES_Y):
                     print(f"[NoC] Adding router and NI at position x={x} y={y}")
                     noc.add_router(x, y)
@@ -223,12 +232,19 @@ class DemocritosSoc(gvsoc.systree.Component):
             #     L2       12        13       14       15
             #
 
-            id = 0   
-            for y in reversed(range(0,DemocritosArch.N_TILES_Y)):
-                print(f"[NoC] Adding L2 {id} at position x={0} y={y}")
-                noc.o_NARROW_MAP(l2_mem[id].i_INPUT(),name=f'l2-map-{id}',base=DemocritosArch.L2_ADDR_START + id*(DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y),size=DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y,x=0,y=y,rm_base=True)
-                noc.o_WIDE_MAP(l2_mem[id].i_INPUT(),name=f'l2-wide-map-{id}',base=DemocritosArch.L2_ADDR_START + id*(DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y),size=DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y,x=0,y=y,rm_base=True)
-                id=id+1
+            # Slice i covers [L2_ADDR_START + i*slice, +slice). Left column
+            # first (ids 0..N_TILES_Y-1, by descending y), then the right
+            # column, so slice id = (x_index * N_TILES_Y) + y_index and a tile
+            # can pick the slice it is adjacent to from its own id.
+            l2_slice = DemocritosArch.L2_SIZE // DEMOCRITOS_L2_SLICES
+            id = 0
+            for x_l2 in (0, DemocritosArch.N_TILES_X + 1):
+                for y in reversed(range(0,DemocritosArch.N_TILES_Y)):
+                    print(f"[NoC] Adding L2 {id} at position x={x_l2} y={y}")
+                    base = DemocritosArch.L2_ADDR_START + id*l2_slice
+                    noc.o_NARROW_MAP(l2_mem[id].i_INPUT(),name=f'l2-map-{id}',base=base,size=l2_slice,x=x_l2,y=y,rm_base=True)
+                    noc.o_WIDE_MAP(l2_mem[id].i_INPUT(),name=f'l2-wide-map-{id}',base=base,size=l2_slice,x=x_l2,y=y,rm_base=True)
+                    id=id+1
 
         else:
 
@@ -248,7 +264,7 @@ class DemocritosSoc(gvsoc.systree.Component):
             id = 0   
             for y in reversed(range(0,DemocritosArch.N_TILES_Y)):
                 print(f"[G-XBAR] Adding L2 {id} at position x={0} y={y}")
-                soc_xbar.o_MAP(l2_mem[id].i_INPUT(),name=f'l2-map-{id}',base=DemocritosArch.L2_ADDR_START + id*(DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y),size=DemocritosArch.L2_SIZE // DemocritosArch.N_TILES_Y,rm_base=True)
+                soc_xbar.o_MAP(l2_mem[id].i_INPUT(),name=f'l2-map-{id}',base=DemocritosArch.L2_ADDR_START + id*(DemocritosArch.L2_SIZE // DEMOCRITOS_L2_SLICES),size=DemocritosArch.L2_SIZE // DEMOCRITOS_L2_SLICES,rm_base=True)
                 id=id+1
 
         # Fractal tree routing
