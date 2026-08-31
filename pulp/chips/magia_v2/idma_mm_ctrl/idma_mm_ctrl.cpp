@@ -343,12 +343,20 @@ vp::IoReqStatus iDMA_mm_ctrl::req(vp::Block *__this, vp::IoReq *req)
                 _this->next_id_reg_dma1.set(dmstati_dma1.result - 1); //fixed next id to be coherent with RTL value
                 uint32_t next_id_r =  _this->next_id_reg_dma1.get();
                 memcpy((void *)data, (void *)&next_id_r, size);
-                if (_this->fsm_state_dma1.get()!=IDLE) {
-                    _this->trace.fatal("[Magia iDMA Ctrl] IDMA1 Received read IDMA_NEXT_ID_OFFSET for IDMA - DIR: 0 when not in IDLE state\n");
-                }
-                else {
+                // Not an error in the RTL. idma_reg.sv.tpl:92 drives the
+                // register interface's ready from the DMA's arb_ready, so a
+                // NEXT_ID read while a transfer is outstanding backpressures
+                // the read until the transfer FIFO has room -- flow control,
+                // not an illegal state. The backend already models that FIFO
+                // (SnitchDma transfer_queue_size), so the descriptor is handed
+                // over and the poll below covers whatever is outstanding.
+                // Compatible by construction: this path used to abort the
+                // simulation, so nothing that works today can reach it.
+                const bool was_idle = (_this->fsm_state_dma1.get() == IDLE);
+                {
                     _this->trace.msg("[Magia iDMA Ctrl] IDMA1 Reading IDMA_NEXT_ID_OFFSET=0x%08x\n",next_id_r);
-                    _this->dma1_transfer_time_start=_this->clock.get_cycles();
+                    if (was_idle)
+                        _this->dma1_transfer_time_start=_this->clock.get_cycles();
                     IssOffloadInsn<uint32_t> dmsrc; 
                     IssOffloadInsn<uint32_t> dmdst;
                     IssOffloadInsn<uint32_t> dmrep;
@@ -385,7 +393,8 @@ vp::IoReqStatus iDMA_mm_ctrl::req(vp::Block *__this, vp::IoReq *req)
                     _this->offload_itf_idma1.sync(&dmcpyi);
                     //trigger internal fsm
                     _this->fsm_state_dma1.set(POLL_STS_REG);
-                    _this->event_enqueue(_this->fsm_event_dma1, 1); //trigger fsm
+                    // Only if it was idle: otherwise the poll is already running.
+                    if (was_idle) _this->event_enqueue(_this->fsm_event_dma1, 1);
                 }
             }
         }
@@ -556,12 +565,20 @@ vp::IoReqStatus iDMA_mm_ctrl::req(vp::Block *__this, vp::IoReq *req)
                 _this->next_id_reg_dma0.set(dmstati_dma0.result - 1); //fixed next id to be coherent with RTL value
                 uint32_t next_id_r =  _this->next_id_reg_dma0.get();
                 memcpy((void *)data, (void *)&next_id_r, size);
-                if (_this->fsm_state_dma0.get()!=IDLE) {
-                    _this->trace.fatal("[Magia iDMA Ctrl] IDMA0 Received read IDMA_NEXT_ID_OFFSET for IDMA - DIR: 0 when not in IDLE state\n");
-                }
-                else {
+                // Not an error in the RTL. idma_reg.sv.tpl:92 drives the
+                // register interface's ready from the DMA's arb_ready, so a
+                // NEXT_ID read while a transfer is outstanding backpressures
+                // the read until the transfer FIFO has room -- flow control,
+                // not an illegal state. The backend already models that FIFO
+                // (SnitchDma transfer_queue_size), so the descriptor is handed
+                // over and the poll below covers whatever is outstanding.
+                // Compatible by construction: this path used to abort the
+                // simulation, so nothing that works today can reach it.
+                const bool was_idle = (_this->fsm_state_dma0.get() == IDLE);
+                {
                     _this->trace.msg("[Magia iDMA Ctrl] IDMA0 Reading IDMA_NEXT_ID_OFFSET=0x%08x\n",next_id_r);
-                    _this->dma0_transfer_time_start=_this->clock.get_cycles();
+                    if (was_idle)
+                        _this->dma0_transfer_time_start=_this->clock.get_cycles();
                     IssOffloadInsn<uint32_t> dmsrc; 
                     IssOffloadInsn<uint32_t> dmdst;
                     IssOffloadInsn<uint32_t> dmrep;
@@ -598,7 +615,8 @@ vp::IoReqStatus iDMA_mm_ctrl::req(vp::Block *__this, vp::IoReq *req)
                     _this->offload_itf_idma0.sync(&dmcpyi);
                     //trigger internal fsm
                     _this->fsm_state_dma0.set(POLL_STS_REG);
-                    _this->event_enqueue(_this->fsm_event_dma0, 1); //trigger fsm
+                    // Only if it was idle: otherwise the poll is already running.
+                    if (was_idle) _this->event_enqueue(_this->fsm_event_dma0, 1);
                 }
             }
         }

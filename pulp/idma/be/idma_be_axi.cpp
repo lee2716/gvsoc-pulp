@@ -51,6 +51,7 @@ IDmaBeAxi::IDmaBeAxi(vp::Component *idma, std::string itf_name, IdmaBeProducer *
     // Use it to size the array of bursts and associated timestamps
     this->bursts.resize(burst_queue_size);
     this->read_timestamps.resize(burst_queue_size);
+    this->read_done.assign(burst_queue_size, false);
 
     for (int i=0; i<burst_queue_size; i++)
     {
@@ -88,6 +89,7 @@ void IDmaBeAxi::reset(bool active)
         {
             this->free_bursts.pop();
         }
+        this->read_done.assign(this->read_done.size(), false);
         while(this->read_waiting_bursts.size() > 0)
         {
             this->read_waiting_bursts.pop();
@@ -193,6 +195,10 @@ void IDmaBeAxi::send_read_burst_to_axi()
     // Reinit timings
     req->prepare();
 
+    // Queue it here, at ISSUE time, so read_waiting_bursts carries issue order.
+    this->read_done[req->id] = false;
+    this->read_waiting_bursts.push(req);
+
     // Send to AXI interface
     vp::IoReqStatus status = this->ico_itf.req(req);
 
@@ -221,8 +227,10 @@ void IDmaBeAxi::read_handle_req_end(vp::IoReq *req)
     // Remember at which timestamp the burst must be notified
     this->trace.msg(vp::Trace::LEVEL_TRACE, "Handling end of read request (req: %p, latency %d)\n", req, req->get_latency());
     this->read_timestamps[req->id] = this->clock.get_cycles() + req->get_latency();
-    // Queue the requests, they will be notified in order.
-    this->read_waiting_bursts.push(req);
+    // Mark it answered. read_waiting_bursts keeps ISSUE order (it was pushed
+    // when the burst went out), so the FSM can release the oldest one as soon
+    // as its own answer is in, whatever order the answers arrive in.
+    this->read_done[req->id] = true;
     // Enqueue fsm event at desired timestamp in case the event is not already enqueued before
     this->fsm_event.enqueue(std::max(req->get_latency(), (uint64_t)1));
 }
@@ -388,12 +396,15 @@ void IDmaBeAxi::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
     {
         vp::IoReq *req = _this->read_waiting_bursts.front();
 
-        // Push the data only once the timestamp has expired to take into account the latency
-        // returned when the data was read
-        if (_this->read_timestamps[req->id] <= _this->clock.get_cycles())
+        // Release the OLDEST issued burst, and only once its own answer is in.
+        // Waiting on the head keeps the middle-end seeing bursts in issue order
+        // even when the interconnect answers out of order.
+        if (_this->read_done[req->id] &&
+            _this->read_timestamps[req->id] <= _this->clock.get_cycles())
         {
             // Move the burst to a different queue so that we can free the request when it is
             // acknowledge
+            _this->read_done[req->id] = false;
             _this->read_waiting_bursts.pop();
             _this->read_bursts_waiting_ack.push(req);
 
@@ -403,11 +414,12 @@ void IDmaBeAxi::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
             // Trigger again the FSM since we may continue with another transfer
             _this->fsm_event.enqueue();
         }
-        else
+        else if (_this->read_done[req->id])
         {
-            // Otherwise check again when timetamp is reached
+            // Answered, but its latency has not elapsed: come back then.
             _this->fsm_event.enqueue(_this->read_timestamps[req->id] - _this->clock.get_cycles());
         }
+        // Not answered yet: the response callback will wake the FSM.
     }
 }
 

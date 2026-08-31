@@ -148,26 +148,46 @@ class Dimc_InnerBlock {
         std::vector<Dimc_HWPE_Streamer> psin_stream;   // per-row psums, when PSIN_EN
         std::vector<Dimc_Macro> macros;
 
-        // Cycle-accurate cursor. ONE linear beat index is the only position
-        // state; (macro, row, offset) are decoded from it on demand, so they
-        // cannot drift apart across cycles.
-        std::queue<uint64_t> pending_req_queue;  // cycle at which each beat returns
-        uint32_t beat_index;                     // linear position in the phase
-        uint32_t beat_total;                     // beats this phase must issue
-        // The prefetch runs concurrently with the current job's STORING, and
-        // STORING's completion test is beat_index >= beat_total. A prefetch
-        // sharing those would push the store past its own finish line and the
-        // remaining output beats would never issue. It gets its own cursor.
-        int64_t  prefetch_data_ready_cycle = 0;        // ditto: STORING's drain test reads
-                                                 // data_ready_cycle, so the prefetch
-                                                 // must not write it
-        // The store gets its own cursor too. beat_index belongs to the fill,
-        // and store beats now issue while the fill's phase is still current.
-        uint32_t store_beat_index = 0;
-        uint32_t store_beat_total = 0;
-        uint32_t prefetch_beat_index = 0;
-        uint32_t prefetch_beat_total = 0;
+        // One cursor per streaming activity. Fill, store and prefetch all run
+        // concurrently with at least one other, and every field in here was at
+        // some point shared between two of them -- each time producing a silent
+        // data bug (a store that finished early and dropped output beats, a
+        // prefetch that stalled forever, a running job handed another context's
+        // geometry) rather than an error. Owning a whole cursor is the
+        // structural fix; sharing one is now visible in the type.
+        //
+        // ONE linear beat index is the only position state; (macro, row,
+        // offset) are decoded from it on demand, so they cannot drift apart.
+        struct Cursor {
+            uint32_t beat_index = 0;    // linear position, whole block
+            uint32_t beat_total = 0;
+            std::vector<uint32_t> macro_beat_index;   // per macro
+            std::vector<uint32_t> macro_beat_total;
+            // When the outer port lets this activity's first beat go.
+            int64_t  data_ready_cycle = 0;
+            bool     requested = false;               // outer port already asked
+
+            void reset(uint32_t nb_macros)
+            {
+                this->beat_index = 0;
+                this->beat_total = 0;
+                this->data_ready_cycle = 0;
+                this->requested = false;
+                this->macro_beat_index.assign(nb_macros, 0);
+                this->macro_beat_total.assign(nb_macros, 0);
+            }
+        };
+        Cursor fill;        // the running job's own operands
+        Cursor store;       // its results
+        Cursor prefetch;    // the queued job's operands, staged while this one runs
+
+        // Outstanding L1 requests. This one IS shared on purpose: it is a
+        // property of the inner port, not of the activity using it, so fill and
+        // store contend for the same budget. The prefetch keeps its own because
+        // it must not be able to stall the running job.
+        std::queue<uint64_t> port_pending;
         std::queue<uint64_t> prefetch_pending;
+
         uint32_t rows_issued;                    // compute: rows pushed into pipes
 
         // Per-phase completion, so the phase ends only when EVERY block is done.
@@ -201,15 +221,13 @@ class Dimc_InnerBlock {
         // cannot drift apart.
         void reset_job_state()
         {
-            this->beat_index = 0;
-            this->beat_total = 0;
+            this->fill.reset(this->macros.size());
+            this->store.reset(this->macros.size());
             this->rows_issued = 0;
             this->phase_done = false;
-            this->fill_requested = false;
-            this->data_ready_cycle = 0;
             this->out_beat_lat_est = 0;
             this->load_done.clear();
-            while (!this->pending_req_queue.empty()) this->pending_req_queue.pop();
+            while (!this->port_pending.empty()) this->port_pending.pop();
         }
 };
 
@@ -376,9 +394,11 @@ class Dimc_HWPE : public vp::Component {
 
         // Common tail of a preload or store beat: charge the access latency,
         // advance the cursor, publish it.
-        void beat_issued(Dimc_InnerBlock &blk, int lat, bool prefetch);
+        void beat_issued(Dimc_InnerBlock &blk, Dimc_InnerBlock::Cursor &cursor,
+                         int lat, bool prefetch);
 
-        void preload_block(Dimc_InnerBlock &blk, uint32_t blk_id, bool prefetch);
+        void preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
+                           Dimc_InnerBlock::Cursor &cursor, bool prefetch);
         bool compute_block(Dimc_InnerBlock &blk);
         void background_fill();
         void plan_fill(int ctx);
