@@ -127,7 +127,26 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         # DIMC HWPE. One outer block = 2 inner blocks x 2 macros = 4 macros.
         # The macros of a block share one inner port and double-buffer against
         # each other; the rest of the architecture is fixed in Dimc().
-        dimc = Dimc(self, 'dimc', macros_per_block=2)
+        dimc = Dimc(self, 'dimc',
+                    macros_per_block  = 2,    # macros sharing one inner port
+                    nb_inner_blocks   = 2,    # 2 blocks x 2 macros = 4 macros
+                    # Both port widths set every STARTING and STORING beat
+                    # count, so the measured phase lengths rest on them.
+                    inner_port_bytes  = 32,   # inner (L1) port, 256 bit/cycle
+                    outer_port_bytes  = 64,   # outer (L2) port, 512 bit/cycle;
+                                              # confirmed with the IP owners and
+                                              # backed by an earlier measurement
+                    # Both blocks arbitrate for one outer port. Since
+                    # cut-through lets them stream together at 32 B/cycle each,
+                    # the shared 64 B/cycle port is exactly saturated and
+                    # splitting it in two measured no different.
+                    outer_port_shared = 1,
+                    cross_job_prefetch = 1,   # fill the queued job while this one computes
+                    # A block starts streaming into its macros as soon as the
+                    # outer port has bandwidth for the beat, rather than waiting
+                    # for its whole working set. Set to 0 for the
+                    # store-and-forward arm.
+                    outer_cut_through = 1)
         self.dimc = dimc
 
         # Event unit (mirrors pulp/chips/magia_v2/tile.py). The address window is
