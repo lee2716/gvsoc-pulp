@@ -63,6 +63,8 @@ class Dimc_HWPE_Streamer {
         // which its response is due. The caller keeps the timestamp in a pending
         // queue instead of blocking, so several beats can be in flight at once.
         int issue_beat(int width, void* buf);
+        // Address of the next beat, linear or strided; see the .cpp.
+        uint32_t walk_addr() const;
 
     private:
         Dimc_HWPE*  dimc;
