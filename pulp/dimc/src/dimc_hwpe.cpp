@@ -37,15 +37,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     // Architecture, from the systree. Dimc() in dimc.py writes every property.
     this->num_macros        = (uint32_t)this->get_js_config()->get_child_int("num_macros");
     this->inner_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("inner_port_bytes");
-    this->port_sync_cycles  = (uint32_t)this->get_js_config()->get_child_int("port_sync_cycles");
-    this->tcdm_burst_latency = (uint32_t)this->get_js_config()->get_child_int("tcdm_burst_latency");
     this->nb_inner_blocks   = (uint32_t)this->get_js_config()->get_child_int("nb_inner_blocks");
-    this->outer_port_shared = (uint32_t)this->get_js_config()->get_child_int("outer_port_shared");
-    this->outer_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("outer_port_bytes");
-    this->l2_burst_latency  = (uint32_t)this->get_js_config()->get_child_int("l2_burst_latency");
-
-    this->cross_job_prefetch = (bool)this->get_js_config()->get_child_int("cross_job_prefetch");
-    this->outer_cut_through  = (bool)this->get_js_config()->get_child_int("outer_cut_through");
     this->last_kb_src     = 0xFFFFFFFF;   // no resident weights yet
     // HWPE slave port
     this->hwpe_slv.set_req_meth(&Dimc_HWPE::hwpe_slave);
@@ -71,30 +63,15 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
         blk.reset_job_state();
     }
 
-    // ---- Outer ports ----
-    // One inner block reaches memory directly, so no port is created and the
-    // engine matches the single-block model bit for bit. With more blocks,
-    // outer_port_shared picks the topology: one shared port or one each.
-    if (this->nb_inner_blocks > 1) {
-        uint32_t nb_ports = this->outer_port_shared ? 1 : this->nb_inner_blocks;
-        this->outer_ports.resize(nb_ports);
-        for (Dimc_OuterPort &p : this->outer_ports)
-            p.configure(this->outer_port_bytes, this->l2_burst_latency);
-    }
-
-    // Per-block and per-port events. Registered after the vectors are sized --
+    // Per-block events. Registered after the vectors are sized --
     // registering earlier silently loops zero times. The "/" makes gvsoc nest
     // them, so they appear as dimc.block_0.beat_index and the like.
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         std::string pfx = "block_" + std::to_string(b) + "/";
         this->traces.new_trace_event(pfx + "beat_index",  &this->inner_blocks[b].beat_event,  32);
         this->traces.new_trace_event(pfx + "rows_issued", &this->inner_blocks[b].rows_event,  32);
-        this->traces.new_trace_event(pfx + "data_ready",  &this->inner_blocks[b].ready_event, 32);
-        this->traces.new_trace_event(pfx + "drain_ready", &this->inner_blocks[b].drain_event, 32);
-    }
-    for (uint32_t i = 0; i < this->outer_ports.size(); i++) {
-        this->traces.new_trace_event("outer_port_" + std::to_string(i) + "/next_free",
-                                     &this->outer_ports[i].free_event, 32);
+        this->traces.new_trace_event(pfx + "load_active",  &this->inner_blocks[b].load_active_event, 1);
+        this->traces.new_trace_event(pfx + "comp_active",  &this->inner_blocks[b].comp_active_event, 1);
     }
 
     // Event handlers
@@ -129,13 +106,9 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->state.set(DIMC_IDLE);
 
     this->trace.msg(vp::TraceLevel::WARNING,
-        "DIMC systree config: num_macros=%u l1bw=%u sync=%u tcdm_lat=%u "
-        "nb_blocks=%u blocks=%u ports=%u outer_bw=%u l2_lat=%u\n",
-        this->num_macros,
-        this->inner_port_bytes, this->port_sync_cycles, this->tcdm_burst_latency,
-        this->nb_inner_blocks, (uint32_t)this->inner_blocks.size(),
-        (uint32_t)this->outer_ports.size(), this->outer_port_bytes,
-        this->l2_burst_latency);
+        "DIMC systree config: num_macros=%u l1bw=%u nb_blocks=%u blocks=%u\n",
+        this->num_macros, this->inner_port_bytes,
+        this->nb_inner_blocks, (uint32_t)this->inner_blocks.size());
 }
 
 void Dimc_HWPE::reset(bool active)
@@ -146,15 +119,15 @@ void Dimc_HWPE::reset(bool active)
         // trace_file is only valid once the trace engine has started, so this
         // check cannot live in the constructor.
         if (this->num_macros == 0 || this->inner_port_bytes == 0 ||
-            this->nb_inner_blocks == 0 || this->outer_port_bytes == 0) {
+            this->nb_inner_blocks == 0) {
             // trace.fatal writes to stdout and ends in abort(), which does not
             // flush stdio, so its message is lost whenever stdout is a pipe.
             // stderr is unbuffered and always reaches the user.
             fprintf(stderr,
                     "DIMC systree incomplete: num_macros=%u inner_port_bytes=%u "
-                    "nb_inner_blocks=%u outer_port_bytes=%u (all must be non-zero)\n",
+                    "nb_inner_blocks=%u (all must be non-zero)\n",
                     this->num_macros, this->inner_port_bytes,
-                    this->nb_inner_blocks, this->outer_port_bytes);
+                    this->nb_inner_blocks);
             this->trace.fatal("DIMC systree incomplete\n");
         }
         for (uint32_t i = 0; i < N_CFG_REGS; i++) {
@@ -165,7 +138,6 @@ void Dimc_HWPE::reset(bool active)
             blk.out_accum.clear();
             blk.out_accum.enable = 0;
         }
-        for (Dimc_OuterPort &p : this->outer_ports) p.reset();
         this->sel_dimc = 0;
         this->last_kb_src = 0xFFFFFFFF;
         this->running_job   = 0;
@@ -203,11 +175,7 @@ void Dimc_HWPE::reset(bool active)
         for (Dimc_InnerBlock &blk : this->inner_blocks) {
             blk.beat_event.event((uint8_t *)&zero32);
             blk.rows_event.event((uint8_t *)&zero32);
-            blk.ready_event.event((uint8_t *)&zero32);
-            blk.drain_event.event((uint8_t *)&zero32);
         }
-        for (Dimc_OuterPort &p : this->outer_ports)
-            p.free_event.event((uint8_t *)&zero32);
     }
 }
 

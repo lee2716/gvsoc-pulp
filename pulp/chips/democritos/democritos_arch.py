@@ -89,8 +89,17 @@ class DemocritosArch:
     SPATZ_NB_LANES      = 4
     SPATZ_LANE_WIDTH    = 4
     SPATZ_NB_VLSU_PORTS = 4
-    N_TILES_X           = 2 # 16
-    N_TILES_Y           = 2 # 16
+    # Mesh size. DEMOCRITOS_N_TILES_X / _Y override them, the way
+    # DEMOCRITOS_TILE_TYPES overrides the tile types below, so a test picks its
+    # mesh without editing the platform. The C side takes the same two numbers
+    # from democritos_archi.h; feed both from one place or they will drift.
+    #
+    # Only square meshes work: democritos_soc.py's FractalSync tree takes the
+    # root through a branch that needs a full level below it, and a 4x2 leaves
+    # that level empty (KeyError on fsync_center_v). 2x2 and 4x4 are the
+    # verified sizes.
+    N_TILES_X           = int(os.environ.get('DEMOCRITOS_N_TILES_X', 2))
+    N_TILES_Y           = int(os.environ.get('DEMOCRITOS_N_TILES_Y', 2))
     NB_CLUSTERS         = N_TILES_X*N_TILES_Y # to be removed when we'll use the DemocritosTree properties instead of hardcoding the number of clusters in the components
     # Which accelerator each mesh position carries, one character per position
     # indexed by tile id: 'd' DIMC tile, 'a' A-tile, 'v' D-tile plus a
@@ -120,6 +129,15 @@ class DemocritosDSE:
     TILE_AXI_XBAR_SYNC          = False
     TILE_OBI_XBAR_LATENCY       = 2
     TILE_OBI_XBAR_SYNC          = True
+    # AXI transactions the iDMA keeps in flight. A transfer's duration is
+    # inversely proportional to this up to 8 and rises again at 16, so 8 is the
+    # setting that runs fastest here. The RTL parameter it stands for is
+    # iDMA_NumAxInFlight = 16 (magia_tile_pkg.sv:353).
+    # Transfers the front end can queue to the mid end. RTL:
+    # iDMA_JobFifoDepth = 16 (magia_tile_pkg.sv:365), the depth of the
+    # stream_fifo between front and mid end (idma_axi_obi_transfer_ch.sv:158).
+    TILE_IDMA0_JOBFIFO_SIZE     = 16
+    TILE_IDMA1_JOBFIFO_SIZE     = 16
     TILE_IDMA0_BQUEUE_SIZE      = 8
     TILE_IDMA0_B_SIZE           = 32
     TILE_IDMA1_BQUEUE_SIZE      = 8

@@ -26,9 +26,10 @@
 #define DIMC_MACRO_FB_EW    128
 // Pipeline depth: 4 cycles per spatz_DIMC.sv (1 result/cycle throughput after fill)
 #define DIMC_MACRO_LATENCY  4
-// Kernel, feature and partial-sum storage is double banked: one bank feeds the
-// running job while the other takes the next one's operands.
-#define DIMC_MACRO_NB_BANKS 2
+// Kernel, feature and partial-sum storage is single-banked, as in the macro:
+// spatz_DIMC.sv declares one kernel_mem [31:0] and one feature_buf, and the two
+// low bits of RA/WA/FA select one of a row's four 256-bit sections rather than a
+// bank. A job's fill therefore cannot overlap the previous job's compute.
 
 struct DimcPipeEntry {
     int32_t  psout;
@@ -87,18 +88,11 @@ class Dimc_Macro {
         // what compute_PP uses while psin_rows is off.
         int32_t  psin_scalar = 0;
         uint8_t  psin_rows   = 0;                        // 1 = take psin from psin_buf
-        // Two banks of everything a compute trigger reads, so the next job's
-        // data can land while this one still runs. The kernel and the feature
-        // side need their own pair of pointers: on a reuse job the kernel is
-        // not reloaded and has to stay where it is, while the features and the
-        // partial sums change every job.
-        uint8_t  kb_cur = 0, kb_fill = 0;
-        uint8_t  fb_cur = 0, fb_fill = 0;
-        int32_t  psin_buf[DIMC_MACRO_NB_BANKS][DIMC_MACRO_KB_LEN] = {{0}};
+        int32_t  psin_buf[DIMC_MACRO_KB_LEN] = {0};
 
         // Buffers
-        uint8_t  KB[DIMC_MACRO_NB_BANKS][DIMC_MACRO_KB_LEN][DIMC_MACRO_KB_EW];
-        uint8_t  FB[DIMC_MACRO_NB_BANKS][DIMC_MACRO_FB_EW];
+        uint8_t  KB[DIMC_MACRO_KB_LEN][DIMC_MACRO_KB_EW];
+        uint8_t  FB[DIMC_MACRO_FB_EW];
 
         // Outputs
         int32_t  psout = 0;
@@ -110,15 +104,13 @@ class Dimc_Macro {
         // overwritten by whichever macro filled most recently -- every reuse
         // would then miss and reload weights that were already resident.
 
-        // "the operands for the job I am executing are in cur". A flag of its
-        // own, not a comparison on the fill's beat counters: those live in the
-        // fill cursor and a prefetch resets its own copy under this macro at
-        // any time.
+        // "the operands for the job I am executing have landed". A flag of its
+        // own rather than a comparison on the fill cursor's beat counters,
+        // which belong to the block and are reset per phase.
         bool     exec_ready = false;
         // Job-relative timestamps, instrumentation only.
         uint32_t trace_fill_start = 0, trace_fill_done = 0;
         uint32_t trace_compute_start = 0, trace_compute_end   = 0;
-        uint32_t job_slot   = 0;
         uint32_t last_kb_src = 0xFFFFFFFFu;
         bool     skip_kb    = false;
         // Cycle its last preload beat lands. A macro may not compute before it:

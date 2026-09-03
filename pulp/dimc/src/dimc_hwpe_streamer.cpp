@@ -119,7 +119,7 @@ int Dimc_HWPE_Streamer::issue_beat(int width, void* buf) {
         return 1;
     }
     if (width <= 0) {
-        return (int) this->dimc->port_sync_cycles;
+        return 0;
     }
 
     // One beat carries at most a port word. Bank-granularity over-fetch is not
@@ -151,5 +151,5 @@ int Dimc_HWPE_Streamer::issue_beat(int width, void* buf) {
     this->pos += (uint32_t)beat;
     this->tot_iters++;
 
-    return (int)latency + (int)this->dimc->port_sync_cycles;
+    return (int)latency;
 }

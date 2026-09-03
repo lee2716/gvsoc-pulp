@@ -138,45 +138,21 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     _this->phase_planned = false;
     _this->exec_slot = (uint32_t)(_this->running_ctx >= 0 ? _this->running_ctx : 0);
 
-    // If the queued context that just became the running one was prefetched,
-    // its operands are already in the spare banks: flip them in and skip the
-    // load entirely. This is the whole point of the second context.
-    _this->job_prefetched = (_this->prefetch_ctx == _this->running_ctx
-                             && _this->prefetch_ready);
-    if (_this->job_prefetched) {
-        JobGeom &pg = _this->job_geom[_this->exec_slot];
-        for (Dimc_InnerBlock &blk : _this->inner_blocks)
-            for (uint32_t m = 0; m < pg.num_active; m++) {
-                Dimc_Macro &mc = blk.macros[m];
-                mc.exec_ready  = true;
-                mc.last_kb_src = pg.kb_src;   // the prefetched fill landed
-                mc.kb_ready = true;
-                mc.fb_ready = true;
-                mc.pipe.clear();
-                mc.psin_scalar = (int32_t)_this->job_reg_ctx((int)_this->exec_slot,
-                                                             DIMC_HWPE_PSIN);
-                mc.fb_cur  = mc.fb_fill;
-                mc.fb_fill = (uint8_t)(mc.fb_fill ^ 1u);
-                if (!pg.skip_kb) {
-                    mc.kb_cur  = mc.kb_fill;
-                    mc.kb_fill = (uint8_t)(mc.kb_fill ^ 1u);
-                }
-            }
-    }
-    _this->prefetch_ctx   = -1;
-    _this->prefetch_ready = false;
-
-    if (!_this->job_prefetched)
-        for (Dimc_InnerBlock &blk : _this->inner_blocks)
-            for (uint32_t m = 0; m < _this->num_macros; m++)
-                blk.macros[m].exec_ready = false;
+    for (Dimc_InnerBlock &blk : _this->inner_blocks)
+        for (uint32_t m = 0; m < _this->num_macros; m++) {
+            blk.macros[m].exec_ready     = false;
+            // Cleared here, not left over from the previous job: they gate
+            // compute, and this job's feature vector has not landed yet.
+            blk.macros[m].kb_ready       = false;
+            blk.macros[m].fb_ready       = false;
+        }
 
     for (Dimc_InnerBlock &blk : _this->inner_blocks) blk.reset_job_state();
-    if (_this->job_prefetched)
-        for (Dimc_InnerBlock &blk : _this->inner_blocks)
-            for (uint32_t m = 0; m < _this->num_macros; m++)
-                blk.fill.macro_beat_total[m] = 0;   // nothing left to load
 
+    _this->phase_entry_ts  = _this->fsm_timestamp;
+    _this->job_entry_cycle = (uint64_t)_this->clock.get_cycles();
+    if (_this->jobs_measured != 0)
+        _this->acc_gap_cycles += _this->job_entry_cycle - _this->last_job_end;
     _this->state.set(DIMC_STARTING);
 
     uint8_t one = 1, st = DIMC_STARTING;
@@ -241,8 +217,7 @@ void Dimc_HWPE::fsm_loop()
 }
 
 // Size one job's fill: geometry into its slot, per-macro beat budgets, and the
-// outer-port reservation. Shared by the running job's own load and by the
-// prefetch of the queued one.
+// outer-port reservation.
 void Dimc_HWPE::latch_geom(int ctx)
 {
     JobGeom &g = this->job_geom[ctx];
@@ -251,8 +226,8 @@ void Dimc_HWPE::latch_geom(int ctx)
     uint32_t r = this->job_reg_ctx(ctx, DIMC_HWPE_ROW_COUNT);
     if (r == 0) {
         this->trace.force_warning("latch_geom: ctx %d has ROW_COUNT=0 "
-            "(never configured); running_ctx=%d prefetch_ctx=%d qlen=%u\n",
-            ctx, this->running_ctx, this->prefetch_ctx,
+            "(never configured); running_ctx=%d qlen=%u\n",
+            ctx, this->running_ctx,
             (unsigned)this->ctx_queue.size());
         r = 1;
     }
@@ -275,15 +250,14 @@ void Dimc_HWPE::latch_geom(int ctx)
         }
     g.skip_kb = all_skip;
     g.kb_src  = kb_src;
-    // last_kb_src is NOT stamped here. A prefetch that is planned and then
-    // abandoned -- the running job ends before its beats are done -- would
-    // otherwise leave the stamp behind, and the real fill that replaces it
-    // would see skip_kb and skip a weight load that never happened.
+    // last_kb_src is NOT stamped here: it records that a weight load actually
+    // landed, and stamping it at planning time would let a fill that never ran
+    // be mistaken for one that did.
 }
 
 void Dimc_HWPE::plan_fill(int ctx)
 {
-    const bool prefetch = (this->prefetch_ctx == ctx);
+
     const uint32_t port_bytes = this->inner_port_bytes;
     JobGeom &g = this->job_geom[ctx];
     uint32_t num_active = g.num_active, row_count = g.row_count;
@@ -298,12 +272,9 @@ void Dimc_HWPE::plan_fill(int ctx)
 
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         Dimc_InnerBlock &blk = this->inner_blocks[b];
-        // A prefetch plans into its own cursor; the block-level one belongs to
-        // the phase the running job is in and must not be touched.
-        Dimc_InnerBlock::Cursor &cur = prefetch ? blk.prefetch : blk.fill;
+        Dimc_InnerBlock::Cursor &cur = blk.fill;
         cur.reset((uint32_t)blk.macros.size());
         cur.beat_total = num_active * g.beats_per_macro;
-        if (prefetch) while (!blk.prefetch_pending.empty()) blk.prefetch_pending.pop();
         for (uint32_t m = 0; m < num_active; m++) {
             cur.macro_beat_total[m] = g.beats_per_macro;
             blk.macros[m].fill_done_cycle = 0;
@@ -319,95 +290,8 @@ static inline size_t retire_due(std::queue<uint64_t> &q, uint64_t now)
     return q.size();
 }
 
-// Point the three input streamers at a context's own operands. The job-start
-// path configures every streamer from the RUNNING context; a prefetch fills a
-// different context, so without this it would stream the running job's features
-// and partial sums into the next job's banks -- the prefetched job then
-// accumulated the previous job's psums and came out wrong.
-// out_stream is deliberately left alone: the running job still needs it to
-// store, and the job-start path sets it for the new job anyway.
-void Dimc_HWPE::configure_fill_streams(int ctx)
-{
-    JobGeom &g = this->job_geom[ctx];
-    const uint32_t kb_one  = g.row_count * DIMC_MACRO_KB_EW;
-    const uint32_t fb_one  = DIMC_MACRO_FB_EW;
-    const uint32_t out_one = g.row_count * 4;
-
-    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
-        Dimc_InnerBlock &blk = this->inner_blocks[b];
-        for (uint32_t m = 0; m < g.num_active; m++) {
-            const uint32_t slot = b * g.num_active + m;
-            blk.weight_stream[m].configure(
-                this->job_reg_ctx(ctx, DIMC_HWPE_JOB_KB_SRC_ADDR) + slot * kb_one,
-                kb_one,
-                this->job_reg_ctx(ctx, DIMC_HWPE_KB_D0_LENGTH),
-                this->job_reg_ctx(ctx, DIMC_HWPE_KB_D0_STRIDE),
-                this->job_reg_ctx(ctx, DIMC_HWPE_KB_D1_LENGTH),
-                this->job_reg_ctx(ctx, DIMC_HWPE_KB_D1_STRIDE), 0, 0, 0);
-            blk.input_stream[m].configure(
-                this->job_reg_ctx(ctx, DIMC_HWPE_JOB_FB_SRC_ADDR) + slot * fb_one,
-                fb_one,
-                this->job_reg_ctx(ctx, DIMC_HWPE_FB_D0_LENGTH),
-                this->job_reg_ctx(ctx, DIMC_HWPE_FB_D0_STRIDE), 0, 0, 0, 0, 0);
-            blk.psin_stream[m].configure(
-                this->job_reg_ctx(ctx, DIMC_HWPE_JOB_PSIN_SRC_ADDR) + slot * out_one,
-                out_one, 0, 0, 0, 0, 0, 0, 0);
-        }
-    }
-}
-
-void Dimc_HWPE::background_fill()
-{
-    if (!this->cross_job_prefetch) return;
-    if (this->state.get() == DIMC_IDLE) return;
-    if (this->prefetch_ready) return;
-    // The streamers are free once every active macro of the running job has
-    // its operands; from then on they can pull the queued job's.
-    if (this->prefetch_ctx < 0) {
-        JobGeom &eg = this->job_geom[this->exec_slot];
-        for (Dimc_InnerBlock &blk : this->inner_blocks)
-            for (uint32_t m = 0; m < eg.num_active; m++)
-                if (!blk.macros[m].exec_ready) return;
-    }
-
-    if (this->prefetch_ctx < 0) {
-        const int head = this->queue_head();
-        if (head < 0 || head == (int)this->exec_slot) return;
-        this->prefetch_ctx = head;
-        this->fill_slot    = (uint32_t)this->prefetch_ctx;
-        this->latch_geom(this->prefetch_ctx);
-        this->plan_fill(this->prefetch_ctx);
-        this->configure_fill_streams(this->prefetch_ctx);
-    }
-
-    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
-        Dimc_InnerBlock &blk = this->inner_blocks[b];
-        // The prefetch owns this queue, so it has to retire it as well. Without
-        // this the queue fills to outstanding_depth and the prefetch stalls
-        // there for good -- it stopped at 4 of 16 beats on every job.
-        retire_due(blk.prefetch_pending, this->fsm_timestamp);
-        if (!blk.prefetch.requested) {
-            Dimc_OuterPort *port = this->block_port(b);
-            if (port != NULL)
-                blk.prefetch.data_ready_cycle = this->outer_cut_through
-                    ? (int64_t)this->fsm_timestamp + (int64_t)this->l2_burst_latency
-                    : port->request((int64_t)this->fsm_timestamp, this->block_working_set());
-            blk.prefetch.requested = true;
-        }
-        this->preload_block(blk, b, blk.prefetch, true);
-    }
-
-    bool done = true;
-    for (Dimc_InnerBlock &blk : this->inner_blocks)
-        for (uint32_t m = 0; m < this->job_geom[this->fill_slot].num_active; m++)
-            if (blk.prefetch.macro_beat_index[m] < blk.prefetch.macro_beat_total[m]) done = false;
-    if (done) this->prefetch_ready = true;
-}
-
 int Dimc_HWPE::fsm()
 {
-    this->background_fill();
-
     auto next_state = this->state.get();
     int  latency    = 0;
 
@@ -432,6 +316,14 @@ int Dimc_HWPE::fsm()
     }
 
     if (next_state != this->state.get()) {
+        uint64_t spent = this->fsm_timestamp - this->phase_entry_ts;
+        switch (this->state.get()) {
+        case DIMC_STARTING:  this->acc_starting  += spent; break;
+        case DIMC_COMPUTING: this->acc_computing += spent; break;
+        case DIMC_STORING:   this->acc_storing   += spent; break;
+        default: break;
+        }
+        this->phase_entry_ts = this->fsm_timestamp;
         uint8_t st = (uint8_t)next_state;
         this->state_event.event(&st);
     }
@@ -444,11 +336,6 @@ int Dimc_HWPE::fsm()
 // one cycle of work, then ticks the job timestamp once; the phase ends when
 // all blocks are done. The per-block steps never touch fsm_timestamp: bumping
 // it per block would make N blocks look N times slower.
-//
-// The outer stage is not a closed-form correction at the end of the job.
-// Blocks reserve a Dimc_OuterPort carrying next_free_cycle, like
-// interco/router's BandwidthLimiter, so a block hitting a busy port lands
-// later. Sharing and serialization are emergent.
 
 void Dimc_HWPE::phase_end_reset()
 {
@@ -461,77 +348,14 @@ void Dimc_HWPE::phase_end_reset()
 }
 
 void Dimc_HWPE::beat_issued(Dimc_InnerBlock &blk, Dimc_InnerBlock::Cursor &cursor,
-                            int lat, bool prefetch)
+                            int lat)
 {
     if (lat < 1) lat = 1;
-    if (prefetch) {
-        blk.prefetch_pending.push(this->fsm_timestamp + (uint64_t)lat);
-        cursor.beat_index++;
-        return;
-    }
     blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
     cursor.beat_index++;
     blk.beat_event.event((uint8_t *)&cursor.beat_index);
 }
 
-
-// ================= Outer port =================
-void Dimc_OuterPort::configure(uint32_t bandwidth, uint32_t latency)
-{
-    this->bandwidth_bytes = bandwidth ? bandwidth : 1;
-    this->burst_latency   = latency;
-    this->next_free_cycle = 0;
-    this->cursor_bytes    = 0;
-}
-
-void Dimc_OuterPort::reset()
-{
-    this->next_free_cycle = 0;
-    this->cursor_bytes    = 0;
-}
-
-int64_t Dimc_OuterPort::busy_until() const
-{
-    return this->cursor_bytes / (int64_t)this->bandwidth_bytes;
-}
-
-// Reserve the port for `bytes` no earlier than `now`; return the cycle the data
-// has landed. A client arriving while the port is still busy is pushed out by
-// however long the previous burst still runs. That is the whole contention
-// mechanism, the same one interco/router uses.
-int64_t Dimc_OuterPort::request(int64_t now, uint64_t bytes)
-{
-    // Reserve in bytes, report in cycles. For a whole-working-set request whose
-    // size is a multiple of the port width this is identical to the previous
-    // cycle-granular reservation; it differs only for beats narrower than the
-    // port, which the cut-through path issues.
-    int64_t start = std::max(now * (int64_t)this->bandwidth_bytes, this->cursor_bytes);
-    this->cursor_bytes = start + (int64_t)bytes;
-    this->next_free_cycle =
-        (this->cursor_bytes + this->bandwidth_bytes - 1) / this->bandwidth_bytes;
-    uint32_t nf = (uint32_t)this->next_free_cycle;
-    this->free_event.event((uint8_t *)&nf);
-    return this->next_free_cycle + (int64_t)this->burst_latency;
-}
-
-// Shared topology -> every block indexes the one port. Independent -> one each.
-Dimc_OuterPort *Dimc_HWPE::block_port(uint32_t blk)
-{
-    if (this->outer_ports.empty()) return NULL;
-    if (this->outer_ports.size() == 1) return &this->outer_ports[0];
-    return &this->outer_ports[blk % this->outer_ports.size()];
-}
-
-// Bytes one inner block must pull through the outer port for this job. On reuse
-// the weights are already resident in the IMC array, so only features travel.
-uint64_t Dimc_HWPE::block_working_set() const
-{
-    uint64_t psin_bytes = this->job_geom[this->fill_slot].psin_rows ? (uint64_t)this->job_geom[this->fill_slot].row_count * 4 : 0;
-    uint64_t per_macro = this->job_geom[this->fill_slot].skip_kb
-        ? ((uint64_t)DIMC_MACRO_FB_EW + psin_bytes)
-        : ((uint64_t)this->job_geom[this->fill_slot].row_count * DIMC_MACRO_KB_EW + DIMC_MACRO_FB_EW + psin_bytes);
-    return (uint64_t)this->job_geom[this->fill_slot].num_active * per_macro;
-}
 
 // ================= STARTING =================
 bool Dimc_HWPE::preload_iter(int *latency)
@@ -542,18 +366,15 @@ bool Dimc_HWPE::preload_iter(int *latency)
     // ---- first cycle of the phase: latch the job shape, plan every block ----
     if (!this->phase_planned) {
         const uint32_t slot = this->exec_slot;
-        if (!this->job_prefetched) {
-            this->fill_slot = slot;
-            this->latch_geom((int)slot);
-            this->plan_fill((int)slot);
-        }
+        this->fill_slot = slot;
+        this->latch_geom((int)slot);
+        this->plan_fill((int)slot);
         JobGeom &g = this->job_geom[slot];
         for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
             Dimc_InnerBlock &blk = this->inner_blocks[b];
             for (uint32_t m = 0; m < g.num_active; m++) {
                 blk.macros[m].rows_issued  = 0;
                 blk.macros[m].rows_retired = 0;
-                blk.macros[m].job_slot = slot;
             }
             // The store is planned here, not at the start of DIMC_STORING: its
             // beats now issue from inside this phase, as soon as the rows they
@@ -565,9 +386,6 @@ bool Dimc_HWPE::preload_iter(int *latency)
                                std::vector<uint8_t>(g.row_count * 4, 0));
             blk.load_done.assign(g.num_active, 0);
         }
-        // A prefetched job pays no burst head: its data is already resident.
-        if (!this->job_prefetched)
-            this->fsm_timestamp += this->tcdm_burst_latency;
         this->phase_planned = true;
     }
 
@@ -577,26 +395,13 @@ bool Dimc_HWPE::preload_iter(int *latency)
     // port hands out later completion times, independent ports do not.
     // Per-block buffer depth (single vs ping-pong L1) is not modelled: there is
     // one fill per block per job, so depth could only matter across triggers.
-    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
-        Dimc_InnerBlock &blk = this->inner_blocks[b];
-        if (blk.fill.requested) continue;
-        Dimc_OuterPort *port = this->block_port(b);
-        if (port != NULL) {
-            blk.fill.data_ready_cycle = this->outer_cut_through
-                ? (int64_t)this->fsm_timestamp + (int64_t)this->l2_burst_latency
-                : port->request((int64_t)this->fsm_timestamp, this->block_working_set());
-            uint32_t dr = (uint32_t)blk.fill.data_ready_cycle;
-            blk.ready_event.event((uint8_t *)&dr);
-        }
-        blk.fill.requested = true;
-    }
-
     // ---- one beat per block per cycle ----
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         Dimc_InnerBlock &blk = this->inner_blocks[b];
-        this->preload_block(blk, b, blk.fill, false);  // one beat, to the first macro still owing
+        this->preload_block(blk, b, blk.fill);  // one beat, to the first macro still owing
         this->compute_indep(blk);     // every macro whose own fill has landed
         this->store_block(blk, b);    // and ship whatever has already retired
+        this->publish_activity(blk);
     }
 
     this->fsm_timestamp++;
@@ -625,22 +430,16 @@ bool Dimc_HWPE::preload_iter(int *latency)
 // Phase completion is decided by the caller from beat_index and the pending
 // queue, not here, so there is nothing to report back.
 void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
-                              Dimc_InnerBlock::Cursor &cursor, bool prefetch)
+                              Dimc_InnerBlock::Cursor &cursor)
 {
     const uint32_t port_bytes = this->inner_port_bytes;
-    std::queue<uint64_t> &blk_pending = prefetch ? blk.prefetch_pending : blk.port_pending;
-
-    // The block's data has not landed from the outer port yet. Under
-    // store-and-forward data_ready_cycle is the whole working set; under
-    // cut-through it is only the fixed round trip, and each beat is admitted
-    // individually below.
-    if ((int64_t)this->fsm_timestamp < cursor.data_ready_cycle) return;
-
-    Dimc_OuterPort *oport = this->outer_cut_through ? this->block_port(blk_id) : NULL;
-    if (oport != NULL && oport->busy_until() > (int64_t)this->fsm_timestamp) return;
+    std::queue<uint64_t> &blk_pending = blk.port_pending;
 
     if (cursor.beat_index >= cursor.beat_total ||
-        blk_pending.size() >= this->outstanding_depth) return;
+        blk_pending.size() >= this->outstanding_depth) {
+        if (cursor.beat_index < cursor.beat_total) this->acc_stall_full++;
+        return;
+    }
 
     // Lowest-index macro that still owes beats. Same order the block-wide
     // cursor produced, so this substitution changes nothing by itself.
@@ -652,92 +451,74 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
     if (within == 0)
         blk.macros[macro].trace_fill_start =
             (uint32_t)(this->fsm_timestamp - this->job_start_cycle);
-    uint32_t kb_span = this->job_geom[this->fill_slot].skip_kb ? 0
-                     : this->job_geom[this->fill_slot].row_count * this->job_geom[this->fill_slot].kb_beats_per_row;
+    const JobGeom &fg = this->job_geom[this->fill_slot];
+    // The feature and the partial sums go first, then the kernel rows. The
+    // macro needs the feature vector before it can compute anything, so
+    // sending it last would keep every row waiting for the whole fill; the RTL
+    // drives FD/FA and D/WA on independent ports and imposes no order between
+    // them.
+    const uint32_t fb_span   = fg.fb_beats_per_macro;
+    const uint32_t ps_span   = fb_span + fg.psin_beats_per_macro;
+    const uint32_t kb_span   = fg.skip_kb ? 0 : fg.row_count * fg.kb_beats_per_row;
     int lat;
 
-    if (within < kb_span) {                       // ---- kernel beat ----
-        uint32_t row  = within / this->job_geom[this->fill_slot].kb_beats_per_row;
-        uint32_t sub  = within % this->job_geom[this->fill_slot].kb_beats_per_row;
+    if (within >= ps_span) {                      // ---- kernel beat ----
+        uint32_t idx  = within - ps_span;
+        uint32_t row  = idx / fg.kb_beats_per_row;
+        uint32_t sub  = idx % fg.kb_beats_per_row;
         uint32_t off  = sub * port_bytes;
         uint32_t w    = DIMC_MACRO_KB_EW - off;
         if (w > port_bytes) w = port_bytes;
         lat = blk.weight_stream[macro].issue_beat((int)w, blk.macros[macro].row_buffer + off);
-        if (sub == this->job_geom[this->fill_slot].kb_beats_per_row - 1) {  // row complete -> commit
-            uint32_t row_idx = (this->job_geom[this->fill_slot].row_base + row) % DIMC_MACRO_KB_LEN;
+        if (sub == fg.kb_beats_per_row - 1) {  // row complete -> commit
+            uint32_t row_idx = (fg.row_base + row) % DIMC_MACRO_KB_LEN;
             blk.macros[macro].write_row((int)row_idx, blk.macros[macro].row_buffer);
         }
-    } else if (within < kb_span + this->job_geom[this->fill_slot].fb_beats_per_macro) {  // ---- feature beat ----
-        uint32_t sub = within - kb_span;
+    } else if (within < fb_span) {                // ---- feature beat ----
+        uint32_t sub = within;
         uint32_t off = sub * port_bytes;
         uint32_t w   = DIMC_MACRO_FB_EW - off;
         if (w > port_bytes) w = port_bytes;
         lat = blk.input_stream[macro].issue_beat((int)w, blk.macros[macro].row_buffer + off);
-        if (sub == this->job_geom[this->fill_slot].fb_beats_per_macro - 1) { // feature complete
+        if (sub == fb_span - 1) {                 // feature complete
             blk.macros[macro].write_fb(blk.macros[macro].row_buffer);
-            // pipe/kb_ready/fb_ready/psin_scalar belong to the job that is
-            // EXECUTING, not to the one being filled. A prefetch runs while the
-            // previous job is still computing, so clearing its pipe here threw
-            // away rows already in flight -- whole output beats came back zero.
-            // A prefetched job gets them set at job start instead.
-            if (!prefetch) {
-                blk.macros[macro].kb_ready = true;
-                blk.macros[macro].fb_ready = true;
-                blk.macros[macro].pipe.clear();
-                blk.macros[macro].psin_scalar = (int32_t)this->job_reg(DIMC_HWPE_PSIN);
-                // Job-relative, like the makespan it is traced beside.
-                blk.load_done[macro] =
-                    (uint32_t)(this->fsm_timestamp + 1 - this->job_start_cycle);
-            }
+            blk.macros[macro].kb_ready = true;
+            blk.macros[macro].fb_ready = true;
+            blk.macros[macro].pipe.clear();
+            blk.macros[macro].psin_scalar = (int32_t)this->job_reg(DIMC_HWPE_PSIN);
+            // Job-relative, like the makespan it is traced beside.
+            blk.load_done[macro] =
+                (uint32_t)(this->fsm_timestamp + 1 - this->job_start_cycle);
         }
     } else {                                      // ---- partial-sum beat ----
-        uint32_t sub  = within - kb_span - this->job_geom[this->fill_slot].fb_beats_per_macro;
+        uint32_t sub  = within - fb_span;
         uint32_t off  = sub * port_bytes;
-        uint32_t left = this->job_geom[this->fill_slot].row_count * 4 - off;
+        uint32_t left = fg.row_count * 4 - off;
         uint32_t w    = left > port_bytes ? port_bytes : left;
         lat = blk.psin_stream[macro].issue_beat((int)w, blk.macros[macro].row_buffer + off);
         // A beat carries several rows; commit them once the last one lands.
-        if (sub == this->job_geom[this->fill_slot].psin_beats_per_macro - 1) {
-            for (uint32_t r = 0; r < this->job_geom[this->fill_slot].row_count; r++) {
-                uint32_t row_idx = (this->job_geom[this->fill_slot].row_base + r) % DIMC_MACRO_KB_LEN;
+        if (sub == fg.psin_beats_per_macro - 1) {
+            for (uint32_t r = 0; r < fg.row_count; r++) {
+                uint32_t row_idx = (fg.row_base + r) % DIMC_MACRO_KB_LEN;
                 blk.macros[macro].write_psin_row((int)row_idx, blk.macros[macro].row_buffer + r * 4);
             }
         }
     }
-
-    // Charge the beat to the outer port. Two 32-byte beats fit in one cycle of
-    // a 64 B/cycle port, so both blocks can issue every cycle and the port runs
-    // full instead of alternating whole working sets.
-    if (oport != NULL) oport->request((int64_t)this->fsm_timestamp, port_bytes);
 
     cursor.macro_beat_index[macro]++;
     if (cursor.macro_beat_index[macro] >= cursor.macro_beat_total[macro]) {
         blk.macros[macro].fill_done_cycle = this->fsm_timestamp + (uint64_t)lat;
         blk.macros[macro].trace_fill_done =
             (uint32_t)(this->fsm_timestamp + (uint64_t)lat - this->job_start_cycle);
-        // Hand the freshly filled banks to the compute side. The kernel bank
-        // only flips when a kernel actually moved: a reuse job leaves the
-        // weights where they are, so flipping it would compute against a bank
-        // that was never written.
-        // Only the running job's own load may swap banks here. A prefetch
-        // flips at the moment its job starts, not when its data lands, or it
-        // would pull the current job's operands out from under it.
-        if (this->prefetch_ctx >= 0) return;
+        // Hand the freshly filled buffers to the compute side.
         Dimc_Macro &mc = blk.macros[macro];
         mc.exec_ready = true;
         mc.last_kb_src = this->job_geom[this->fill_slot].kb_src;   // the fill landed
-        mc.fb_cur  = mc.fb_fill;
-        mc.fb_fill = (uint8_t)(mc.fb_fill ^ 1u);
-        // The aggregate decision, not mc.skip_kb: kb_span is one value for the
-        // whole job, so either every macro pulled kernel beats or none did. A
-        // macro that flipped on its own opinion would compute from the bank the
-        // load did not go to.
-        if (!this->job_geom[this->fill_slot].skip_kb) {
-            mc.kb_cur  = mc.kb_fill;
-            mc.kb_fill = (uint8_t)(mc.kb_fill ^ 1u);
-        }
     }
-    this->beat_issued(blk, cursor, lat, prefetch);
+    this->acc_beats++;
+    this->acc_beat_lat += (uint64_t)(lat < 1 ? 1 : lat);
+    blk.loaded_this_cycle = true;
+    this->beat_issued(blk, cursor, lat);
 }
 
 // ================= COMPUTING =================
@@ -774,9 +555,19 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk)
             if (mac.rows_issued == row_count)
                 mac.trace_compute_end = (uint32_t)(this->fsm_timestamp - this->job_start_cycle);
             if (m == 0) blk.rows_event.event((uint8_t *)&mac.rows_issued);
+            blk.computed_this_cycle = true;
         }
         mac.tick();
     }
+}
+
+void Dimc_HWPE::publish_activity(Dimc_InnerBlock &blk)
+{
+    uint8_t ld = blk.loaded_this_cycle ? 1 : 0;
+    uint8_t cp = blk.computed_this_cycle ? 1 : 0;
+    blk.load_active_event.event(&ld);
+    blk.comp_active_event.event(&cp);
+    blk.loaded_this_cycle = blk.computed_this_cycle = false;
 }
 
 void Dimc_HWPE::drain_ready_rows(Dimc_InnerBlock &blk)
@@ -795,39 +586,6 @@ void Dimc_HWPE::drain_ready_rows(Dimc_InnerBlock &blk)
     }
 }
 
-// Advance one block's macro pipelines by a cycle. The macros inside a block run
-// in lockstep, so a row enters all of them or none of them, and the row counter
-// advances once, never per macro.
-bool Dimc_HWPE::compute_block(Dimc_InnerBlock &blk)
-{
-    const uint32_t num_active = this->job_geom[this->exec_slot].num_active;
-    const uint32_t row_count  = this->job_geom[this->exec_slot].row_count;
-
-    this->drain_ready_rows(blk);
-
-    if (blk.rows_issued < row_count) {
-        bool all_ready = true;
-        for (uint32_t m = 0; m < num_active; m++)
-            if (!blk.macros[m].can_accept()) { all_ready = false; break; }
-        if (all_ready) {
-            uint32_t row_idx = (this->job_geom[this->exec_slot].row_base + blk.rows_issued) % DIMC_MACRO_KB_LEN;
-            for (uint32_t m = 0; m < num_active; m++)
-                blk.macros[m].issue((int)row_idx, (int)blk.rows_issued, this->job_geom[this->exec_slot].bias);
-            blk.rows_issued++;
-            blk.rows_event.event((uint8_t *)&blk.rows_issued);
-        }
-    }
-    for (uint32_t m = 0; m < num_active; m++) blk.macros[m].tick();
-
-    bool pipes_empty = true;
-    for (uint32_t m = 0; m < num_active; m++)
-        if (!blk.macros[m].pipe.empty()) { pipes_empty = false; break; }
-
-    // No second drain here: pipes_empty means every has_ready() is false, and
-    // tick() only decrements, so a ready entry would still be in its pipe.
-    return blk.rows_issued >= row_count && pipes_empty;
-}
-
 // ================= STORING =================
 bool Dimc_HWPE::store_iter(int *latency)
 {
@@ -837,36 +595,18 @@ bool Dimc_HWPE::store_iter(int *latency)
     const uint32_t out_bytes  = row_count * 4;
 
     if (!this->phase_planned) {
-        for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
-            Dimc_InnerBlock &blk = this->inner_blocks[b];
-            // Results leave through the same outer port, so a shared port
-            // serialises the drains too. The drain is requested at the start of
-            // the store phase and runs in parallel with the inner store beats:
-            // per the D-tile spec the hardware overlaps drain with loading, it
-            // does not wait for the whole result to reach L1. Unlike the input
-            // fill, store is not store-and-forward.
-            Dimc_OuterPort *port = this->block_port(b);
-            if (port != NULL && !this->outer_cut_through) {
-                uint64_t out_ws = (uint64_t)num_active * (uint64_t)out_bytes;
-                blk.store.data_ready_cycle =
-                    port->request((int64_t)this->fsm_timestamp, out_ws);
-            } else {
-                // Cut-through charges the port beat by beat as the beats issue.
-                blk.store.data_ready_cycle = 0;
-            }
-            uint32_t dr = (uint32_t)blk.store.data_ready_cycle;
-            blk.drain_event.event((uint8_t *)&dr);
-        }
-        // Only pay the drain head if nothing has gone out yet; a store that
-        // already started inside the compute phase paid it there.
-        if (this->inner_blocks[0].store.beat_index == 0)
-            this->fsm_timestamp += this->tcdm_burst_latency;
         this->phase_planned = true;
     }
 
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         Dimc_InnerBlock &blk = this->inner_blocks[b];
+        // The macro pipeline does not stop because the job moved on to
+        // storing: rows issued near the end of the fill are still in flight and
+        // have to retire before their beats can go out. compute_indep issues
+        // nothing here -- every row is already issued -- it ticks and drains.
+        this->compute_indep(blk);
         if (!blk.phase_done) this->store_block(blk, b);
+        this->publish_activity(blk);
     }
 
     this->fsm_timestamp++;
@@ -875,22 +615,21 @@ bool Dimc_HWPE::store_iter(int *latency)
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
         size_t after = retire_due(blk.port_pending, this->fsm_timestamp);
         bool beats_done = (blk.store.beat_index >= blk.store.beat_total) && (after == 0);
-        bool drain_landed = (int64_t)this->fsm_timestamp >= blk.store.data_ready_cycle;
-        if (beats_done && drain_landed) blk.phase_done = true;
-        else                            all_done = false;
+        if (beats_done) blk.phase_done = true;
+        else            all_done = false;
     }
 
     if (!all_done) return false;
 
     // ---- job closed: the elapsed cycles ARE the makespan, for the whole
-    // outer block. No formula is applied on top: the outer port already
-    // charged its bandwidth and its serialization while the job ran.
+    // outer block. No formula is applied on top: every beat was charged as it
+    // issued, against the latency the L1 bank and the crossbar returned.
     this->phase_end_reset();
     this->phase_planned = false;
 
-    uint64_t finish      = this->fsm_timestamp - this->job_start_cycle;
     uint32_t compute_cyc = this->job_geom[this->exec_slot].compute_cyc;
     bool     skip_kb     = this->job_geom[this->exec_slot].skip_kb;
+    uint64_t finish      = this->fsm_timestamp - this->job_start_cycle;
 
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         Dimc_InnerBlock &blk = this->inner_blocks[b];
@@ -912,16 +651,41 @@ bool Dimc_HWPE::store_iter(int *latency)
     }
 
     // Each phase advanced the clock one cycle per beat, so job start to here
-    // already took `finish` cycles. The completion event therefore fires after
-    // 1 cycle, not after `finish` more, which would count them twice. `finish`
-    // only goes to the trace.
+    // already took the job's whole duration. The completion event therefore
+    // fires after 1 cycle, not after that duration again, which would count it
+    // twice.
     *latency = 1;
+    const uint64_t now      = (uint64_t)this->clock.get_cycles();
+    const uint64_t job_busy = now - this->job_entry_cycle;
+    // Analytic minimum: every beat the fill must move through the inner port,
+    // one per cycle, plus the macro pipeline's drain. The blocks run in
+    // parallel, so one block's beats set the floor.
+    const uint64_t ideal = (uint64_t)this->job_geom[this->exec_slot].num_active
+                         * this->job_geom[this->exec_slot].beats_per_macro
+                         + DIMC_MACRO_LATENCY;
+    this->acc_busy_cycles  += job_busy;
+    this->acc_ideal_cycles += ideal;
+    this->last_job_end      = now;
+    this->jobs_measured++;
     this->trace.msg(vp::TraceLevel::WARNING,
         "DIMC double-buffer: num_active=%u row_count=%u l1bw=%u "
-        "reuse=%u prefetched=%d total_latency=%lu\n",
+        "reuse=%u | %lu ---> %lu cyc | period = %lu cyc | ideal = %lu | "
+        "uti = %.3f | totals: jobs=%u busy=%lu gap=%lu uti=%.3f\n",
         num_active, row_count, this->inner_port_bytes,
-        (unsigned)skip_kb, (int)this->job_prefetched,
-        (unsigned long)finish);
+        (unsigned)skip_kb,
+        (unsigned long)this->job_entry_cycle, (unsigned long)now,
+        (unsigned long)job_busy, (unsigned long)ideal,
+        job_busy ? (1.0 * ideal) / (1.0 * job_busy) : 0.0,
+        this->jobs_measured,
+        (unsigned long)this->acc_busy_cycles,
+        (unsigned long)this->acc_gap_cycles,
+        this->acc_busy_cycles
+            ? (1.0 * this->acc_ideal_cycles) / (1.0 * this->acc_busy_cycles) : 0.0);
+    this->trace.msg(vp::TraceLevel::WARNING,
+        "  beats=%lu avg_lat=%.2f stalled_on_depth=%lu (depth=%u)\n",
+        (unsigned long)this->acc_beats,
+        this->acc_beats ? (1.0 * this->acc_beat_lat) / (1.0 * this->acc_beats) : 0.0,
+        (unsigned long)this->acc_stall_full, this->outstanding_depth);
     return true;
 }
 
@@ -951,14 +715,8 @@ void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
     if (need > row_count) need = row_count;
     if (blk.macros[macro].rows_retired < need) return;
 
-    // Same admission as the fill: the beat is charged to the outer port as it
-    // issues, so store traffic and a concurrent prefetch share the port.
-    Dimc_OuterPort *oport = this->outer_cut_through ? this->block_port(blk_id) : NULL;
-    if (oport != NULL && oport->busy_until() > (int64_t)this->fsm_timestamp) return;
-
     int lat = blk.out_stream[macro].issue_beat((int)w, blk.out_buf[macro].data() + off);
     blk.out_beat_lat_est = (uint32_t)((lat < 1 ? 1 : lat) * (int)out_beats);
-    if (oport != NULL) oport->request((int64_t)this->fsm_timestamp, w);
 
     if (lat < 1) lat = 1;
     blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
