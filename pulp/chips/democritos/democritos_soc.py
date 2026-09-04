@@ -23,6 +23,7 @@ import interco.router as router
 from pulp.chips.democritos.democritos_D_tile import Democritos_D_Tile
 from pulp.chips.democritos.democritos_A_tile import Democritos_A_Tile
 from pulp.chips.democritos.democritos_V_tile import Democritos_V_Tile
+from pulp.chips.democritos.democritos_T_tile import Democritos_T_Tile
 from pulp.chips.democritos.democritos_arch import DemocritosArch
 from pulp.floonoc.floonoc import *
 from pulp.chips.magia_v2.fractal_sync.fractal_sync import *
@@ -69,7 +70,8 @@ class DemocritosSoc(gvsoc.systree.Component):
                 f"{DemocritosArch.NB_CLUSTERS} positions")
         tile_class = {'d': Democritos_D_Tile,
                       'a': Democritos_A_Tile,
-                      'v': Democritos_V_Tile}
+                      'v': Democritos_V_Tile,
+                      't': Democritos_T_Tile}
         cluster:List[gvsoc.systree.Component] = []
         for id in range(0,DemocritosArch.NB_CLUSTERS):
             t = types[id]

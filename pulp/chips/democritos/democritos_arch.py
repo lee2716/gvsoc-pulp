@@ -46,6 +46,10 @@ class DemocritosArch:
     DIMC_START              = PCM_START
     DIMC_SIZE               = PCM_SIZE
     DIMC_END                = PCM_END
+    # T-tile-local HWPE address segment (RedMulE) -- likewise
+    REDMULE_START           = PCM_START
+    REDMULE_SIZE            = PCM_SIZE
+    REDMULE_END             = PCM_END
     STACK_ADDR_START        = PCM_END + 1
     STACK_SIZE              = 0x0000_FFFF
     STACK_ADDR_END          = STACK_ADDR_START + STACK_SIZE
@@ -102,9 +106,11 @@ class DemocritosArch:
     N_TILES_Y           = int(os.environ.get('DEMOCRITOS_N_TILES_Y', 2))
     NB_CLUSTERS         = N_TILES_X*N_TILES_Y # to be removed when we'll use the DemocritosTree properties instead of hardcoding the number of clusters in the components
     # Which accelerator each mesh position carries, one character per position
-    # indexed by tile id: 'd' DIMC tile, 'a' A-tile, 'v' D-tile plus a
-    # Snitch+Spatz vector core. Set DEMOCRITOS_TILE_TYPES to select a mesh
-    # without editing this file, for example 'vvvv' for four Spatz tiles.
+    # indexed by tile id: 'd' DIMC tile, 'a' A-tile with the PCM, 'v' D-tile
+    # plus a Snitch+Spatz vector core, 't' RedMulE tile. Set
+    # DEMOCRITOS_TILE_TYPES to select a mesh without editing this file, for
+    # example 'vvvv' for four Spatz tiles or 'ttttvvvv' for four RedMulE tiles
+    # feeding four Spatz tiles.
     # Keep NB_CLUSTERS a power of two: democritos_soc.py sizes the FractalSync
     # tree by int(log2(NB_CLUSTERS)) and under-provisions it silently otherwise.
     TILE_TYPES          = list(os.environ.get('DEMOCRITOS_TILE_TYPES',
