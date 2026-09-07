@@ -232,9 +232,8 @@ class Democritos_T_Tile(gvsoc.systree.Component):
                        base=DemocritosArch.STDOUT_START,
                        size=DemocritosArch.STDOUT_SIZE, rm_base=False)
 
-        # Bind OBI Xbar so that it can communicate to RedMulE. magia_v2 maps the
-        # V2 register interface, which is the memory-mapped one; the offload
-        # port belongs to the Xif path and stays unbound.
+        # RedMulE's memory-mapped register interface, as magia_v2 maps it. The
+        # offload port belongs to the Xif path and stays unbound.
         obi_xbar.o_MAP(redmule.i_INPUT_V2(), name='local-redmule',
                        base=DemocritosArch.REDMULE_START,
                        size=DemocritosArch.REDMULE_SIZE,
