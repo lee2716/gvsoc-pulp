@@ -86,6 +86,27 @@ class Dimc_HWPE_Streamer {
 };
 
 
+// ---- Outer port: the tile's shared port towards memory ----
+// A bandwidth limiter in the same idiom as interco/router's: the port remembers
+// when it is free again, so a client arriving before that waits. Accounting is
+// byte-granular, so two 32-byte beats occupy one cycle of a 64 B/cycle port
+// rather than one cycle each.
+class Dimc_OuterPort {
+    public:
+        void    configure(uint32_t bandwidth);
+        void    reset();
+        // First cycle at which the port can start new work.
+        int64_t busy_until() const;
+        // Reserve `bytes` starting no earlier than `now`.
+        void    request(int64_t now, uint64_t bytes);
+
+        int64_t  cursor_bytes    = 0;   // bytes committed; /bandwidth gives the cycle
+        uint32_t bandwidth_bytes = 1;
+
+        // VCD event, registered by the parent as outer_port/next_free.
+        vp::Trace free_event;
+};
+
 // ---- rtl/accumulator.sv, instantiated by rtl/cleopatra.sv ----
 // Sums every result popped from the block's output FIFO into one register.
 // The FIFO is 32 bits wide, the same as PSOUT, so nothing is truncated.
@@ -127,8 +148,11 @@ class Dimc_InnerBlock {
         // and must not share position state: a cursor per activity keeps that
         // separation in the type rather than in a convention.
         //
-        // ONE linear beat index is the only position state; (macro, row,
-        // offset) are decoded from it on demand, so they cannot drift apart.
+        // Two levels of position: beat_index/beat_total bound the block's
+        // whole phase, and macro_beat_index/macro_beat_total say where each
+        // macro is in its own stream. preload_block picks the lowest-index
+        // macro that still owes beats, so the per-macro pair is what selects
+        // the destination of a beat.
         struct Cursor {
             uint32_t beat_index = 0;    // linear position, whole block
             uint32_t beat_total = 0;
@@ -212,8 +236,8 @@ class Dimc_HWPE : public vp::Component {
         vp::WireMaster<bool> irq;
 
         // ---- Inner blocks (nb_inner_blocks of them) ----
-        // Each owns its streamers and macros. nb_inner_blocks == 1 is a single
-        // block on the inner port, with no outer port.
+        // Each owns its streamers and macros, and reaches L1 through its own
+        // inner port.
         std::vector<Dimc_InnerBlock> inner_blocks;
 
         uint8_t sel_dimc;
@@ -222,13 +246,16 @@ class Dimc_HWPE : public vp::Component {
         uint32_t num_macros;
         // Streamer bandwidth: fixed hardware properties, set once from the
         // systree / gvrun --param (no per-trigger MMIO override).
-        uint32_t inner_port_bytes;    // inner (L1) port bytes/cycle, e.g. 32 banks*4=128
+        uint32_t inner_port_bytes;    // one inner block's port, bytes/cycle
+        uint32_t outer_port_bytes;    // the tile's shared outer port, bytes/cycle
+        Dimc_OuterPort outer_port;    // every block's beats pass through it
         // ---- Outer block ----
         // An inner block is num_macros macros on one inner port; an outer block
-        // is nb_inner_blocks of them. Every block reaches memory through its own
-        // inner port, and the latency of an access is whatever the L1 bank and
-        // the crossbar return -- the accelerator adds none of its own, which is
-        // how magia_v2 models RedMulE.
+        // is nb_inner_blocks of them, and all of their beats pass through one
+        // shared outer port. An access costs whatever the L1 bank and the
+        // crossbar return; the only delay the accelerator adds of its own is
+        // the wait when more beats want the shared port in a cycle than its
+        // bandwidth covers.
         uint32_t nb_inner_blocks;     // inner blocks in the outer block (D-tile default 2)
         // Reuse auto-detect: the KB (weight) source address of the last loaded
         // job. A trigger whose KB address matches reuses the resident weights
@@ -237,7 +264,7 @@ class Dimc_HWPE : public vp::Component {
 
         // ---- Job accounting ----
         // Reported per job the way magia_v2's LightRedmule reports a GEMM
-        // (light_redmule.cpp:1409): absolute start and end so the gap to the
+        // (light_redmule.cpp): absolute start and end so the gap to the
         // next job reads straight off consecutive lines, the period in cycles,
         // and a utilisation against an analytic ideal.
         //
@@ -248,10 +275,10 @@ class Dimc_HWPE : public vp::Component {
         // reconciles with the core's own mcycle.
         //
         // The FSM phases are not a partition of the work: preload_iter drives
-        // the fill, the compute and the store in one loop, so a job whose
-        // compute hides entirely under its fill spends no cycles in the
-        // COMPUTING state. busy_cycles is what an outside observer measures;
-        // the beat counters say what filled it.
+        // the fill, the compute and the store in one loop, and compute_iter
+        // does no work of its own, so COMPUTING costs one cycle for any job.
+        // busy_cycles is what an outside observer measures; the beat counters
+        // say what filled it.
         uint64_t phase_entry_ts  = 0;    // fsm_timestamp at the current phase's start
         uint64_t job_entry_cycle = 0;    // simulated cycle at this job's start
         uint64_t last_job_end    = 0;    // simulated cycle the previous job ended
@@ -259,8 +286,9 @@ class Dimc_HWPE : public vp::Component {
         uint64_t acc_busy_cycles = 0;    // simulated cycles inside a job
         uint64_t acc_gap_cycles  = 0;    // simulated cycles between jobs
         uint64_t acc_ideal_cycles = 0;   // analytic minimum for those jobs
-        // Beats the inner port issued and the latency L1 returned for them.
-        // Their average is the per-beat cost the phase lengths are built from.
+        // Fill beats and the latency L1 returned for them; store beats are
+        // not counted here. Reported as an average per beat. The phase lengths
+        // come from each beat's own latency, not from this average.
         uint64_t acc_beats = 0, acc_beat_lat = 0, acc_stall_full = 0;
         uint32_t jobs_measured   = 0;
 
@@ -287,7 +315,7 @@ class Dimc_HWPE : public vp::Component {
         // Several jobs can be offloaded while one runs. The engine still runs
         // one at a time, so the per-block state and the scratch below hold the
         // running job only.
-        // hwpe_ctrl_target.sv (a52dc9cd): there is ONE live bundle of
+        // hwpe_ctrl_target.sv: there is ONE live bundle of
         // job-dependent registers, and COMMIT snapshots it into a job FIFO of
         // depth NB_CONTEXT. Software cannot address a queue slot at all -- and
         // must not have to: ACQUIRE hands back a job id, never a slot index.
@@ -298,10 +326,9 @@ class Dimc_HWPE : public vp::Component {
         uint32_t ctx_job_id[DIMC_NB_CONTEXT];  // job id stamped at commit
         int      acquired_ctx;                 // context SW is currently filling (-1 none)
         int      running_ctx;                  // context the engine executes (-1 none)
-        // Committed-but-not-yet-running contexts, in commit order. A real FIFO
-        // rather than the two scalars this used to be: with DIMC_NB_CONTEXT
-        // above 2 the software can queue several jobs ahead, and the pair could
-        // only ever hold one plus a spare.
+        // Committed-but-not-yet-running contexts, in commit order. A FIFO and
+        // not a pair of scalars: with DIMC_NB_CONTEXT above 2 the software can
+        // queue more than one job ahead of the running one.
         std::deque<int> ctx_queue;
 
         int      ctx_alloc();                  // reserve a free context, -1 if none
@@ -321,8 +348,8 @@ class Dimc_HWPE : public vp::Component {
 
         // Scratch shared across the three phases of one job (same for all blocks:
         // one control plane issues one job shape to every inner block).
-        // Everything derived once per job. One per context, so two jobs can be
-        // in flight and each macro reads the one it is actually working on.
+        // Everything derived once per job. One per context, so a queued job's
+        // shape survives until the engine reaches it.
         struct JobGeom {
             uint32_t num_active, row_count, row_base, compute_cyc;
             int32_t  bias;
@@ -333,16 +360,11 @@ class Dimc_HWPE : public vp::Component {
             uint32_t fb_beats_per_macro, psin_beats_per_macro, out_beats;
         };
         JobGeom job_geom[DIMC_NB_CONTEXT];
-        // Which slot each pipeline stage reads. They are the same index while
-        // one job is in flight; splitting them is what lets the streamers fill
-        // job k+1's banks while the macros still compute job k.
+        // The context slot the fill side and the execute side read. preload_iter
+        // assigns fill_slot from exec_slot at the top of every job, so both
+        // always name the running job's context.
         uint32_t fill_slot = 0;
         uint32_t exec_slot = 0;
-        // hwpe-ctrl keeps one context running while software prepares the
-        // other. This is the data-path half of that: once the running job stops
-        // needing the streamers, the queued context's kernels and features are
-        // pulled into the macros' spare banks, so when it starts there is
-        // nothing left to load.
         // Per-block step functions. Each advances ONE inner block by one cycle's
         // worth of work and returns true when that block finished the phase; the
         // phase wrapper owns fsm_timestamp and ends only when all blocks are done.
@@ -385,9 +407,9 @@ class Dimc_HWPE : public vp::Component {
         // came back. outstanding_depth caps in-flight requests, so slow memory
         // back-pressures the engine.
         //
-        // The load walks (macro, row, offset). Keeping three counters in sync
-        // broke the first attempt, so the position is one linear beat index,
-        // decoded on demand.
+        // The load walks (macro, row, offset), decoded from the beat cursors:
+        // beat_index bounds the block's phase and macro_beat_index[] locates a
+        // beat within its own macro's stream.
         uint32_t outstanding_depth;              // max in-flight TCDM beats per block
         uint64_t fsm_timestamp;                  // free-running engine cycle count
         uint64_t job_start_cycle;                // fsm_timestamp when this job began

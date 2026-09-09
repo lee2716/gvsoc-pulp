@@ -128,12 +128,10 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     // job_running / running_job were latched by start_next_job() at commit.
     _this->register_file[DIMC_HWPE_STATUS >> 2] = 0x0;   // busy
 
-    // fsm_timestamp runs free across jobs, and the outer port keeps its
-    // busy-until stamp, so a transfer still in flight when the next job starts
-    // pushes that job out. Zeroing both per job was safe only because the phase
-    // barriers drained everything first; it also made cross-job overlap
-    // impossible to express. job_start_cycle is what the makespan trace
-    // subtracts to stay per-job.
+    // fsm_timestamp runs free across jobs: port_pending holds absolute
+    // due-stamps, so zeroing it while a beat is in flight would strand that
+    // beat. job_start_cycle is what the makespan trace subtracts to stay
+    // per-job.
     _this->job_start_cycle = _this->fsm_timestamp;
     _this->phase_planned = false;
     _this->exec_slot = (uint32_t)(_this->running_ctx >= 0 ? _this->running_ctx : 0);
@@ -192,7 +190,7 @@ void Dimc_HWPE::fsm_end_handler(vp::Block *__this, vp::ClockEvent *event)
         _this->irq.sync(true);
         _this->irq.sync(false);
     }
-    // autotrigger_n (hwpe-ctrl): 0 = chain into the next queued job automatically,
+    // autotrigger_n: 0 = chain into the next queued job automatically,
     // 1 = hold the queue until SW issues an explicit trigger (commit_trigger 0/2).
     if ((_this->register_file[DIMC_HWPE_AUTOTRIGGER_N >> 2] & 0x1) == 0)
         _this->start_next_job();
@@ -216,8 +214,7 @@ void Dimc_HWPE::fsm_loop()
     }
 }
 
-// Size one job's fill: geometry into its slot, per-macro beat budgets, and the
-// outer-port reservation.
+// Size one job's fill: geometry into its slot and the per-macro beat budgets.
 void Dimc_HWPE::latch_geom(int ctx)
 {
     JobGeom &g = this->job_geom[ctx];
@@ -282,8 +279,36 @@ void Dimc_HWPE::plan_fill(int ctx)
     }
 }
 
-// One beat per block per cycle for the queued context, run in every state
-// except the one where the current job still owns the streamers.
+void Dimc_OuterPort::configure(uint32_t bandwidth)
+{
+    this->bandwidth_bytes = bandwidth ? bandwidth : 1;
+    this->cursor_bytes    = 0;
+}
+
+void Dimc_OuterPort::reset()
+{
+    this->cursor_bytes = 0;
+}
+
+int64_t Dimc_OuterPort::busy_until() const
+{
+    return this->cursor_bytes / (int64_t)this->bandwidth_bytes;
+}
+
+void Dimc_OuterPort::request(int64_t now, uint64_t bytes)
+{
+    // Reserve in bytes, report in cycles: a beat narrower than the port takes a
+    // fraction of a cycle, so several of them can share one.
+    int64_t start = now * (int64_t)this->bandwidth_bytes;
+    if (this->cursor_bytes > start) start = this->cursor_bytes;
+    this->cursor_bytes = start + (int64_t)bytes;
+    uint32_t nf = (uint32_t)((this->cursor_bytes + this->bandwidth_bytes - 1)
+                             / this->bandwidth_bytes);
+    this->free_event.event((uint8_t *)&nf);
+}
+
+// Drop every pending beat whose response is due, and report how many are
+// still in flight.
 static inline size_t retire_due(std::queue<uint64_t> &q, uint64_t now)
 {
     while (!q.empty() && q.front() <= now) q.pop();
@@ -391,11 +416,11 @@ bool Dimc_HWPE::preload_iter(int *latency)
 
     // ---- outer-port fills ----
     // Every block asks for its working set when the job starts. Whether the
-    // fills overlap or serialize is decided by the port, not here: a shared
-    // port hands out later completion times, independent ports do not.
+    // fills overlap or serialize is decided by the outer port, not here: it
+    // books bytes, so blocks whose combined demand fits one cycle all go.
     // Per-block buffer depth (single vs ping-pong L1) is not modelled: there is
     // one fill per block per job, so depth could only matter across triggers.
-    // ---- one beat per block per cycle ----
+    // ---- at most one beat per block per cycle, outer port permitting ----
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         Dimc_InnerBlock &blk = this->inner_blocks[b];
         this->preload_block(blk, b, blk.fill);  // one beat, to the first macro still owing
@@ -440,6 +465,11 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
         if (cursor.beat_index < cursor.beat_total) this->acc_stall_full++;
         return;
     }
+    // Every block's beats share one outer port, so a block that arrives after
+    // the port is booked for this cycle waits. store_block books the same
+    // budget, so fills and stores compete for it instead of each getting a
+    // beat of their own every cycle.
+    if (this->outer_port.busy_until() > (int64_t)this->fsm_timestamp) return;
 
     // Lowest-index macro that still owes beats. Same order the block-wide
     // cursor produced, so this substitution changes nothing by itself.
@@ -461,13 +491,14 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
     const uint32_t ps_span   = fb_span + fg.psin_beats_per_macro;
     const uint32_t kb_span   = fg.skip_kb ? 0 : fg.row_count * fg.kb_beats_per_row;
     int lat;
+    uint32_t w = 0;   // this beat's width, charged to the outer port below
 
     if (within >= ps_span) {                      // ---- kernel beat ----
         uint32_t idx  = within - ps_span;
         uint32_t row  = idx / fg.kb_beats_per_row;
         uint32_t sub  = idx % fg.kb_beats_per_row;
         uint32_t off  = sub * port_bytes;
-        uint32_t w    = DIMC_MACRO_KB_EW - off;
+                 w    = DIMC_MACRO_KB_EW - off;
         if (w > port_bytes) w = port_bytes;
         lat = blk.weight_stream[macro].issue_beat((int)w, blk.macros[macro].row_buffer + off);
         if (sub == fg.kb_beats_per_row - 1) {  // row complete -> commit
@@ -477,7 +508,7 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
     } else if (within < fb_span) {                // ---- feature beat ----
         uint32_t sub = within;
         uint32_t off = sub * port_bytes;
-        uint32_t w   = DIMC_MACRO_FB_EW - off;
+                 w   = DIMC_MACRO_FB_EW - off;
         if (w > port_bytes) w = port_bytes;
         lat = blk.input_stream[macro].issue_beat((int)w, blk.macros[macro].row_buffer + off);
         if (sub == fb_span - 1) {                 // feature complete
@@ -494,7 +525,7 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
         uint32_t sub  = within - fb_span;
         uint32_t off  = sub * port_bytes;
         uint32_t left = fg.row_count * 4 - off;
-        uint32_t w    = left > port_bytes ? port_bytes : left;
+                 w    = left > port_bytes ? port_bytes : left;
         lat = blk.psin_stream[macro].issue_beat((int)w, blk.macros[macro].row_buffer + off);
         // A beat carries several rows; commit them once the last one lands.
         if (sub == fg.psin_beats_per_macro - 1) {
@@ -518,6 +549,7 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
     this->acc_beats++;
     this->acc_beat_lat += (uint64_t)(lat < 1 ? 1 : lat);
     blk.loaded_this_cycle = true;
+    this->outer_port.request((int64_t)this->fsm_timestamp, w);
     this->beat_issued(blk, cursor, lat);
 }
 
@@ -658,8 +690,9 @@ bool Dimc_HWPE::store_iter(int *latency)
     const uint64_t now      = (uint64_t)this->clock.get_cycles();
     const uint64_t job_busy = now - this->job_entry_cycle;
     // Analytic minimum: every beat the fill must move through the inner port,
-    // one per cycle, plus the macro pipeline's drain. The blocks run in
-    // parallel, so one block's beats set the floor.
+    // one per cycle, plus the macro pipeline's drain. One block's beats set
+    // the floor, which holds while the blocks' combined demand still fits the
+    // outer port.
     const uint64_t ideal = (uint64_t)this->job_geom[this->exec_slot].num_active
                          * this->job_geom[this->exec_slot].beats_per_macro
                          + DIMC_MACRO_LATENCY;
@@ -698,6 +731,7 @@ void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
 
     if (blk.store.beat_index >= blk.store.beat_total ||
         blk.port_pending.size() >= this->outstanding_depth) return;
+    if (this->outer_port.busy_until() > (int64_t)this->fsm_timestamp) return;
 
     uint32_t macro = blk.store.beat_index / out_beats;
     uint32_t sub   = blk.store.beat_index % out_beats;
@@ -720,5 +754,6 @@ void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
 
     if (lat < 1) lat = 1;
     blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
+    this->outer_port.request((int64_t)this->fsm_timestamp, w);
     blk.store.beat_index++;
 }

@@ -50,9 +50,9 @@ class Democritos_D_TileTcdm(gvsoc.systree.Component):
         L1_masters = 3
         interleaver = L1_interleaver(self, 'interleaver', nb_slaves=nb_banks, nb_masters=L1_masters, interleaving_bits=2)
 
-        # OBI plus the two iDMAs. They share one DmaInterleaver input, the way
-        # magia_v2/tile.py:59 does it; the count is how many composite ports the
-        # tile exposes, not how many interleaver inputs exist.
+        # They share one DmaInterleaver input, the way magia_v2/tile.py
+        # instantiates its own; the count is how many composite ports the tile exposes, not how
+        # many interleaver inputs exist.
         # 0: OBI xbar (core-issued L1 access through the DMA interleaver)
         # 1: iDMA0 TCDM side   2: iDMA1 TCDM side   3: NoC wide channel inbound
         dma_masters = 4
@@ -65,7 +65,7 @@ class Democritos_D_TileTcdm(gvsoc.systree.Component):
         banks = []
         for i in range(nb_banks):
             # Instantiate a new memory bank
-            # atomics and truncate_size match magia_v2/tile.py:74. Without
+            # atomics and truncate_size match the banks in magia_v2/tile.py. Without
             # atomics the banks reject RISC-V atomic instructions; truncate_size
             # masks an incoming address with (size - 1), so a bank sees an
             # in-range offset instead of running past its end.
@@ -120,7 +120,9 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         # iDMA controller
         idma_mm_ctrl= iDMA_mm_ctrl(self,f'tile-{tid}-idma-ctrl-mm')
 
-        # iDMA
+        # iDMA. loc_base/loc_size must BE the L1 window: idma_be.cpp decides
+        # whether a transfer is local purely by [loc_base, loc_base+loc_size),
+        # and a window that does not match sends a local transfer out over AXI.
         idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=DemocritosArch.L1_ADDR_START,loc_size=DemocritosArch.L1_SIZE,tcdm_base=0,tcdm_width=32,transfer_queue_size=DemocritosDSE.TILE_IDMA0_JOBFIFO_SIZE,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
         idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=DemocritosArch.L1_ADDR_START,loc_size=DemocritosArch.L1_SIZE,tcdm_base=0,tcdm_width=32,transfer_queue_size=DemocritosDSE.TILE_IDMA1_JOBFIFO_SIZE,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
 
@@ -130,10 +132,12 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         dimc = Dimc(self, 'dimc',
                     macros_per_block  = 2,    # macros sharing one inner port
                     nb_inner_blocks   = 2,    # 2 blocks x 2 macros = 4 macros
-                    # One macro carries 256 bit/cycle, so a block of two carries
-                    # 512. This width sets every STARTING and STORING beat
-                    # count, so the measured phase lengths rest on it.
-                    inner_port_bytes  = 64)
+                    # Two port widths, and every STARTING and STORING beat count
+                    # is derived from them: an inner block reaches memory at
+                    # 32 B/cycle (256 bit), and both blocks' beats then pass
+                    # through one shared 64 B/cycle (512 bit) outer port.
+                    inner_port_bytes  = 32,
+                    outer_port_bytes  = 64)
         self.dimc = dimc
 
         # Event unit (mirrors pulp/chips/magia_v2/tile.py). The address window is
@@ -250,7 +254,7 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         self.bind(fsync_mm_ctrl, 'fsync_done_irq', event_unit, 'in_event_24_pe_0')
         # iDMA completion -> events 2 and 3, the slots magia_v2 uses. These are
         # master ports on iDMA_mm_ctrl and it drives them on every completion
-        # (idma_mm_ctrl.cpp:240), so leaving them unbound is a null dereference
+        # (idma_mm_ctrl.cpp), so leaving them unbound is a null dereference
         # the moment software issues a transfer, not merely a missing feature.
         self.bind(idma_mm_ctrl, 'idma0_done_irq', event_unit, 'in_event_2_pe_0')
         self.bind(idma_mm_ctrl, 'idma1_done_irq', event_unit, 'in_event_3_pe_0')
@@ -269,7 +273,7 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         self.__o_NARROW_INPUT(tile_xbar.i_INPUT())
 
         # Wide channel inbound: a remote DMA writing this tile's L1 lands on the
-        # DmaInterleaver, not the core-side one. magia_v2/tile.py:313 binds the
+        # DmaInterleaver, not the core-side one. magia_v2/tile.py binds its wide input the
         # same way.
         self.__o_WIDE_INPUT(l1_tcdm.i_DMA_INPUT(3))
 
@@ -280,34 +284,19 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         # Bind: iDMA controller
         obi_xbar.o_MAP(idma_mm_ctrl.i_INPUT(), name=f'iDMA-ctrl-mm-{tid}-mem', base=DemocritosArch.IDMA_CTRL_ADDR_START, size=DemocritosArch.IDMA_CTRL_SIZE, rm_base=True)
 
-        # idma_be.cpp:51 classifies a transfer as local purely by
-        # [loc_base, loc_base+loc_size), so this window has to BE the L1 window.
-        # It used to be tid*L1_TILE_OFFSET, which described a different address
-        # space from the one the core uses: every tile but tile 0 then treated
-        # its own L1 as remote and sent the transfer out over AXI instead of
-        # into the local TCDM, and tile 0's window was itself short of L1 by the
-        # 0x1FEE0 the stack occupies. Copied verbatim from magia_v2/tile.py:196;
-        # only the mesh could expose it, because tid=0 hides all of it.
         # Bind iDMA0
-        # Out the WIDE port, not tile_xbar. tile_xbar is 4 bytes/cycle and its
-        # L2 route leaves through the 4-byte narrow NoC; measured on that path
-        # the DMA ran at exactly 4.0 B/cycle and the weight transfers were 99%
-        # of the psin runtime. The wide network is what exists for DMA traffic;
-        # magia_v2/tile.py:342 binds it the same way.
+        # Both iDMAs leave through the wide port: tile_xbar is 4 bytes/cycle and
+        # its only L2 route is the narrow NoC. magia_v2/tile.py binds its iDMAs the
+        # same way.
         idma0.o_AXI(self.__i_WIDE_OUTPUT())
         # DmaInterleaver, not the core-side L1_interleaver: the latter is
         # interleaved every 4 bytes, so a DMA bound to it lands one eighth of
-        # the bytes it was asked for. magia_v2/tile.py:343 binds the same way.
+        # the bytes it was asked for. magia_v2/tile.py binds the TCDM side the same way.
         idma0.o_TCDM(l1_tcdm.i_DMA_INPUT(1))
         idma_mm_ctrl.o_OFFLOAD_iDMA0_AXI2OBI(idma0.i_OFFLOAD())
         idma0.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA0_AXI2OBI())
 
         # Bind iDMA1
-        # Out the WIDE port, not tile_xbar. tile_xbar is 4 bytes/cycle and its
-        # L2 route leaves through the 4-byte narrow NoC; measured on that path
-        # the DMA ran at exactly 4.0 B/cycle and the weight transfers were 99%
-        # of the psin runtime. The wide network is what exists for DMA traffic;
-        # magia_v2/tile.py:342 binds it the same way.
         idma1.o_AXI(self.__i_WIDE_OUTPUT())
         idma1.o_TCDM(l1_tcdm.i_DMA_INPUT(2))
         idma_mm_ctrl.o_OFFLOAD_iDMA1_OBI2AXI(idma1.i_OFFLOAD())

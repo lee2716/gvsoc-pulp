@@ -25,7 +25,8 @@
 
 Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
 {
-    // Registered first so the systree check below can report through it.
+    // Registered first: every message this component emits, here and in
+    // reset(), goes through it.
     this->traces.new_trace("trace", &this->trace);
 
     // VCD events. Names become <component path>.<leaf> in the dump, which is what
@@ -33,10 +34,12 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->traces.new_trace_event("state", &this->state_event, 8);
     this->traces.new_trace_event("busy", &this->busy_event, 1);
     this->traces.new_trace_event("job_id", &this->job_event, 32);
+    this->traces.new_trace_event("outer_port/next_free", &this->outer_port.free_event, 32);
 
     // Architecture, from the systree. Dimc() in dimc.py writes every property.
     this->num_macros        = (uint32_t)this->get_js_config()->get_child_int("num_macros");
     this->inner_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("inner_port_bytes");
+    this->outer_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("outer_port_bytes");
     this->nb_inner_blocks   = (uint32_t)this->get_js_config()->get_child_int("nb_inner_blocks");
     this->last_kb_src     = 0xFFFFFFFF;   // no resident weights yet
     // HWPE slave port
@@ -105,9 +108,11 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->job_geom[0].psin_rows        = 0;
     this->state.set(DIMC_IDLE);
 
+    this->outer_port.configure(this->outer_port_bytes);
+
     this->trace.msg(vp::TraceLevel::WARNING,
-        "DIMC systree config: num_macros=%u l1bw=%u nb_blocks=%u blocks=%u\n",
-        this->num_macros, this->inner_port_bytes,
+        "DIMC systree config: num_macros=%u inner_bw=%u outer_bw=%u nb_blocks=%u blocks=%u\n",
+        this->num_macros, this->inner_port_bytes, this->outer_port_bytes,
         this->nb_inner_blocks, (uint32_t)this->inner_blocks.size());
 }
 
@@ -119,17 +124,18 @@ void Dimc_HWPE::reset(bool active)
         // trace_file is only valid once the trace engine has started, so this
         // check cannot live in the constructor.
         if (this->num_macros == 0 || this->inner_port_bytes == 0 ||
-            this->nb_inner_blocks == 0) {
+            this->outer_port_bytes == 0 || this->nb_inner_blocks == 0) {
             // trace.fatal writes to stdout and ends in abort(), which does not
             // flush stdio, so its message is lost whenever stdout is a pipe.
             // stderr is unbuffered and always reaches the user.
             fprintf(stderr,
                     "DIMC systree incomplete: num_macros=%u inner_port_bytes=%u "
-                    "nb_inner_blocks=%u (all must be non-zero)\n",
+                    "outer_port_bytes=%u nb_inner_blocks=%u (all must be non-zero)\n",
                     this->num_macros, this->inner_port_bytes,
-                    this->nb_inner_blocks);
+                    this->outer_port_bytes, this->nb_inner_blocks);
             this->trace.fatal("DIMC systree incomplete\n");
         }
+        this->outer_port.reset();
         for (uint32_t i = 0; i < N_CFG_REGS; i++) {
             this->register_file[i] = 0x0;
         }
@@ -241,14 +247,13 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                 return vp::IO_REQ_INVALID;
             }
             if (address >= DIMC_HWPE_JOB_BASE) {
-                // Job-dependent write -> the live bundle. No queue slot is
-                // chosen here; a commit is what snapshots this into one.
-                // Straight into the live bundle. No slot is chosen here and
-                // none can be full: the queue only fills at COMMIT, and it is
-                // ACQUIRE that reports that. Writes that precede a commit
-                // simply update what the next commit will snapshot -- which is
-                // why a value written once (a length, a stride) still reaches
-                // every later job without being rewritten.
+                // Job-dependent write, straight into the live bundle. No slot
+                // is chosen here and none can be full: the queue only fills at
+                // COMMIT, and it is ACQUIRE that reports that. Writes that
+                // precede a commit simply update what the next commit will
+                // snapshot -- which is why a value written once (a length, a
+                // stride) still reaches every later job without being
+                // rewritten.
                 _this->live_regs[(address - DIMC_HWPE_JOB_BASE) >> 2] = data;
             } else {
                 // Mandatory / generic (job-independent) registers stay unbanked.
@@ -330,14 +335,14 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
         // ACQUIRE: on read, start a job offload and lock the controller.
         // Reserving a context is the lock: job-dependent writes are routed into
         // it and no other offload can claim it until commit_trigger (0x0/0x1)
-        // or soft_clear releases it. Returns 0xFFFFFFFF only when all contexts
-        // are busy, so with DIMC_NB_CONTEXT=2 a second job can be queued.
+        // or soft_clear releases it. Returns 0xFFFFFFFF only when every
+        // context is busy, so up to DIMC_NB_CONTEXT jobs can be offloaded
+        // before software has to wait.
         if (address == DIMC_HWPE_ACQ) {
-            // hwpe_ctrl_target.sv:194-195 defines two distinct codes, and the
-            // difference matters: -1 is "the queue is full, back off", -2 is
-            // "you already hold an uncommitted job". The model used to return
-            // the same id on a repeated ACQUIRE, which silently made the second
-            // read look like a fresh acquisition.
+            // hwpe_ctrl_target.sv defines two distinct codes and the difference
+            // matters: -1 is "the queue is full, back off", -2 is "you already
+            // hold an uncommitted job". Returning the same id for both makes a
+            // repeated ACQUIRE look like a fresh acquisition.
             if (_this->acquired_ctx >= 0) {
                 *(uint32_t *)req->get_data() = 0xFFFFFFFEu;
             } else if ((_this->acquired_ctx = _this->ctx_alloc()) < 0) {

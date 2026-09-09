@@ -19,20 +19,22 @@ import gvsoc.systree
 
 class Dimc(gvsoc.systree.Component):
 
-    # One D-tile DIMC: nb_inner_blocks inner blocks of macros_per_block macros,
-    # each reaching L1 through an inner port. Access latency belongs to the L1
-    # bank and the crossbar, which is where magia_v2 puts RedMulE's, so this
-    # model adds none of its own.
-    # The three parameters that decide the geometry carry no default: the tile
-    # that instantiates this model has to state them, the way
-    # magia_v2/tile.py:199 states RedMulE's. A default here is a specification
-    # nobody wrote down.
+    # One D-tile DIMC: nb_inner_blocks inner blocks of macros_per_block macros.
+    # Each block reaches memory through its own inner port, and every block's
+    # beats then pass through one shared outer port. Access latency belongs to
+    # the L1 bank and the crossbar, which is where magia_v2 puts RedMulE's; the
+    # only delay this model adds of its own is the wait when more beats want the
+    # shared outer port in a cycle than its bandwidth covers.
+    # The four parameters that decide the geometry carry no default: the tile
+    # that instantiates this model has to state them, the way magia_v2/tile.py
+    # states RedMulE's. A default here is a specification nobody wrote down.
     def __init__(self,
                  parent: gvsoc.systree.Component,
                  name: str,
                  macros_per_block: int,
                  nb_inner_blocks: int,
                  inner_port_bytes: int,
+                 outer_port_bytes: int,
                  ):
         super().__init__(parent, name)
 
@@ -41,6 +43,7 @@ class Dimc(gvsoc.systree.Component):
         self.add_properties({
             "num_macros":        macros_per_block,
             "inner_port_bytes":  inner_port_bytes,
+            "outer_port_bytes":  outer_port_bytes,
             "nb_inner_blocks":   nb_inner_blocks,
         })
 
