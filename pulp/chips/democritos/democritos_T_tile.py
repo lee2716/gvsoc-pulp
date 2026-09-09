@@ -210,6 +210,15 @@ class Democritos_T_Tile(gvsoc.systree.Component):
                                base=DemocritosArch.L1_ADDR_START + (tile_id*DemocritosArch.L1_TILE_OFFSET),
                                size=DemocritosArch.L1_SIZE, rm_base=False)
 
+        # Bind tile Xbar so that it can communicate with the remote tiles' L1
+        # over the NoC. The tile Xbar's other routes reach the OBI Xbar and L2
+        # only, so an off-tile L1 address needs this one to leave the tile.
+        for tile_id in range(DemocritosArch.NB_CLUSTERS):
+            if tile_id != tid: # skip yourself
+                tile_xbar.o_MAP(self.__i_NARROW_OUTPUT(), name=f'axi-to-off-tile-{tile_id}-l1-mem',
+                                base=DemocritosArch.L1_ADDR_START + (tile_id*DemocritosArch.L1_TILE_OFFSET),
+                                size=DemocritosArch.L1_SIZE, rm_base=False)
+
         # Bind tile Xbar so that it can communicate with OBI Xbar L1 mem
         tile_xbar.o_MAP(obi_xbar.i_INPUT(), name='axi2obi-l1-mem',
                         base=DemocritosArch.L1_ADDR_START + (tile_id*DemocritosArch.L1_TILE_OFFSET),
@@ -291,9 +300,11 @@ class Democritos_T_Tile(gvsoc.systree.Component):
         # its only L2 route is the narrow NoC. magia_v2/tile.py binds its iDMAs the
         # same way.
         idma0.o_AXI(self.__i_WIDE_OUTPUT())
-        # DmaInterleaver, not the core-side L1_interleaver: the latter is
-        # interleaved every 4 bytes, so a DMA bound to it lands one eighth of
-        # the bytes it was asked for. magia_v2/tile.py binds the TCDM side the same way.
+        # DmaInterleaver, not the core-side L1_interleaver: that one derives a
+        # single bank from the request's base address and forwards the whole
+        # request there, which is right for a core's one word and wrong for a
+        # DMA line, whose eight words belong in eight banks.
+        # magia_v2/tile.py binds the TCDM side the same way.
         idma0.o_TCDM(l1_tcdm.i_DMA_INPUT(1))
         idma_mm_ctrl.o_OFFLOAD_iDMA0_AXI2OBI(idma0.i_OFFLOAD())
         idma0.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA0_AXI2OBI())
