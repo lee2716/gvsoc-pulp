@@ -98,7 +98,8 @@ void Dimc_Macro::write_fb(const uint8_t *src)
     std::memcpy(this->FB, src, DIMC_MACRO_FB_EW);
 }
 
-// One 32-bit partial sum, for the row the next compute trigger will select.
+// One 32-bit partial sum, stored against the row it belongs to. compute_PP()
+// picks it up when that row is selected, and only while PSIN_EN is set.
 void Dimc_Macro::write_psin_row(int row, const uint8_t *src)
 {
     if (row < 0 || row >= DIMC_MACRO_KB_LEN) return;
@@ -107,7 +108,8 @@ void Dimc_Macro::write_psin_row(int row, const uint8_t *src)
 
 int32_t Dimc_Macro::compute_PP(int row_sel)
 {
-    // compute_mask is thermometric: it masks off that many bits from the top.
+    // compute_mask is a COUNT, not a bit pattern: setting it to x masks off the
+    // x most-significant bits of the 1024-bit row (spatz_dimc.sv).
     uint32_t valid_bits = 1024u - (uint32_t)this->compute_mask;
     if (valid_bits > 1024u) valid_bits = 0;
     uint32_t valid_bytes = valid_bits / 8u;

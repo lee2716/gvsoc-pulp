@@ -59,7 +59,7 @@ class DemocritosArch:
     L1_TILE_OFFSET          = 0x0010_0000
     L2_ADDR_START           = 0xC000_0000
     # Last offset, not a byte count: TEST_END_ADDR_START below is L2_ADDR_END + 1,
-    # and a-tile_test/kernel/crt0.S:76 hard-codes that address as 0xCCFF_0000.
+    # and a-tile_test/kernel/crt0.S hard-codes that address as 0xCCFF_0000.
     # So this value is pinned. Anything slicing L2 must use the span L2_SIZE + 1
     # and round each slice down to a page -- see DEMOCRITOS_L2_SLICE_BYTES.
     L2_SIZE                 = 0x0CFE_FFFF
@@ -100,14 +100,15 @@ class DemocritosArch:
     #
     # Only square meshes work: democritos_soc.py's FractalSync tree takes the
     # root through a branch that needs a full level below it, and a 4x2 leaves
-    # that level empty (KeyError on fsync_center_v). 2x2 and 4x4 are the
-    # verified sizes.
+    # that level empty (KeyError on fsync_center_v). Keep N_TILES_X equal to
+    # N_TILES_Y.
     N_TILES_X           = int(os.environ.get('DEMOCRITOS_N_TILES_X', 2))
     N_TILES_Y           = int(os.environ.get('DEMOCRITOS_N_TILES_Y', 2))
     NB_CLUSTERS         = N_TILES_X*N_TILES_Y # to be removed when we'll use the DemocritosTree properties instead of hardcoding the number of clusters in the components
     # Which accelerator each mesh position carries, one character per position
-    # indexed by tile id: 'd' DIMC tile, 'a' A-tile with the PCM, 'v' D-tile
-    # plus a Snitch+Spatz vector core, 't' RedMulE tile. Set
+    # indexed by tile id: 'd' DIMC tile, 'a' A-tile with the PCM, 'v' a tile
+    # whose accelerator is replaced by a Snitch+Spatz vector core, 't' RedMulE
+    # tile. Set
     # DEMOCRITOS_TILE_TYPES to select a mesh without editing this file, for
     # example 'vvvv' for four Spatz tiles or 'ttttvvvv' for four RedMulE tiles
     # feeding four Spatz tiles.
@@ -135,15 +136,14 @@ class DemocritosDSE:
     TILE_AXI_XBAR_SYNC          = False
     TILE_OBI_XBAR_LATENCY       = 2
     TILE_OBI_XBAR_SYNC          = True
-    # AXI transactions the iDMA keeps in flight. A transfer's duration is
-    # inversely proportional to this up to 8 and rises again at 16, so 8 is the
-    # setting that runs fastest here. The RTL parameter it stands for is
-    # iDMA_NumAxInFlight = 16 (magia_tile_pkg.sv:353).
     # Transfers the front end can queue to the mid end. RTL:
-    # iDMA_JobFifoDepth = 16 (magia_tile_pkg.sv:365), the depth of the
-    # stream_fifo between front and mid end (idma_axi_obi_transfer_ch.sv:158).
+    # iDMA_JobFifoDepth = 16 (magia_tile_pkg.sv), the depth of the stream_fifo
+    # between front and mid end (idma_axi_obi_transfer_ch.sv).
     TILE_IDMA0_JOBFIFO_SIZE     = 16
     TILE_IDMA1_JOBFIFO_SIZE     = 16
+    # AXI transactions the iDMA keeps in flight, standing in for
+    # iDMA_NumAxInFlight = 16 (magia_tile_pkg.sv). magia_v2/arch.py sets its own
+    # burst_queue_size to 2; this platform runs 8.
     TILE_IDMA0_BQUEUE_SIZE      = 8
     TILE_IDMA0_B_SIZE           = 32
     TILE_IDMA1_BQUEUE_SIZE      = 8

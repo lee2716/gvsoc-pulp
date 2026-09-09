@@ -22,10 +22,14 @@
 #define DIMC_HWPE_BASE   0x0
 
 /* ================= Mandatory control block @ 0x00 =================
- * Standard HWPE control interface (hwpe-ctrl). hwpe_ctrl_regif_example.rdl puts
- * `autotrigger` at 0x08; this model exposes FINISHED there instead.
- * 0x18/0x1C are reserved; 0x18 is also the command-vs-config dispatch boundary
- * in hwpe_slave().
+ * Standard HWPE control interface (hwpe-ctrl), at the same offsets as the PCM
+ * wrapper. The block split -- control @ 0x00, job-independent @ 0x20,
+ * job-dependent @ 0x40 -- is the one hwpe_ctrl_regif_example.rdl defines. That
+ * map leaves 0x08, 0x18 and 0x1C reserved; like PCM, this model puts
+ * finished_jobs at 0x08, and neither 0x18 nor 0x1C carries a register.
+ * 0x18 does serve as the dispatch boundary on hwpe_slave()'s WRITE path: an
+ * address at or below it is a command decoded by a switch, an address above it
+ * is a register write. Reads take no such split.
  */
 #define DIMC_HWPE_TRIG               (DIMC_HWPE_BASE + 0x00)  /* commit_trigger */
 #define DIMC_HWPE_ACQ                (DIMC_HWPE_BASE + 0x04)  /* acquire        */
@@ -45,11 +49,10 @@
 #define DIMC_HWPE_COMPUTE_MASK       (DIMC_HWPE_BASE + 0x2C)  /* bits masked off */
 #define DIMC_HWPE_NUM_MACROS         (DIMC_HWPE_BASE + 0x30)
 #define DIMC_HWPE_SEL_DIMC           (DIMC_HWPE_BASE + 0x34)
-/* autotrigger (hwpe-ctrl semantics, RDL puts it at 0x08):
+/* autotrigger_n, this model's own register -- hwpe-ctrl defines no equivalent:
  *   0 (default) = automatically start the next queued job when one finishes
  *   1           = wait for an explicit trigger (commit_trigger 0x0 / 0x2)
- * It lives here because 0x08 exposes `finished`. Job-INDEPENDENT, so it is not
- * part of the bundle a commit snapshots. */
+ * Job-INDEPENDENT, so it is not part of the bundle a commit snapshots. */
 #define DIMC_HWPE_AUTOTRIGGER_N      (DIMC_HWPE_BASE + 0x38)
 
 /* Output accumulator, one per inner block (rtl/accumulator.sv via cleopatra.sv).
@@ -68,7 +71,7 @@
  * whole thing into a job FIFO of depth DIMC_NB_CONTEXT, so several jobs can be
  * offloaded while one runs and a value only has to be rewritten when it
  * changes. A queue slot is not addressable: ACQUIRE returns a job id, never a
- * slot index (hwpe_ctrl_target.sv a52dc9cd, rtl/hwpe_ctrl_target.sv:49,73).
+ * slot index (hwpe_ctrl_target.sv).
  */
 #define DIMC_NB_CONTEXT              8
 #define DIMC_HWPE_JOB_BASE           (DIMC_HWPE_BASE + 0x40)
@@ -97,16 +100,14 @@
 /* Streamer bandwidth and kernel reuse are not MMIO: bandwidth is fixed in the
  * systree, and reuse is detected in the FSM by comparing the KB source address
  * to the previous job's. */
-/* 0x88 is free. It held ACCUM_EN, which drove an accumulator per kernel row
- * inside the macro; the RTL has no such register, so a K chain goes through
- * PSIN_EN below instead. Left unused rather than reassigned, since the register
- * numbers are shared with the HAL by hand. */
+/* 0x88 carries no register. Left unassigned rather than reused, because these
+ * offsets and the HAL's archi header are kept in step by hand. */
 
 /* Per-row partial-sum input, the model of the RTL's ADDIN. With PSIN_EN set the
  * engine streams one 32-bit psum per kernel row from PSIN_SRC_ADDR and adds it to
  * that row's dot product; with it clear the per-job PSIN scalar is used instead
  * and nothing extra is loaded. This is what lets a K-chain keep several partial
- * sums alive at once, so weights can be reused across a batch. */
+ * sums alive at once, one per kernel row. */
 #define DIMC_HWPE_PSIN_EN            (DIMC_HWPE_BASE + 0x94)
 #define DIMC_HWPE_JOB_PSIN_SRC_ADDR  (DIMC_HWPE_BASE + 0x98)
 

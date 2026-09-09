@@ -74,14 +74,12 @@ void Dimc_HWPE_Streamer::configure(
     );
 }
 
-// tot_len is a BYTE count. This bound is looser than the engine's beat_total,
-// so it never ends a phase early: TOTAL_LENGTH and NUM_MACROS come from the same
-// num_jobs, and the engine only clamps num_active downwards.
+// tot_len is a BYTE count. The engine issues beat widths that sum to exactly
+// this span -- each is clamped to what is left of the buffer -- so this turns
+// true on the same beat that exhausts the engine's own beat_total. It is the
+// streamer's own guard, not the bound that ends a phase.
 bool Dimc_HWPE_Streamer::is_done() { return this->pos >= this->tot_len; }
 
-// Issue one beat of at most inner_port_bytes and return the latency the memory
-// reported. The caller advances one beat per cycle and tracks the in-flight
-// response itself, which is what lets several accesses overlap.
 // Where the next beat reads or writes. `pos` counts bytes consumed, which is
 // also the address offset while the walk is linear.
 //
@@ -112,6 +110,9 @@ uint32_t Dimc_HWPE_Streamer::walk_addr() const {
          + off_in_run;
 }
 
+// Issue one beat of at most inner_port_bytes and return the latency the memory
+// reported. The caller advances one beat per cycle and tracks the in-flight
+// response itself, which is what lets several accesses overlap.
 int Dimc_HWPE_Streamer::issue_beat(int width, void* buf) {
     uint32_t base = this->walk_addr();
 

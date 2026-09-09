@@ -24,12 +24,13 @@
 #define DIMC_MACRO_KB_LEN   32
 #define DIMC_MACRO_KB_EW    128
 #define DIMC_MACRO_FB_EW    128
-// Pipeline depth: 4 cycles per spatz_DIMC.sv (1 result/cycle throughput after fill)
+// Pipeline depth: 4 stages, matching pipeline_mode[0:3] in spatz_dimc.sv
+// (1 result/cycle throughput once the pipe is full)
 #define DIMC_MACRO_LATENCY  4
-// Kernel, feature and partial-sum storage is single-banked, as in the macro:
-// spatz_DIMC.sv declares one kernel_mem [31:0] and one feature_buf, and the two
-// low bits of RA/WA/FA select one of a row's four 256-bit sections rather than a
-// bank. A job's fill therefore cannot overlap the previous job's compute.
+// Kernel and feature storage is single-banked, as in the macro: spatz_dimc.sv
+// declares one kernel_mem [31:0] and one feature_buf, and the two low bits of
+// RA/WA/FA select one of a row's four 256-bit sections rather than a bank. A
+// job's fill therefore cannot overlap the previous job's compute.
 
 struct DimcPipeEntry {
     int32_t  psout;
@@ -82,10 +83,11 @@ class Dimc_Macro {
         uint8_t  ci           = DIMC_CI_8BIT;
         uint8_t  sign_8b      = DIMC_SIGN_UU;
         uint16_t compute_mask = 0;   // bits masked off the 1024-bit row
-        // Per-row partial-sum input, mirroring the RTL's ADDIN, which is sampled
-        // together with the row address on every compute trigger
-        // (spatz_DIMC.sv:224). psin_scalar is the legacy per-job constant and is
-        // what compute_PP uses while psin_rows is off.
+        // Per-row partial-sum input, mirroring the RTL's ADDIN, which is
+        // sampled together with the row address on every compute trigger
+        // (spatz_dimc.sv) and is a port there, not a stored array. psin_scalar
+        // is the per-job constant, and is what compute_PP uses while psin_rows
+        // is off.
         int32_t  psin_scalar = 0;
         uint8_t  psin_rows   = 0;                        // 1 = take psin from psin_buf
         int32_t  psin_buf[DIMC_MACRO_KB_LEN] = {0};
@@ -98,19 +100,19 @@ class Dimc_Macro {
         int32_t  psout = 0;
         uint8_t  sout  = 0;   // computed by final_compute, never wired out
 
-        // Which in-flight job this macro is working on, and the kernel base it
-        // last pulled in. Per macro because once two jobs overlap the macros
-        // are on different ones, and a single engine-wide last_kb_src would be
-        // overwritten by whichever macro filled most recently -- every reuse
-        // would then miss and reload weights that were already resident.
-
-        // "the operands for the job I am executing have landed". A flag of its
-        // own rather than a comparison on the fill cursor's beat counters,
-        // which belong to the block and are reset per phase.
+        // Set when the operands for the job this macro is executing have
+        // landed. A flag of its own rather than a comparison on the fill
+        // cursor's beat counters, which belong to the block and are reset per
+        // phase.
         bool     exec_ready = false;
         // Job-relative timestamps, instrumentation only.
         uint32_t trace_fill_start = 0, trace_fill_done = 0;
         uint32_t trace_compute_start = 0, trace_compute_end   = 0;
+        // The kernel base this macro last pulled in. Per macro, not per engine:
+        // once two jobs overlap the macros are on different ones, and a single
+        // engine-wide value would be overwritten by whichever macro filled most
+        // recently -- every reuse would then miss and reload weights that were
+        // already resident.
         uint32_t last_kb_src = 0xFFFFFFFFu;
         bool     skip_kb    = false;
         // Cycle its last preload beat lands. A macro may not compute before it:

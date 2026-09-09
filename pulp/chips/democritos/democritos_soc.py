@@ -61,8 +61,10 @@ class DemocritosSoc(gvsoc.systree.Component):
                                              frequency=DemocritosArch.TILE_CLK_FREQ)
         clock.o_CLOCK(self.i_CLOCK())
 
-        # Create Tiles. All three classes expose the same ports to the SoC, so
-        # the wiring below does not branch on the type.
+        # Create Tiles. Every tile class exposes the same SoC-facing ports, so
+        # the wiring below does not branch on the type -- with one exception,
+        # the wide NoC port, which the A-tile does not have and which is
+        # therefore wired behind a hasattr guard.
         types = DemocritosArch.TILE_TYPES
         if len(types) != DemocritosArch.NB_CLUSTERS:
             raise RuntimeError(
@@ -82,7 +84,7 @@ class DemocritosSoc(gvsoc.systree.Component):
                 self, f'democritos-{t.upper()}-tile-{id}', parser, id))
 
         # End-of-simulation. crt0's exit sequence has every tile store a halfword
-        # at TEST_END_ADDR_START + 2*mhartid, which the D-tile maps out through
+        # at TEST_END_ADDR_START + 2*mhartid, which each tile maps out through
         # its killer port. Waiting for all tiles keeps an early finisher from
         # ending the run while the others are still printing.
         killer = KillModule(self, 'kill-module',
@@ -95,15 +97,13 @@ class DemocritosSoc(gvsoc.systree.Component):
         # L2 memory
         # One L2 slice per tile, on a column at each side of the mesh. With a
         # single column every tile on a row shares that column's network
-        # interface, and the sharing costs more than the extra hop does:
-        # measured 36,281 cycles for a tile one hop away against 31,672 for the
-        # same work with the port to itself, and only 38,874 for a tile two hops
-        # away. Two columns put every tile one hop from a slice of its own.
+        # interface; two columns put every tile one hop from a slice of its
+        # own.
         DEMOCRITOS_L2_SLICES = 2 * DemocritosArch.N_TILES_Y
         # L2_SIZE is a last offset, so the span is L2_SIZE + 1; round the slice
         # down to a page so that every slice base is page aligned, not just the
-        # first. Dividing L2_SIZE directly leaves every later base on an odd
-        # address, which cost tile 3 44% in the four-tile mesh.
+        # first. L2_SIZE itself is odd, so dividing it directly would leave
+        # every later base on an odd address.
         DEMOCRITOS_L2_SLICE = ((DemocritosArch.L2_SIZE + 1) // DEMOCRITOS_L2_SLICES) & ~0xFFF
         l2_mem:List[memory.Memory] = []
         for id in range(0, DEMOCRITOS_L2_SLICES):
