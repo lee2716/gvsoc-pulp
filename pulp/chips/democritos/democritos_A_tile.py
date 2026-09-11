@@ -125,6 +125,33 @@ class Democritos_A_Tile(gvsoc.systree.Component):
         # Fsync mm controller
         fsync_mm_ctrl = FSync_mm_ctrl(self,f'tile-{tid}-fs-ctrl-mm')
 
+        # Event unit, the same block the other tiles carry (magia_v2 pattern).
+        # The FractalSync and iDMA controllers raise their done interrupts into
+        # it unconditionally, so it has to exist even while software polls: an
+        # irq port bound to nothing is a null call in the model.
+        self.add_properties({
+            "event_unit": {
+                "version": "4",
+                "mapping": {
+                    "base":          DemocritosArch.EVENT_UNIT_ADDR_START,
+                    "size":          DemocritosArch.EVENT_UNIT_SIZE,
+                    "remove_offset": DemocritosArch.EVENT_UNIT_ADDR_START,
+                },
+                "config": {
+                    "nb_core": 1,                      # A-tile has one CV32 core
+                    "properties": {
+                        "dispatch":  {"size": 8},
+                        "mutex":     {"nb_mutexes": 0},
+                        "barriers":  {"nb_barriers": 0},
+                        "soc_event": {"nb_fifo_events": 8, "fifo_event": 8},
+                        "events":    {"dispatch": 8, "mutex": 0, "barrier": 0},
+                    },
+                },
+            }
+        })
+        event_unit = Event_unit(self, f'tile-{tid}-event-unit',
+                                self.get_property('event_unit/config'))
+
         # UART
         stdout = Stdout(self, f'tile-{tid}-stdout', max_cluster=DemocritosArch.NB_CLUSTERS, max_core_per_cluster=1, user_set_core_id=0, user_set_cluster_id=tid)
 
@@ -209,6 +236,25 @@ class Democritos_A_Tile(gvsoc.systree.Component):
 
         # Bind: iDMA controller
         obi_xbar.o_MAP(idma_mm_ctrl.i_INPUT(), name=f'iDMA-ctrl-mm-{tid}-mem', base=DemocritosArch.IDMA_CTRL_ADDR_START, size=DemocritosArch.IDMA_CTRL_SIZE, rm_base=True)
+
+        # Bind: FractalSync controller. The controller is wired into the sync
+        # tree below; this window is how the core reaches its registers. Same
+        # window the other tiles map.
+        obi_xbar.o_MAP(fsync_mm_ctrl.i_INPUT(), name=f'fs-ctrl-mm-{tid}-mem',
+                       base=DemocritosArch.FSYNC_CTRL_ADDR_START,
+                       size=DemocritosArch.FSYNC_CTRL_SIZE, rm_base=True)
+
+        # Bind: event unit. Register window on the OBI xbar, the irq handshake
+        # with the core, and the controllers' done interrupts, on the same
+        # event numbers the other tiles use.
+        obi_xbar.add_mapping('event_unit', **self.get_property('event_unit/mapping'))
+        self.bind(obi_xbar, 'event_unit', event_unit, 'input')
+        self.bind(event_unit, 'clock_0', core_cv32, 'clock')
+        self.bind(core_cv32, 'irq_ack', event_unit, 'irq_ack_0')
+        self.bind(event_unit, 'irq_req_0', core_cv32, 'irq_req')
+        self.bind(fsync_mm_ctrl, 'fsync_done_irq', event_unit, 'in_event_24_pe_0')
+        self.bind(idma_mm_ctrl, 'idma0_done_irq', event_unit, 'in_event_2_pe_0')
+        self.bind(idma_mm_ctrl, 'idma1_done_irq', event_unit, 'in_event_3_pe_0')
 
         # Bind iDMA0
         idma0.o_AXI(tile_xbar.i_INPUT())
