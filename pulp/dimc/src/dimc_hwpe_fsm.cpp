@@ -549,6 +549,7 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
     this->acc_beats++;
     this->acc_beat_lat += (uint64_t)(lat < 1 ? 1 : lat);
     blk.loaded_this_cycle = true;
+    blk.macro_loaded_this_cycle[macro] = 1;
     this->outer_port.request((int64_t)this->fsm_timestamp, w);
     this->beat_issued(blk, cursor, lat);
 }
@@ -588,6 +589,7 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk)
                 mac.trace_compute_end = (uint32_t)(this->fsm_timestamp - this->job_start_cycle);
             if (m == 0) blk.rows_event.event((uint8_t *)&mac.rows_issued);
             blk.computed_this_cycle = true;
+            blk.macro_computed_this_cycle[m] = 1;
         }
         mac.tick();
     }
@@ -600,6 +602,11 @@ void Dimc_HWPE::publish_activity(Dimc_InnerBlock &blk)
     blk.load_active_event.event(&ld);
     blk.comp_active_event.event(&cp);
     blk.loaded_this_cycle = blk.computed_this_cycle = false;
+    for (size_t m = 0; m < blk.macro_load_event.size(); m++) {
+        blk.macro_load_event[m].event(&blk.macro_loaded_this_cycle[m]);
+        blk.macro_comp_event[m].event(&blk.macro_computed_this_cycle[m]);
+        blk.macro_loaded_this_cycle[m] = blk.macro_computed_this_cycle[m] = 0;
+    }
 }
 
 void Dimc_HWPE::drain_ready_rows(Dimc_InnerBlock &blk)

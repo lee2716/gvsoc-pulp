@@ -57,6 +57,10 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->inner_blocks.resize(this->nb_inner_blocks);
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
         blk.macros.resize(this->num_macros);
+        blk.macro_load_event.resize(this->num_macros);
+        blk.macro_comp_event.resize(this->num_macros);
+        blk.macro_loaded_this_cycle.assign(this->num_macros, 0);
+        blk.macro_computed_this_cycle.assign(this->num_macros, 0);
         for (uint32_t m = 0; m < this->num_macros; m++) {
             blk.weight_stream.emplace_back(this, false);
             blk.input_stream .emplace_back(this, false);
@@ -75,6 +79,13 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
         this->traces.new_trace_event(pfx + "rows_issued", &this->inner_blocks[b].rows_event,  32);
         this->traces.new_trace_event(pfx + "load_active",  &this->inner_blocks[b].load_active_event, 1);
         this->traces.new_trace_event(pfx + "comp_active",  &this->inner_blocks[b].comp_active_event, 1);
+        for (uint32_t m = 0; m < this->num_macros; m++) {
+            std::string mpfx = pfx + "macro_" + std::to_string(m) + "/";
+            this->traces.new_trace_event(mpfx + "load_active",
+                                         &this->inner_blocks[b].macro_load_event[m], 1);
+            this->traces.new_trace_event(mpfx + "comp_active",
+                                         &this->inner_blocks[b].macro_comp_event[m], 1);
+        }
     }
 
     // Event handlers

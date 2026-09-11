@@ -202,6 +202,16 @@ class Dimc_InnerBlock {
         bool loaded_this_cycle  = false;   // a fill beat issued
         bool computed_this_cycle = false;  // a compute row issued
 
+        // The same two signals per macro. The block-level pair above is the OR
+        // of these, so a job in which the macros fill one after the other shows
+        // one pulse per macro here and a single merged pulse there. Sized in
+        // the constructor beside macros, and registered by address, so nothing
+        // may resize them afterwards.
+        std::vector<vp::Trace> macro_load_event;
+        std::vector<vp::Trace> macro_comp_event;
+        std::vector<uint8_t>   macro_loaded_this_cycle;
+        std::vector<uint8_t>   macro_computed_this_cycle;
+
         // Clear everything the engine tracks for one job. Called from the
         // constructor, from reset(), and at every job start, so the three sites
         // cannot drift apart.
