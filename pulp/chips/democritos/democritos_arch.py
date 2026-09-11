@@ -93,29 +93,34 @@ class DemocritosArch:
     SPATZ_NB_LANES      = 4
     SPATZ_LANE_WIDTH    = 4
     SPATZ_NB_VLSU_PORTS = 4
-    # Mesh size. DEMOCRITOS_N_TILES_X / _Y override them, the way
-    # DEMOCRITOS_TILE_TYPES overrides the tile types below, so a test picks its
-    # mesh without editing the platform. The C side takes the same two numbers
-    # from democritos_archi.h; feed both from one place or they will drift.
+    # The SoC: a 4x4 mesh of sixteen tiles, four of each kind. The C side
+    # carries the same numbers in democritos_archi.h; change both or the
+    # software addresses a mesh that is not there.
     #
-    # Only square meshes work: democritos_soc.py's FractalSync tree takes the
-    # root through a branch that needs a full level below it, and a 4x2 leaves
-    # that level empty (KeyError on fsync_center_v). Keep N_TILES_X equal to
-    # N_TILES_Y.
-    N_TILES_X           = int(os.environ.get('DEMOCRITOS_N_TILES_X', 2))
-    N_TILES_Y           = int(os.environ.get('DEMOCRITOS_N_TILES_Y', 2))
+    # The mesh is square and NB_CLUSTERS a power of two, both required by
+    # democritos_soc.py's FractalSync tree: it is sized by int(log2(NB_CLUSTERS))
+    # and its root branch needs a full level below it.
+    N_TILES_X           = 4
+    N_TILES_Y           = 4
     NB_CLUSTERS         = N_TILES_X*N_TILES_Y # to be removed when we'll use the DemocritosTree properties instead of hardcoding the number of clusters in the components
     # Which accelerator each mesh position carries, one character per position
     # indexed by tile id: 'd' DIMC tile, 'a' A-tile with the PCM, 'v' a tile
     # whose accelerator is replaced by a Snitch+Spatz vector core, 't' RedMulE
-    # tile. Set
-    # DEMOCRITOS_TILE_TYPES to select a mesh without editing this file, for
-    # example 'vvvv' for four Spatz tiles or 'ttttvvvv' for four RedMulE tiles
-    # feeding four Spatz tiles.
-    # Keep NB_CLUSTERS a power of two: democritos_soc.py sizes the FractalSync
-    # tree by int(log2(NB_CLUSTERS)) and under-provisions it silently otherwise.
-    TILE_TYPES          = list(os.environ.get('DEMOCRITOS_TILE_TYPES',
-                                              'd' * NB_CLUSTERS))
+    # tile.
+    #
+    # Each kind fills one quadrant of the quadtree, so a FractalSync level-1
+    # aggregate names exactly the tiles of one kind. The quadrants sit in a
+    # ring D - V - T - A: the pairs that exchange data (the projection tile
+    # feeding either matmul tile, either matmul tile handing S to the Spatz
+    # tiles and taking P back) are orthogonal neighbours, three NoC hops to
+    # the L2 slice between them, and the two pairs that never talk (A with V,
+    # D with T) sit on the diagonals, where the same transfer costs five.
+    #
+    #   d d v v      ids  0  1  2  3
+    #   d d v v           4  5  6  7
+    #   a a t t           8  9 10 11
+    #   a a t t          12 13 14 15
+    TILE_TYPES          = list('ddvvddvvaattaatt')
 
 class DemocritosTree(Tree):
     def __init__(self, parent, name):
