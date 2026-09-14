@@ -29,7 +29,7 @@ from pulp.chips.democritos.hierarchical_cache import Hierarchical_cache
 
 from pulp.chips.democritos.democritos_arch import *
 from pulp.chips.magia_v2.cv32.core import CV32CoreTest
-from pulp.light_redmule.light_redmule import LightRedmule
+from pulp.democritos_redmule.democritos_redmule import DemocritosRedmule
 from pulp.idma.snitch_dma import SnitchDma
 from pulp.chips.magia_v2.fractal_sync_mm_ctrl.fractal_sync_mm_ctrl import FSync_mm_ctrl
 from pulp.chips.magia_v2.idma_mm_ctrl.idma_mm_ctrl import iDMA_mm_ctrl
@@ -128,10 +128,9 @@ class Democritos_T_Tile(gvsoc.systree.Component):
 
         # RedMulE, configured the way magia_v2/tile.py configures LightRedmule, so the
         # two platforms model the same accelerator: an 8x8 array reached through
-        # a 32-byte port. elem_size is the widest element any supported format
-        # needs; light_redmule.cpp narrows it to 1 when a job selects an
-        # 8-bit format.
-        redmule = LightRedmule(self, f'tile-{tid}-redmule',
+        # a 32-byte port, plus a simulation-only integer format. elem_size is
+        # the initial width; each job's format sets its own.
+        redmule = DemocritosRedmule(self, f'tile-{tid}-redmule',
                                tcdm_bank_width  = DemocritosArch.BYTES_PER_WORD,
                                tcdm_bank_number = 8,
                                elem_size        = 2,
