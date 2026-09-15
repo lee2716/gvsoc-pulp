@@ -202,6 +202,11 @@ class Democritos_D_Tile(gvsoc.systree.Component):
                        base=DemocritosArch.L1_ADDR_START,
                        size=DemocritosArch.L1_SIZE, rm_base=False, remove_offset=(tid*DemocritosArch.L1_TILE_OFFSET))
 
+        # The same L1 at this tile's global window, reached from the NoC through the tile Xbar.
+        obi_xbar.o_MAP(l1_tcdm.i_DMA_INPUT(0), name='global-l1-mem',
+                       base=DemocritosArch.L1_ADDR_START + (tid*DemocritosArch.L1_TILE_OFFSET),
+                       size=DemocritosArch.L1_SIZE, rm_base=False, remove_offset=(tid*DemocritosArch.L1_TILE_OFFSET))
+
         # Bind OBI Xbar so that it can communicate with the tile Xbar to get access to remote tiles L1
         for tile_id in range(DemocritosArch.NB_CLUSTERS):
             if tile_id != tid: # skip yourself
@@ -220,7 +225,7 @@ class Democritos_D_Tile(gvsoc.systree.Component):
 
         # Bind tile Xbar so that it can communicate with OBI Xbar L1 mem
         tile_xbar.o_MAP(obi_xbar.i_INPUT(), name='axi2obi-l1-mem',
-                        base=DemocritosArch.L1_ADDR_START + (tile_id*DemocritosArch.L1_TILE_OFFSET),
+                        base=DemocritosArch.L1_ADDR_START + (tid*DemocritosArch.L1_TILE_OFFSET),
                         size=DemocritosArch.L1_SIZE, rm_base=False)
 
         # Bind tile Xbar so that it can communicate with OBI Xbar reserved mem
