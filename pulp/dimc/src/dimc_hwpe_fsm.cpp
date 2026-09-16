@@ -70,8 +70,10 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     );
 
     // Configuration of the feature (FB) input streamer
+    // No slot offset: all macros read the job's one block. The workloads give
+    // every macro the same features; only the kernel buffers are sliced.
     blk.input_stream[m].configure(
-        _this->job_reg(DIMC_HWPE_JOB_FB_SRC_ADDR) + slot * fb_one,     // base_addr
+        _this->job_reg(DIMC_HWPE_JOB_FB_SRC_ADDR),                     // base_addr
         fb_one,                                      // tot_len
         _this->job_reg(DIMC_HWPE_FB_D0_LENGTH),   // d0_len
         _this->job_reg(DIMC_HWPE_FB_D0_STRIDE),   // d0_stride
