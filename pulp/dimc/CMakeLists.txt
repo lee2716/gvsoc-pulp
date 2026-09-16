@@ -7,11 +7,13 @@ set(DIMC_SRCS
     "${MOD_ROOT}/src/dimc_macro.cpp"
     "${MOD_ROOT}/src/dimc_hwpe_streamer.cpp"
     "${MOD_ROOT}/src/dimc_hwpe_fsm.cpp"
+    "${MOD_ROOT}/src/dimc_tracer.cpp"
     )
 set(DIMC_HDRS
     "${MOD_ROOT}/include/dimc_hwpe_archi.hpp"
     "${MOD_ROOT}/include/dimc.hpp"
     "${MOD_ROOT}/include/dimc_macro.hpp"
+    "${MOD_ROOT}/include/dimc_tracer.hpp"
     )
 
 foreach(f IN LISTS DIMC_SRCS DIMC_HDRS)

@@ -33,8 +33,6 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     Dimc_HWPE *_this = (Dimc_HWPE *)__this;
 
-    _this->trace.msg(vp::TraceLevel::WARNING, "DIMC job start\n");
-
     // Clear STATUS at job start so a back-to-back trigger (e.g. reuse without a
     // soft_clear) does not see the previous job's STATUS=1 and exit polling early.
     _this->register_file[DIMC_HWPE_STATUS >> 2] = 0x0;
@@ -149,16 +147,8 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
 
     for (Dimc_InnerBlock &blk : _this->inner_blocks) blk.reset_job_state();
 
-    _this->phase_entry_ts  = _this->fsm_timestamp;
-    _this->job_entry_cycle = (uint64_t)_this->clock.get_cycles();
-    if (_this->jobs_measured != 0)
-        _this->acc_gap_cycles += _this->job_entry_cycle - _this->last_job_end;
     _this->state.set(DIMC_STARTING);
-
-    uint8_t one = 1, st = DIMC_STARTING;
-    _this->busy_event.event(&one);
-    _this->job_event.event((uint8_t *)&_this->running_job);
-    _this->state_event.event(&st);
+    _this->tracer.job_start((uint64_t)_this->clock.get_cycles());
 
     _this->fsm_loop();
 }
@@ -174,10 +164,6 @@ void Dimc_HWPE::fsm_end_handler(vp::Block *__this, vp::ClockEvent *event)
     Dimc_HWPE *_this = (Dimc_HWPE *)__this;
     _this->state.set(DIMC_IDLE);
 
-    uint8_t zero = 0, st = DIMC_IDLE;
-    _this->busy_event.event(&zero);
-    _this->state_event.event(&st);
-
     // Retire the context this job used, then launch whatever is queued behind it.
     if (_this->running_ctx >= 0) _this->ctx_busy[_this->running_ctx] = false;
     _this->running_ctx = -1;
@@ -185,8 +171,8 @@ void Dimc_HWPE::fsm_end_handler(vp::Block *__this, vp::ClockEvent *event)
     _this->finished_jobs++;
     _this->register_file[DIMC_HWPE_STATUS    >> 2] = 0x1;                 // done
     _this->register_file[DIMC_HWPE_FIN_JOBS  >> 2] = _this->finished_jobs;
-    _this->trace.msg(vp::TraceLevel::WARNING,
-        "DIMC job done, STATUS=1, finished_jobs=%u\n", _this->finished_jobs);
+    // Before start_next_job, which reports the next job as queued.
+    _this->tracer.job_end();
     // Standard HWPE completion interrupt (pulse), if the line is wired.
     if (_this->irq.is_bound()) {
         _this->irq.sync(true);
@@ -304,9 +290,6 @@ void Dimc_OuterPort::request(int64_t now, uint64_t bytes)
     int64_t start = now * (int64_t)this->bandwidth_bytes;
     if (this->cursor_bytes > start) start = this->cursor_bytes;
     this->cursor_bytes = start + (int64_t)bytes;
-    uint32_t nf = (uint32_t)((this->cursor_bytes + this->bandwidth_bytes - 1)
-                             / this->bandwidth_bytes);
-    this->free_event.event((uint8_t *)&nf);
 }
 
 // Drop every pending beat whose response is due, and report how many are
@@ -324,15 +307,24 @@ int Dimc_HWPE::fsm()
 
     switch (this->state.get()) {
     case DIMC_STARTING:
-        if (this->preload_iter(&latency)) next_state = DIMC_COMPUTING;
-        break;
-
-    case DIMC_COMPUTING:
-        if (this->compute_iter(&latency)) next_state = DIMC_STORING;
+        // The fill phase also computes and writes back. When it ends with every
+        // result written and acknowledged, the job closes in this cycle rather
+        // than spending another one in STORING with nothing to do.
+        if (this->preload_iter(&latency)) {
+            if (this->store_done()) {
+                this->close_job();
+                next_state = DIMC_FINISHED;
+            } else {
+                next_state = DIMC_STORING;
+            }
+        }
         break;
 
     case DIMC_STORING:
-        if (this->store_iter(&latency)) next_state = DIMC_FINISHED;
+        if (this->store_iter(&latency)) {
+            this->close_job();
+            next_state = DIMC_FINISHED;
+        }
         break;
 
     case DIMC_FINISHED:
@@ -342,18 +334,7 @@ int Dimc_HWPE::fsm()
         this->trace.fatal("DIMC HWPE FSM: UNKNOWN STATE (%d)!\n", this->state.get());
     }
 
-    if (next_state != this->state.get()) {
-        uint64_t spent = this->fsm_timestamp - this->phase_entry_ts;
-        switch (this->state.get()) {
-        case DIMC_STARTING:  this->acc_starting  += spent; break;
-        case DIMC_COMPUTING: this->acc_computing += spent; break;
-        case DIMC_STORING:   this->acc_storing   += spent; break;
-        default: break;
-        }
-        this->phase_entry_ts = this->fsm_timestamp;
-        uint8_t st = (uint8_t)next_state;
-        this->state_event.event(&st);
-    }
+    if (next_state != this->state.get()) this->tracer.state(next_state);
     this->state.set(next_state);
     return latency;
 }
@@ -380,7 +361,6 @@ void Dimc_HWPE::beat_issued(Dimc_InnerBlock &blk, Dimc_InnerBlock::Cursor &curso
     if (lat < 1) lat = 1;
     blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
     cursor.beat_index++;
-    blk.beat_event.event((uint8_t *)&cursor.beat_index);
 }
 
 
@@ -411,7 +391,6 @@ bool Dimc_HWPE::preload_iter(int *latency)
             blk.store.beat_total = g.num_active * g.out_beats;
             blk.out_buf.assign(g.num_active,
                                std::vector<uint8_t>(g.row_count * 4, 0));
-            blk.load_done.assign(g.num_active, 0);
         }
         this->phase_planned = true;
     }
@@ -426,9 +405,9 @@ bool Dimc_HWPE::preload_iter(int *latency)
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         Dimc_InnerBlock &blk = this->inner_blocks[b];
         this->preload_block(blk, b, blk.fill);  // one beat, to the first macro still owing
-        this->compute_indep(blk);     // every macro whose own fill has landed
+        this->compute_indep(blk, b);  // every macro whose own fill has landed
         this->store_block(blk, b);    // and ship whatever has already retired
-        this->publish_activity(blk);
+        this->tracer.end_cycle(b);
     }
 
     this->fsm_timestamp++;
@@ -464,14 +443,18 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
 
     if (cursor.beat_index >= cursor.beat_total ||
         blk_pending.size() >= this->outstanding_depth) {
-        if (cursor.beat_index < cursor.beat_total) this->acc_stall_full++;
+        if (cursor.beat_index < cursor.beat_total)
+            this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
         return;
     }
     // Every block's beats share one outer port, so a block that arrives after
     // the port is booked for this cycle waits. store_block books the same
     // budget, so fills and stores compete for it instead of each getting a
     // beat of their own every cycle.
-    if (this->outer_port.busy_until() > (int64_t)this->fsm_timestamp) return;
+    if (this->outer_port.busy_until() > (int64_t)this->fsm_timestamp) {
+        this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
+        return;
+    }
 
     // Lowest-index macro that still owes beats. Same order the block-wide
     // cursor produced, so this substitution changes nothing by itself.
@@ -480,9 +463,6 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
            cursor.macro_beat_index[macro] >= cursor.macro_beat_total[macro]) macro++;
     if (macro >= this->job_geom[this->fill_slot].num_active) return;
     uint32_t within = cursor.macro_beat_index[macro];
-    if (within == 0)
-        blk.macros[macro].trace_fill_start =
-            (uint32_t)(this->fsm_timestamp - this->job_start_cycle);
     const JobGeom &fg = this->job_geom[this->fill_slot];
     // The feature and the partial sums go first, then the kernel rows. The
     // macro needs the feature vector before it can compute anything, so
@@ -494,6 +474,7 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
     const uint32_t kb_span   = fg.skip_kb ? 0 : fg.row_count * fg.kb_beats_per_row;
     int lat;
     uint32_t w = 0;   // this beat's width, charged to the outer port below
+    bool feature_done = false;
 
     if (within >= ps_span) {                      // ---- kernel beat ----
         uint32_t idx  = within - ps_span;
@@ -519,9 +500,7 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
             blk.macros[macro].fb_ready = true;
             blk.macros[macro].pipe.clear();
             blk.macros[macro].psin_scalar = (int32_t)this->job_reg(DIMC_HWPE_PSIN);
-            // Job-relative, like the makespan it is traced beside.
-            blk.load_done[macro] =
-                (uint32_t)(this->fsm_timestamp + 1 - this->job_start_cycle);
+            feature_done = true;
         }
     } else {                                      // ---- partial-sum beat ----
         uint32_t sub  = within - fb_span;
@@ -539,38 +518,28 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
     }
 
     cursor.macro_beat_index[macro]++;
-    if (cursor.macro_beat_index[macro] >= cursor.macro_beat_total[macro]) {
+    const bool macro_filled = cursor.macro_beat_index[macro] >= cursor.macro_beat_total[macro];
+    if (macro_filled) {
         blk.macros[macro].fill_done_cycle = this->fsm_timestamp + (uint64_t)lat;
-        blk.macros[macro].trace_fill_done =
-            (uint32_t)(this->fsm_timestamp + (uint64_t)lat - this->job_start_cycle);
         // Hand the freshly filled buffers to the compute side.
         Dimc_Macro &mc = blk.macros[macro];
         mc.exec_ready = true;
         mc.last_kb_src = this->job_geom[this->fill_slot].kb_src;   // the fill landed
     }
-    this->acc_beats++;
-    this->acc_beat_lat += (uint64_t)(lat < 1 ? 1 : lat);
-    blk.loaded_this_cycle = true;
-    blk.macro_loaded_this_cycle[macro] = 1;
     this->outer_port.request((int64_t)this->fsm_timestamp, w);
+    this->tracer.outer_port_booked();
     this->beat_issued(blk, cursor, lat);
+    this->tracer.fill_beat(blk_id, macro, within, macro_filled, feature_done, lat);
 }
 
-// ================= COMPUTING =================
-// The rows are issued and drained inside the fill phase now, one macro at a
-// time as each finishes its own beats -- that overlap is the point. Nothing is
-// left to do here, so the state exists only to keep the reported sequence
-// IDLE -> STARTING -> COMPUTING -> STORING -> FINISHED intact for the traces.
-bool Dimc_HWPE::compute_iter(int *latency)
-{
-    *latency = 1;
-    return true;
-}
+// Rows are issued and drained inside the fill phase, one macro at a time as
+// each finishes its own beats -- that overlap is the point -- so there is no
+// compute phase of its own.
 
 // Each macro issues its own rows as soon as its own fill has landed, so a
 // macro still pulling beats through the shared inner port does not hold back a
 // sibling that is ready to compute. That overlap is the inner double buffer.
-void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk)
+void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
 {
     const uint32_t num_active = this->job_geom[this->exec_slot].num_active;
     const uint32_t row_count  = this->job_geom[this->exec_slot].row_count;
@@ -583,31 +552,11 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk)
                    && this->fsm_timestamp >= mac.fill_done_cycle;
         if (filled && mac.rows_issued < row_count && mac.can_accept()) {
             uint32_t row_idx = (this->job_geom[this->exec_slot].row_base + mac.rows_issued) % DIMC_MACRO_KB_LEN;
-            if (mac.rows_issued == 0)
-                mac.trace_compute_start = (uint32_t)(this->fsm_timestamp - this->job_start_cycle);
             mac.issue((int)row_idx, (int)mac.rows_issued, this->job_geom[this->exec_slot].bias);
             mac.rows_issued++;
-            if (mac.rows_issued == row_count)
-                mac.trace_compute_end = (uint32_t)(this->fsm_timestamp - this->job_start_cycle);
-            if (m == 0) blk.rows_event.event((uint8_t *)&mac.rows_issued);
-            blk.computed_this_cycle = true;
-            blk.macro_computed_this_cycle[m] = 1;
+            this->tracer.row_issued(blk_id, m, mac.rows_issued, row_count);
         }
         mac.tick();
-    }
-}
-
-void Dimc_HWPE::publish_activity(Dimc_InnerBlock &blk)
-{
-    uint8_t ld = blk.loaded_this_cycle ? 1 : 0;
-    uint8_t cp = blk.computed_this_cycle ? 1 : 0;
-    blk.load_active_event.event(&ld);
-    blk.comp_active_event.event(&cp);
-    blk.loaded_this_cycle = blk.computed_this_cycle = false;
-    for (size_t m = 0; m < blk.macro_load_event.size(); m++) {
-        blk.macro_load_event[m].event(&blk.macro_loaded_this_cycle[m]);
-        blk.macro_comp_event[m].event(&blk.macro_computed_this_cycle[m]);
-        blk.macro_loaded_this_cycle[m] = blk.macro_computed_this_cycle[m] = 0;
     }
 }
 
@@ -631,9 +580,6 @@ void Dimc_HWPE::drain_ready_rows(Dimc_InnerBlock &blk)
 bool Dimc_HWPE::store_iter(int *latency)
 {
     *latency = 1;
-    const uint32_t num_active = this->job_geom[this->exec_slot].num_active;
-    const uint32_t row_count  = this->job_geom[this->exec_slot].row_count;
-    const uint32_t out_bytes  = row_count * 4;
 
     if (!this->phase_planned) {
         this->phase_planned = true;
@@ -645,9 +591,9 @@ bool Dimc_HWPE::store_iter(int *latency)
         // storing: rows issued near the end of the fill are still in flight and
         // have to retire before their beats can go out. compute_indep issues
         // nothing here -- every row is already issued -- it ticks and drains.
-        this->compute_indep(blk);
+        this->compute_indep(blk, b);
         if (!blk.phase_done) this->store_block(blk, b);
-        this->publish_activity(blk);
+        this->tracer.end_cycle(b);
     }
 
     this->fsm_timestamp++;
@@ -662,73 +608,29 @@ bool Dimc_HWPE::store_iter(int *latency)
 
     if (!all_done) return false;
 
-    // ---- job closed: the elapsed cycles ARE the makespan, for the whole
-    // outer block. No formula is applied on top: every beat was charged as it
-    // issued, against the latency the L1 bank and the crossbar returned.
+    // Every result is out. The elapsed cycles ARE the makespan, for the whole
+    // outer block: every beat was charged as it issued, against the latency the
+    // L1 bank and the crossbar returned. fsm() closes the job.
+    *latency = 1;
+    return true;
+}
+
+bool Dimc_HWPE::store_done() const
+{
+    for (const Dimc_InnerBlock &blk : this->inner_blocks)
+        if (blk.store.beat_index < blk.store.beat_total || !blk.port_pending.empty())
+            return false;
+    return true;
+}
+
+// Each phase advanced the clock one cycle per beat, so job start to here already
+// took the job's whole duration. The completion event fires one cycle later, not
+// after that duration again, which would count it twice.
+void Dimc_HWPE::close_job()
+{
     this->phase_end_reset();
     this->phase_planned = false;
-
-    uint32_t compute_cyc = this->job_geom[this->exec_slot].compute_cyc;
-    bool     skip_kb     = this->job_geom[this->exec_slot].skip_kb;
-    uint64_t finish      = this->fsm_timestamp - this->job_start_cycle;
-
-    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
-        Dimc_InnerBlock &blk = this->inner_blocks[b];
-        for (uint32_t m = 0; m < num_active; m++) {
-            this->trace.msg(vp::TraceLevel::WARNING,
-                "macro[%u]: fill=[%u..%u] comp=[%u..%u] beats=%u skip_kb=%d "
-                "load_done=%u compute=%u OUT=%u finish=%lu\n",
-                b * num_active + m,
-                blk.macros[m].trace_fill_start, blk.macros[m].trace_fill_done,
-                blk.macros[m].trace_compute_start, blk.macros[m].trace_compute_end,
-                blk.fill.macro_beat_total[m], (int)skip_kb,
-                blk.load_done[m], compute_cyc, blk.out_beat_lat_est, finish);
-        }
-        if (blk.out_accum.enable) {
-            this->trace.msg(vp::TraceLevel::WARNING,
-                "block[%u] out_accum: acc=%d n=%u\n",
-                b, blk.out_accum.acc, blk.out_accum.count);
-        }
-    }
-
-    // Each phase advanced the clock one cycle per beat, so job start to here
-    // already took the job's whole duration. The completion event therefore
-    // fires after 1 cycle, not after that duration again, which would count it
-    // twice.
-    *latency = 1;
-    const uint64_t now      = (uint64_t)this->clock.get_cycles();
-    const uint64_t job_busy = now - this->job_entry_cycle;
-    // Analytic minimum: every beat the fill must move through the inner port,
-    // one per cycle, plus the macro pipeline's drain. One block's beats set
-    // the floor, which holds while the blocks' combined demand still fits the
-    // outer port.
-    const uint64_t ideal = (uint64_t)this->job_geom[this->exec_slot].num_active
-                         * this->job_geom[this->exec_slot].beats_per_macro
-                         + DIMC_MACRO_LATENCY;
-    this->acc_busy_cycles  += job_busy;
-    this->acc_ideal_cycles += ideal;
-    this->last_job_end      = now;
-    this->jobs_measured++;
-    this->trace.msg(vp::TraceLevel::WARNING,
-        "DIMC double-buffer: num_active=%u row_count=%u l1bw=%u "
-        "reuse=%u | %lu ---> %lu cyc | period = %lu cyc | ideal = %lu | "
-        "uti = %.3f | totals: jobs=%u busy=%lu gap=%lu uti=%.3f\n",
-        num_active, row_count, this->inner_port_bytes,
-        (unsigned)skip_kb,
-        (unsigned long)this->job_entry_cycle, (unsigned long)now,
-        (unsigned long)job_busy, (unsigned long)ideal,
-        job_busy ? (1.0 * ideal) / (1.0 * job_busy) : 0.0,
-        this->jobs_measured,
-        (unsigned long)this->acc_busy_cycles,
-        (unsigned long)this->acc_gap_cycles,
-        this->acc_busy_cycles
-            ? (1.0 * this->acc_ideal_cycles) / (1.0 * this->acc_busy_cycles) : 0.0);
-    this->trace.msg(vp::TraceLevel::WARNING,
-        "  beats=%lu avg_lat=%.2f stalled_on_depth=%lu (depth=%u)\n",
-        (unsigned long)this->acc_beats,
-        this->acc_beats ? (1.0 * this->acc_beat_lat) / (1.0 * this->acc_beats) : 0.0,
-        (unsigned long)this->acc_stall_full, this->outstanding_depth);
-    return true;
+    this->tracer.job_closed((uint64_t)this->clock.get_cycles());
 }
 
 void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
@@ -738,9 +640,15 @@ void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
     const uint32_t out_bytes  = row_count * 4;
     const uint32_t out_beats  = this->job_geom[this->exec_slot].out_beats;
 
-    if (blk.store.beat_index >= blk.store.beat_total ||
-        blk.port_pending.size() >= this->outstanding_depth) return;
-    if (this->outer_port.busy_until() > (int64_t)this->fsm_timestamp) return;
+    if (blk.store.beat_index >= blk.store.beat_total) return;
+    if (blk.port_pending.size() >= this->outstanding_depth) {
+        this->tracer.store_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
+        return;
+    }
+    if (this->outer_port.busy_until() > (int64_t)this->fsm_timestamp) {
+        this->tracer.store_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
+        return;
+    }
 
     uint32_t macro = blk.store.beat_index / out_beats;
     uint32_t sub   = blk.store.beat_index % out_beats;
@@ -759,10 +667,11 @@ void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
     if (blk.macros[macro].rows_retired < need) return;
 
     int lat = blk.out_stream[macro].issue_beat((int)w, blk.out_buf[macro].data() + off);
-    blk.out_beat_lat_est = (uint32_t)((lat < 1 ? 1 : lat) * (int)out_beats);
+    this->tracer.store_beat(blk_id, macro, lat, out_beats);
 
     if (lat < 1) lat = 1;
     blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
     this->outer_port.request((int64_t)this->fsm_timestamp, w);
+    this->tracer.outer_port_booked();
     blk.store.beat_index++;
 }

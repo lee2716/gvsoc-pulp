@@ -23,18 +23,11 @@
 #include <string>
 #include <dimc.hpp>
 
-Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
+Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(*this)
 {
     // Registered first: every message this component emits, here and in
     // reset(), goes through it.
     this->traces.new_trace("trace", &this->trace);
-
-    // VCD events. Names become <component path>.<leaf> in the dump, which is what
-    // the --include filter of gvsoc2perfetto matches on.
-    this->traces.new_trace_event("state", &this->state_event, 8);
-    this->traces.new_trace_event("busy", &this->busy_event, 1);
-    this->traces.new_trace_event("job_id", &this->job_event, 32);
-    this->traces.new_trace_event("outer_port/next_free", &this->outer_port.free_event, 32);
 
     // Architecture, from the systree. Dimc() in dimc.py writes every property.
     this->num_macros        = (uint32_t)this->get_js_config()->get_child_int("num_macros");
@@ -57,10 +50,6 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
     this->inner_blocks.resize(this->nb_inner_blocks);
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
         blk.macros.resize(this->num_macros);
-        blk.macro_load_event.resize(this->num_macros);
-        blk.macro_comp_event.resize(this->num_macros);
-        blk.macro_loaded_this_cycle.assign(this->num_macros, 0);
-        blk.macro_computed_this_cycle.assign(this->num_macros, 0);
         for (uint32_t m = 0; m < this->num_macros; m++) {
             blk.weight_stream.emplace_back(this, false);
             blk.input_stream .emplace_back(this, false);
@@ -70,23 +59,10 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config)
         blk.reset_job_state();
     }
 
-    // Per-block events. Registered after the vectors are sized --
-    // registering earlier silently loops zero times. The "/" makes gvsoc nest
-    // them, so they appear as dimc.block_0.beat_index and the like.
-    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
-        std::string pfx = "block_" + std::to_string(b) + "/";
-        this->traces.new_trace_event(pfx + "beat_index",  &this->inner_blocks[b].beat_event,  32);
-        this->traces.new_trace_event(pfx + "rows_issued", &this->inner_blocks[b].rows_event,  32);
-        this->traces.new_trace_event(pfx + "load_active",  &this->inner_blocks[b].load_active_event, 1);
-        this->traces.new_trace_event(pfx + "comp_active",  &this->inner_blocks[b].comp_active_event, 1);
-        for (uint32_t m = 0; m < this->num_macros; m++) {
-            std::string mpfx = pfx + "macro_" + std::to_string(m) + "/";
-            this->traces.new_trace_event(mpfx + "load_active",
-                                         &this->inner_blocks[b].macro_load_event[m], 1);
-            this->traces.new_trace_event(mpfx + "comp_active",
-                                         &this->inner_blocks[b].macro_comp_event[m], 1);
-        }
-    }
+    // Every trace signal lives in the tracer, registered once the blocks are
+    // sized.
+    this->tracer.build(*this, this->trace, (uint32_t)this->inner_blocks.size(),
+                       this->num_macros);
 
     // Event handlers
     this->fsm_start_event = this->event_new(&Dimc_HWPE::fsm_start_handler);
@@ -183,16 +159,7 @@ void Dimc_HWPE::reset(bool active)
         for (Dimc_InnerBlock &blk : this->inner_blocks) blk.reset_job_state();
         this->state.set(DIMC_IDLE);
 
-        // Every event gets a value at time zero, so no track starts part-way in.
-        uint8_t st = DIMC_IDLE, zero8 = 0;
-        uint32_t zero32 = 0;
-        this->state_event.event(&st);
-        this->busy_event.event(&zero8);
-        this->job_event.event((uint8_t *)&zero32);
-        for (Dimc_InnerBlock &blk : this->inner_blocks) {
-            blk.beat_event.event((uint8_t *)&zero32);
-            blk.rows_event.event((uint8_t *)&zero32);
-        }
+        this->tracer.reset();
     }
 }
 
@@ -227,6 +194,7 @@ void Dimc_HWPE::start_next_job()
     this->running_job = this->ctx_job_id[this->running_ctx];
     this->register_file[DIMC_HWPE_RUN_TASK >> 2] = this->running_job;
     this->event_enqueue(this->fsm_start_event, 1);
+    this->tracer.job_queued();
 }
 
 vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
@@ -285,6 +253,7 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                     if (ctx < 0) break;                        // all contexts busy: drop
                     _this->ctx_busy[ctx]   = true;
                     _this->ctx_job_id[ctx] = _this->next_job_id++;
+                    _this->tracer.commit(_this->ctx_job_id[ctx]);
                     // The snapshot. i_job_fifo pushes the whole job_dep_regs
                     // bundle, so a committed job carries a complete descriptor.
                     std::memcpy(_this->ctx_regs[ctx], _this->live_regs,

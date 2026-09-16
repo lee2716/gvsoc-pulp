@@ -105,9 +105,6 @@ class Dimc_Macro {
         // cursor's beat counters, which belong to the block and are reset per
         // phase.
         bool     exec_ready = false;
-        // Job-relative timestamps, instrumentation only.
-        uint32_t trace_fill_start = 0, trace_fill_done = 0;
-        uint32_t trace_compute_start = 0, trace_compute_end   = 0;
         // The kernel base this macro last pulled in. Per macro, not per engine:
         // once two jobs overlap the macros are on different ones, and a single
         // engine-wide value would be overwritten by whichever macro filled most

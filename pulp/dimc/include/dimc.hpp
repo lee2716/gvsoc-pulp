@@ -28,17 +28,19 @@
 
 #include <dimc_hwpe_archi.hpp>
 #include <dimc_macro.hpp>
+#include <dimc_tracer.hpp>
 
 typedef uint64_t strobe_t;
 
 // A job is offloaded with the acquire/commit protocol, then the FSM runs
-// preload -> compute -> store.
+// STARTING (fill, compute and write-back together) and, only while results are
+// still unwritten when the fill ends, STORING. Value 2 was a COMPUTING state
+// that did no work; the other values keep their encoding.
 enum dimc_hwpe_state_t {
-    DIMC_IDLE,
-    DIMC_STARTING,
-    DIMC_COMPUTING,
-    DIMC_STORING,
-    DIMC_FINISHED
+    DIMC_IDLE     = 0,
+    DIMC_STARTING = 1,
+    DIMC_STORING  = 3,
+    DIMC_FINISHED = 4
 };
 
 class Dimc_HWPE;
@@ -102,9 +104,6 @@ class Dimc_OuterPort {
 
         int64_t  cursor_bytes    = 0;   // bytes committed; /bandwidth gives the cycle
         uint32_t bandwidth_bytes = 1;
-
-        // VCD event, registered by the parent as outer_port/next_free.
-        vp::Trace free_event;
 };
 
 // ---- rtl/accumulator.sv, instantiated by rtl/cleopatra.sv ----
@@ -179,38 +178,11 @@ class Dimc_InnerBlock {
         // Per-phase completion, so the phase ends only when EVERY block is done.
         bool phase_done;
 
-        // Results and per-block reporting.
+        // Results.
         std::vector<std::vector<uint8_t>> out_buf;
-        std::vector<uint32_t> load_done;   // per-macro L1-load completion cycle
-        // Last store beat's latency times the beat count: an estimate, and it
-        // only ever reaches a trace line. Not a measured output latency.
-        uint32_t out_beat_lat_est;
 
         // Accumulates across jobs, so reset_job_state() must not touch it.
         Dimc_OutAccum out_accum;
-
-        // VCD events for this block, registered by the parent as
-        // block_<i>/<leaf>. Cycle values are fsm_timestamp, not simulated time.
-        vp::Trace beat_event;    // beat_index, the linear cursor of the phase
-        vp::Trace rows_event;    // rows_issued during COMPUTING
-        // High for the cycles the block is moving operands in, and for the
-        // cycles it is issuing compute rows. Counters cannot show that the two
-        // run at once; these two levels overlap in the waveform exactly when
-        // the load of one macro is hidden under the compute of another.
-        vp::Trace load_active_event;
-        vp::Trace comp_active_event;
-        bool loaded_this_cycle  = false;   // a fill beat issued
-        bool computed_this_cycle = false;  // a compute row issued
-
-        // The same two signals per macro. The block-level pair above is the OR
-        // of these, so a job in which the macros fill one after the other shows
-        // one pulse per macro here and a single merged pulse there. Sized in
-        // the constructor beside macros, and registered by address, so nothing
-        // may resize them afterwards.
-        std::vector<vp::Trace> macro_load_event;
-        std::vector<vp::Trace> macro_comp_event;
-        std::vector<uint8_t>   macro_loaded_this_cycle;
-        std::vector<uint8_t>   macro_computed_this_cycle;
 
         // Clear everything the engine tracks for one job. Called from the
         // constructor, from reset(), and at every job start, so the three sites
@@ -221,8 +193,6 @@ class Dimc_InnerBlock {
             this->store.reset(this->macros.size());
             this->rows_issued = 0;
             this->phase_done = false;
-            this->out_beat_lat_est = 0;
-            this->load_done.clear();
             while (!this->port_pending.empty()) this->port_pending.pop();
         }
 };
@@ -272,45 +242,12 @@ class Dimc_HWPE : public vp::Component {
         // (skips that load), like a real weight cache. 0xFFFFFFFF = none yet.
         uint32_t last_kb_src;
 
-        // ---- Job accounting ----
-        // Reported per job the way magia_v2's LightRedmule reports a GEMM
-        // (light_redmule.cpp): absolute start and end so the gap to the
-        // next job reads straight off consecutive lines, the period in cycles,
-        // and a utilisation against an analytic ideal.
-        //
-        // Two clocks, measuring different things. fsm_timestamp advances only
-        // inside the phase iterators, so it counts the cycles the engine
-        // worked and cannot see the gaps between jobs. clock.get_cycles() is
-        // simulated time, keeps running while the engine is idle, and is what
-        // reconciles with the core's own mcycle.
-        //
-        // The FSM phases are not a partition of the work: preload_iter drives
-        // the fill, the compute and the store in one loop, and compute_iter
-        // does no work of its own, so COMPUTING costs one cycle for any job.
-        // busy_cycles is what an outside observer measures; the beat counters
-        // say what filled it.
-        uint64_t phase_entry_ts  = 0;    // fsm_timestamp at the current phase's start
-        uint64_t job_entry_cycle = 0;    // simulated cycle at this job's start
-        uint64_t last_job_end    = 0;    // simulated cycle the previous job ended
-        uint64_t acc_starting = 0, acc_computing = 0, acc_storing = 0;
-        uint64_t acc_busy_cycles = 0;    // simulated cycles inside a job
-        uint64_t acc_gap_cycles  = 0;    // simulated cycles between jobs
-        uint64_t acc_ideal_cycles = 0;   // analytic minimum for those jobs
-        // Fill beats and the latency L1 returned for them; store beats are
-        // not counted here. Reported as an average per beat. The phase lengths
-        // come from each beat's own latency, not from this average.
-        uint64_t acc_beats = 0, acc_beat_lat = 0, acc_stall_full = 0;
-        uint32_t jobs_measured   = 0;
-
-        // Traces
+        // Text trace, for diagnostics and the tracer's reports.
         vp::Trace trace;
 
-        // VCD event traces for waveform and Perfetto profiling. Written from the
-        // FSM handlers; an event costs no cycle. Mark a value stale by writing
-        // the next one -- event_highz() is dropped by the Perfetto converter.
-        vp::Trace state_event;   // three-phase FSM, one byte
-        vp::Trace busy_event;    // 1 while a job runs, drawn as one Perfetto slice
-        vp::Trace job_event;     // id of the running job, to line up with software
+        // Every VCD signal, per-cycle observation and accounting. Read-only
+        // towards the engine and never schedules an event; see dimc_tracer.hpp.
+        Dimc_Tracer tracer;
 
         // Internal state
         vp::reg_32 state;
@@ -348,15 +285,18 @@ class Dimc_HWPE : public vp::Component {
         // ---- Engine phase iterators ----
         // Called once per cycle. Each sets *latency=1 and returns true when its
         // phase is done. The makespan is not returned: it accrues in
-        // fsm_timestamp and is read from the trace.
-        //   preload_iter : real per-beat load of every macro's KB + FB
-        //   compute_iter : run each macro's matvec through its 4-deep pipeline
-        //   store_iter   : real per-beat output drain, then report fsm_timestamp
+        // fsm_timestamp.
+        //   preload_iter : per-beat fill of every macro, with compute and
+        //                  write-back of whatever has retired
+        //   store_iter   : the write-back still owed when the fill ended
         bool preload_iter(int *latency);
-        bool compute_iter(int *latency);
         bool store_iter(int *latency);
+        // Every result beat issued and acknowledged, on every block.
+        bool store_done() const;
+        // Close the running job: clear the phase state and report it.
+        void close_job();
 
-        // Scratch shared across the three phases of one job (same for all blocks:
+        // Scratch shared across the phases of one job (same for all blocks:
         // one control plane issues one job shape to every inner block).
         // Everything derived once per job. One per context, so a queued job's
         // shape survives until the engine reaches it.
@@ -400,16 +340,12 @@ class Dimc_HWPE : public vp::Component {
         void latch_geom(int ctx);
         uint32_t job_reg_ctx(int ctx, uint32_t addr) const;
         // Advance every macro of a block that has finished its own fill.
-        void compute_indep(Dimc_InnerBlock &blk);
+        void compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id);
         void store_block(Dimc_InnerBlock &blk, uint32_t blk_id);
         // Move every row a macro has finished into that macro's output buffer.
         // compute_indep needs this both at the top of a cycle and once more
         // when the last row retires, so it lives in one place.
         void drain_ready_rows(Dimc_InnerBlock &blk);
-        // Emit this cycle's load and compute levels for one block, then clear
-        // them. Called once per block per cycle so the two traces are levels
-        // rather than one-cycle spikes.
-        void publish_activity(Dimc_InnerBlock &blk);
 
         // ---- Cycle-accurate engine ----
         // One cycle per fsm_event. TCDM accesses are async: on issue we record
