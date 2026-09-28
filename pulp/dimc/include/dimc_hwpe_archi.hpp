@@ -17,7 +17,7 @@
 #ifndef __DIMC_HWPE_ARCHI__
 #define __DIMC_HWPE_ARCHI__
 
-#define N_CFG_REGS 48
+#define N_CFG_REGS 64
 
 #define DIMC_HWPE_BASE   0x0
 
@@ -75,19 +75,25 @@
  */
 #define DIMC_NB_CONTEXT              8
 #define DIMC_HWPE_JOB_BASE           (DIMC_HWPE_BASE + 0x40)
-#define DIMC_HWPE_NB_JOB_REGS        23   /* 0x40 .. 0x98 inclusive; 0x8C/0x90 are
+#define DIMC_HWPE_NB_JOB_REGS        35   /* 0x40 .. 0xC8 inclusive; 0x8C/0x90 are
                                           * intercepted as ACC_VAL and leave holes */
 #define DIMC_HWPE_JOB_KB_SRC_ADDR    (DIMC_HWPE_BASE + 0x40)
 #define DIMC_HWPE_JOB_FB_SRC_ADDR    (DIMC_HWPE_BASE + 0x44)
 #define DIMC_HWPE_JOB_DST_ADDR       (DIMC_HWPE_BASE + 0x48)
+/* Batched descriptor, not in the RTL: one job carries NB_VEC input vectors of the same
+ * chunk step. Vector b reads its feature at FB_SRC + b * FB_VEC_STRIDE, its partial sums at
+ * PSIN_SRC + b * PSIN_VEC_STRIDE, and writes at DST + b * OUT_VEC_STRIDE. 0 or 1: one vector. */
+#define DIMC_HWPE_NB_VEC             (DIMC_HWPE_BASE + 0x4C)
 
 #define DIMC_HWPE_KB_D0_LENGTH       (DIMC_HWPE_BASE + 0x50)
 #define DIMC_HWPE_KB_D0_STRIDE       (DIMC_HWPE_BASE + 0x54)
 #define DIMC_HWPE_KB_D1_LENGTH       (DIMC_HWPE_BASE + 0x58)
 #define DIMC_HWPE_KB_D1_STRIDE       (DIMC_HWPE_BASE + 0x5C)
+#define DIMC_HWPE_FB_VEC_STRIDE      (DIMC_HWPE_BASE + 0x60)
 
 #define DIMC_HWPE_FB_D0_LENGTH       (DIMC_HWPE_BASE + 0x64)
 #define DIMC_HWPE_FB_D0_STRIDE       (DIMC_HWPE_BASE + 0x68)
+#define DIMC_HWPE_PSIN_VEC_STRIDE    (DIMC_HWPE_BASE + 0x6C)
 
 #define DIMC_HWPE_OUT_D0_LENGTH      (DIMC_HWPE_BASE + 0x70)
 #define DIMC_HWPE_OUT_D0_STRIDE      (DIMC_HWPE_BASE + 0x74)
@@ -97,11 +103,8 @@
 #define DIMC_HWPE_CFG_BIAS           (DIMC_HWPE_BASE + 0x80)
 #define DIMC_HWPE_PSIN               (DIMC_HWPE_BASE + 0x84)
 
-/* Streamer bandwidth and kernel reuse are not MMIO: bandwidth is fixed in the
- * systree, and reuse is detected in the FSM by comparing the KB source address
- * to the previous job's. */
-/* 0x88 carries no register. Left unassigned rather than reused, because these
- * offsets and the HAL's archi header are kept in step by hand. */
+/* Batched descriptor: output stride per vector (see NB_VEC). */
+#define DIMC_HWPE_OUT_VEC_STRIDE     (DIMC_HWPE_BASE + 0x88)
 
 /* Per-row partial-sum input, the model of the RTL's ADDIN. With PSIN_EN set the
  * engine streams one 32-bit psum per kernel row from PSIN_SRC_ADDR and adds it to
@@ -111,6 +114,36 @@
 #define DIMC_HWPE_PSIN_EN            (DIMC_HWPE_BASE + 0x94)
 #define DIMC_HWPE_JOB_PSIN_SRC_ADDR  (DIMC_HWPE_BASE + 0x98)
 
-#define DIMC_HWPE_REG_MAX            (DIMC_HWPE_BASE + 0x98)
+/* 1: the macros keep the kernel rows they hold and the job loads none; 0: load them. */
+#define DIMC_HWPE_KB_REUSE           (DIMC_HWPE_BASE + 0x9C)
+/* The job whose results this job reads as partial sums, counted back in jobs; each
+ * run's partial-sum fetch waits until its producer run (PSIN_CHAIN) is written back.
+ * 0: no producer. */
+#define DIMC_HWPE_PSIN_DEP           (DIMC_HWPE_BASE + 0xA0)
+
+/* Where macro slot (block b, macro m) reads and writes. ADDR_MODE 0: slot s = b *
+ * NUM_MACROS + m holds kernel rows at KB_SRC + s * row_count * 128 B, reads the one
+ * feature block at FB_SRC, and its partial sums and outputs sit at s * row_count *
+ * 4 B. ADDR_MODE 1: each operand's slot offset is m * MSTRIDE + b * BSTRIDE, so
+ * macros may share rows, split K or split N. The per-vector strides add on top. */
+#define DIMC_HWPE_ADDR_MODE          (DIMC_HWPE_BASE + 0xA4)
+#define DIMC_HWPE_KB_MSTRIDE         (DIMC_HWPE_BASE + 0xA8)
+#define DIMC_HWPE_KB_BSTRIDE         (DIMC_HWPE_BASE + 0xAC)
+#define DIMC_HWPE_FB_MSTRIDE         (DIMC_HWPE_BASE + 0xB0)
+#define DIMC_HWPE_FB_BSTRIDE         (DIMC_HWPE_BASE + 0xB4)
+#define DIMC_HWPE_PSIN_MSTRIDE       (DIMC_HWPE_BASE + 0xB8)
+#define DIMC_HWPE_PSIN_BSTRIDE       (DIMC_HWPE_BASE + 0xBC)
+#define DIMC_HWPE_OUT_MSTRIDE        (DIMC_HWPE_BASE + 0xC0)
+#define DIMC_HWPE_OUT_BSTRIDE        (DIMC_HWPE_BASE + 0xC4)
+/* Which run a run's partial-sum fetch waits for. 0: the same (macro, vector) of the
+ * job PSIN_DEP back. 1: macro m > 0 waits for macro m - 1's run of the same vector in
+ * this job, macro 0 for the last active macro's run of that vector in the job PSIN_DEP
+ * back (K-split: macros of one dual accumulate the same rows). The address is still
+ * PSIN_SRC plus the slot and vector offsets. */
+#define DIMC_HWPE_PSIN_CHAIN         (DIMC_HWPE_BASE + 0xC8)
+
+/* Streamer bandwidth is not MMIO: it is fixed in the systree. */
+
+#define DIMC_HWPE_REG_MAX            (DIMC_HWPE_BASE + 0xC8)
 
 #endif

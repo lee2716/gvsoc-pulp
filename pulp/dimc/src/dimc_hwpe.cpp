@@ -34,7 +34,6 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     this->inner_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("inner_port_bytes");
     this->outer_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("outer_port_bytes");
     this->nb_inner_blocks   = (uint32_t)this->get_js_config()->get_child_int("nb_inner_blocks");
-    this->last_kb_src     = 0xFFFFFFFF;   // no resident weights yet
     // HWPE slave port
     this->hwpe_slv.set_req_meth(&Dimc_HWPE::hwpe_slave);
     this->new_slave_port("hwpe_slv", &this->hwpe_slv);
@@ -50,6 +49,12 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     this->inner_blocks.resize(this->nb_inner_blocks);
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
         blk.macros.resize(this->num_macros);
+        blk.retired.resize(this->num_macros);
+        blk.inp_fifo.resize(this->num_macros);
+        blk.out_fifo.resize(this->num_macros);
+        blk.out_results.assign(this->num_macros, 0);
+        blk.out_results_next.assign(this->num_macros, 0);
+        blk.reset_progress();
         for (uint32_t m = 0; m < this->num_macros; m++) {
             blk.weight_stream.emplace_back(this, false);
             blk.input_stream .emplace_back(this, false);
@@ -68,6 +73,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     this->fsm_start_event = this->event_new(&Dimc_HWPE::fsm_start_handler);
     this->fsm_event       = this->event_new(&Dimc_HWPE::fsm_handler);
     this->fsm_end_event   = this->event_new(&Dimc_HWPE::fsm_end_handler);
+    this->held_event      = this->event_new(&Dimc_HWPE::held_handler);
 
     // Initial state of the controller FSM + standard HWPE offload bookkeeping
     this->sel_dimc      = 0;
@@ -82,6 +88,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
         this->ctx_busy[ctx]   = false;
         this->ctx_job_id[ctx] = 0;
+        this->geom_job[ctx]   = Dimc_Macro::JOB_NONE;
         for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
     }
     this->outstanding_depth = 4;    // max in-flight TCDM beats per block
@@ -91,11 +98,14 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     this->job_geom[0].fb_beats_per_macro= 1;
     this->job_geom[0].beats_per_macro   = 1;
     this->phase_planned     = false;
+    this->fill_active = false;
+    this->fill_job    = 0xFFFFFFFFu;
     this->job_geom[0].psin_beats_per_macro = 0;
     this->job_geom[0].psin_rows        = 0;
     this->state.set(DIMC_IDLE);
 
-    this->outer_port.configure(this->outer_port_bytes);
+    this->outer_port_in.configure(this->outer_port_bytes);
+    this->outer_port_out.configure(this->outer_port_bytes);
 
     this->trace.msg(vp::TraceLevel::WARNING,
         "DIMC systree config: num_macros=%u inner_bw=%u outer_bw=%u nb_blocks=%u blocks=%u\n",
@@ -122,7 +132,8 @@ void Dimc_HWPE::reset(bool active)
                     this->outer_port_bytes, this->nb_inner_blocks);
             this->trace.fatal("DIMC systree incomplete\n");
         }
-        this->outer_port.reset();
+        this->outer_port_in.reset();
+    this->outer_port_out.reset();
         for (uint32_t i = 0; i < N_CFG_REGS; i++) {
             this->register_file[i] = 0x0;
         }
@@ -132,7 +143,13 @@ void Dimc_HWPE::reset(bool active)
             blk.out_accum.enable = 0;
         }
         this->sel_dimc = 0;
-        this->last_kb_src = 0xFFFFFFFF;
+        for (Dimc_InnerBlock &blk : this->inner_blocks) {
+            blk.run_pending.clear();
+            for (Dimc_InnerBlock::Retired &r : blk.retired) r = Dimc_InnerBlock::Retired();
+        }
+        this->psum_waits = 0;
+        this->psum_waits_reported = 0;
+        this->psum_reports = 0;
         this->running_job   = 0;
         this->next_job_id   = 0;
         this->finished_jobs = 0;
@@ -154,9 +171,38 @@ void Dimc_HWPE::reset(bool active)
         this->job_geom[0].fb_beats_per_macro= 1;
         this->job_geom[0].beats_per_macro   = 1;
         this->phase_planned     = false;
+        this->fill_active = false;
+    this->fill_job    = 0xFFFFFFFFu;
         this->job_geom[0].psin_beats_per_macro = 0;
         this->job_geom[0].psin_rows        = 0;
         for (Dimc_InnerBlock &blk : this->inner_blocks) blk.reset_job_state();
+        for (Dimc_InnerBlock &blk : this->inner_blocks)
+            for (Dimc_Macro &mc : blk.macros) {
+                mc.exec_ready  = false;
+                mc.filled_job  = Dimc_Macro::JOB_NONE;
+                // Job ids restart at 0 after a reset; a stale id could match one.
+                mc.issue_job   = Dimc_Macro::JOB_NONE;
+                mc.fill_job    = Dimc_Macro::JOB_NONE;
+                mc.owed        = 0;
+                mc.write_job   = Dimc_Macro::JOB_NONE;
+                mc.written     = 0;
+                mc.kpf_job     = Dimc_Macro::JOB_NONE;
+                mc.kfetched    = 0;
+                mc.kw = 0; mc.f0 = false; mc.stamped = false;
+                mc.runs_issued = 0;
+                mc.set_job[0]  = mc.set_job[1] = Dimc_Macro::JOB_NONE;
+            }
+        for (Dimc_InnerBlock &blk : this->inner_blocks) {
+            for (auto &q : blk.out_fifo) q.clear();
+            blk.out_shared.clear();
+            blk.reset_progress();
+            for (uint32_t &n : blk.out_results) n = 0;
+            for (uint32_t &n : blk.out_results_next) n = 0;
+            blk.store_next_beats = 0;
+            while (!blk.store_next_pending.empty()) blk.store_next_pending.pop();
+        }
+        for (uint32_t c = 0; c < DIMC_NB_CONTEXT; c++) this->geom_job[c] = Dimc_Macro::JOB_NONE;
+        this->out_dropped = 0;
         this->state.set(DIMC_IDLE);
 
         this->tracer.reset();
@@ -266,6 +312,9 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
 
                 // Modes 0 and 2 release the queue; mode 1 only commits.
                 if (mode != 0x1) _this->start_next_job();
+                else if (DIMC_HELD_KB_PRELOAD && !_this->job_running
+                         && !_this->held_event->is_enqueued())
+                    _this->event_enqueue(_this->held_event, 1);
                 break;
             }
             case DIMC_HWPE_ACQ:    // acquire is observed on the read path; write is a no-op
@@ -283,9 +332,6 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                         blk.out_accum.clear();      // accumulator.sv clear_i
                     }
                     _this->sel_dimc = 0;
-                    _this->last_kb_src = 0xFFFFFFFF;   // resident weights invalidated
-                    for (Dimc_InnerBlock &b : _this->inner_blocks)
-                        for (Dimc_Macro &mc : b.macros) mc.last_kb_src = 0xFFFFFFFF;
                     // Aborts any in-flight job: release every context, otherwise
                     // ACQUIRE would report busy forever and acquire_block() hangs.
                     _this->job_running  = false;

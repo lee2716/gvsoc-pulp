@@ -18,6 +18,9 @@
 #include <cstring>
 #include <algorithm>
 
+// Cross-job prefill. 1: the fill runs ahead into the next job; 0: each job drains before the next fills.
+#define DIMC_PREFILL_NEXT_JOB 1
+
 void Dimc_HWPE::job_shape(uint32_t *num_active, uint32_t *row_count) const
 {
     uint32_t n = this->register_file[DIMC_HWPE_NUM_MACROS >> 2];
@@ -37,73 +40,8 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     // soft_clear) does not see the previous job's STATUS=1 and exit polling early.
     _this->register_file[DIMC_HWPE_STATUS >> 2] = 0x0;
 
-    // Every inner block gets its own streamers. Block b works on its own slice
-    // of the job: the descriptor gives the base of block 0, and each further
-    // block is offset by one block's worth of kernels, features and outputs.
-    // That is what makes the blocks compute DIFFERENT data in parallel instead
-    // of repeating each other. Software must therefore lay out
-    // nb_inner_blocks x num_active kernels back to back.
-    uint32_t blk_num_active, blk_row_count;
-    _this->job_shape(&blk_num_active, &blk_row_count);
-
-    // Per-macro spans now: macro m of block b owns slot (b * num_active + m).
-    const uint32_t kb_one   = blk_row_count * DIMC_MACRO_KB_EW;
-    const uint32_t fb_one   = DIMC_MACRO_FB_EW;
-    const uint32_t out_one  = blk_row_count * 4;
-
-    uint32_t blk_id = 0;
-    for (Dimc_InnerBlock &blk : _this->inner_blocks) {
-    for (uint32_t m = 0; m < blk_num_active; m++) {
-    const uint32_t slot = blk_id * blk_num_active + m;
-    blk.weight_stream[m].configure(
-        _this->job_reg(DIMC_HWPE_JOB_KB_SRC_ADDR) + slot * kb_one,     // base_addr
-        kb_one,                                      // tot_len
-        _this->job_reg(DIMC_HWPE_KB_D0_LENGTH),   // d0_len
-        _this->job_reg(DIMC_HWPE_KB_D0_STRIDE),   // d0_stride
-        _this->job_reg(DIMC_HWPE_KB_D1_LENGTH),   // d1_len
-        _this->job_reg(DIMC_HWPE_KB_D1_STRIDE),   // d1_stride
-        0,                                                      // d2_len
-        0,                                                      // d2_stride
-        0                                                       // d3_stride
-    );
-
-    // Configuration of the feature (FB) input streamer
-    // No slot offset: all macros read the job's one block. The workloads give
-    // every macro the same features; only the kernel buffers are sliced.
-    blk.input_stream[m].configure(
-        _this->job_reg(DIMC_HWPE_JOB_FB_SRC_ADDR),                     // base_addr
-        fb_one,                                      // tot_len
-        _this->job_reg(DIMC_HWPE_FB_D0_LENGTH),   // d0_len
-        _this->job_reg(DIMC_HWPE_FB_D0_STRIDE),   // d0_stride
-        0,                                                      // d1_len
-        0,                                                      // d1_stride
-        0,                                                      // d2_len
-        0,                                                      // d2_stride
-        0                                                       // d3_stride
-    );
-
-    // Configuration of the output streamer
-    // Per-row partial sums in. Same per-block slicing as the outputs, since a
-    // psum belongs to the row that produced it.
-    blk.psin_stream[m].configure(
-        _this->job_reg(DIMC_HWPE_JOB_PSIN_SRC_ADDR) + slot * out_one,
-        out_one, 0, 0, 0, 0, 0, 0, 0
-    );
-
-    blk.out_stream[m].configure(
-        _this->job_reg(DIMC_HWPE_JOB_DST_ADDR) + slot * out_one,      // base_addr
-        out_one,                                     // tot_len
-        _this->job_reg(DIMC_HWPE_OUT_D0_LENGTH),  // d0_len
-        _this->job_reg(DIMC_HWPE_OUT_D0_STRIDE),  // d0_stride
-        0,                                                      // d1_len
-        0,                                                      // d1_stride
-        0,                                                      // d2_len
-        0,                                                      // d2_stride
-        0                                                       // d3_stride
-    );
-    }
-    blk_id++;
-    }
+    // Streamers: the input ones follow the fill (plan_macro_fill), the output ones the
+    // sink (configure_out_stream at each run's first result).
 
     // Latch the per-job compute configuration once at commit, then broadcast it
     // to every macro (ci, sign_8b, compute_mask, sel_dimc).
@@ -111,16 +49,15 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     uint8_t  ci        = (uint8_t) (_this->register_file[DIMC_HWPE_CFG_CI       >> 2] & 0x3);
     uint8_t  sign_8b   = (uint8_t) (_this->register_file[DIMC_HWPE_SIGN_8B      >> 2] & 0x3);
     uint16_t cmask     = (uint16_t)(_this->register_file[DIMC_HWPE_COMPUTE_MASK >> 2] & 0x3FF);
-    uint8_t  psin_rows = (uint8_t) (_this->job_reg(DIMC_HWPE_PSIN_EN) & 0x1);
-    _this->job_geom[_this->fill_slot].psin_rows = psin_rows;
     _this->sel_dimc   = (uint8_t)(_this->register_file[DIMC_HWPE_SEL_DIMC  >> 2] & 0xFF);
     for (Dimc_InnerBlock &blk : _this->inner_blocks)
     for (auto &m : blk.macros) {
         // `compe` (memory-vs-compute mode) is latched but never read: compute_PP
         // always performs the dot product, and COMPE=0 memory mode is not
         // implemented.
+        // psin_rows is per job and latched with the macro's fill (preload_block),
+        // since a macro may compute the next job before that job starts here.
         m.compe = compe; m.ci = ci; m.sign_8b = sign_8b; m.compute_mask = cmask;
-        m.psin_rows  = psin_rows;
     }
     // `sel_dimc` is stored but never consulted: macro selection goes through
     // NUM_MACROS (num_active). It exists for register-map fidelity.
@@ -136,16 +73,31 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     _this->phase_planned = false;
     _this->exec_slot = (uint32_t)(_this->running_ctx >= 0 ? _this->running_ctx : 0);
 
+    // A fill already running for this job raises kb_ready/fb_ready before its last beat
+    // stamps filled_job, so clearing here would strand that macro. Compute is gated on
+    // filled_job == running_job either way.
     for (Dimc_InnerBlock &blk : _this->inner_blocks)
         for (uint32_t m = 0; m < _this->num_macros; m++) {
-            blk.macros[m].exec_ready     = false;
+            Dimc_Macro &mc = blk.macros[m];
+            // A macro already filled, filling or being written for this job keeps its buffers.
+            if (mc.filled_job == _this->running_job || mc.fill_job == _this->running_job
+                || mc.write_job == _this->running_job) continue;
+            // A macro further ahead holds a later job's operands.
+            const uint32_t none = Dimc_Macro::JOB_NONE, run = _this->running_job;
+            if (DIMC_JOB_LOOKAHEAD > 1
+                && ((mc.filled_job != none && mc.filled_job > run)
+                    || (mc.fill_job != none && mc.fill_job > run)
+                    || (mc.write_job != none && mc.write_job > run))) continue;
+            mc.exec_ready  = false;
             // Cleared here, not left over from the previous job: they gate
             // compute, and this job's feature vector has not landed yet.
-            blk.macros[m].kb_ready       = false;
-            blk.macros[m].fb_ready       = false;
+            mc.kb_ready    = false;
+            mc.fb_ready    = false;
+            mc.filled_job  = Dimc_Macro::JOB_NONE;
         }
 
-    for (Dimc_InnerBlock &blk : _this->inner_blocks) blk.reset_job_state();
+    for (Dimc_InnerBlock &blk : _this->inner_blocks)
+        blk.reset_job_state(_this->fill_active, DIMC_JOB_LOOKAHEAD > 1);
 
     _this->state.set(DIMC_STARTING);
     _this->tracer.job_start((uint64_t)_this->clock.get_cycles());
@@ -182,6 +134,9 @@ void Dimc_HWPE::fsm_end_handler(vp::Block *__this, vp::ClockEvent *event)
     // 1 = hold the queue until SW issues an explicit trigger (commit_trigger 0/2).
     if ((_this->register_file[DIMC_HWPE_AUTOTRIGGER_N >> 2] & 0x1) == 0)
         _this->start_next_job();
+    // The macros already on the next job keep filling and computing through the
+    // cycle this bookkeeping takes; only the controller is between jobs.
+    if (DIMC_PREFILL_NEXT_JOB) _this->handover_step();
 }
 
 void Dimc_HWPE::fsm_loop()
@@ -221,49 +176,166 @@ void Dimc_HWPE::latch_geom(int ctx)
     g.num_active  = n;
     g.row_count   = r;
     g.row_base    = this->job_reg_ctx(ctx, DIMC_HWPE_ROW_SEL_BASE);
-    g.bias        = (int32_t)this->job_reg_ctx(ctx, DIMC_HWPE_CFG_BIAS);
+    // CFG_BIAS is not read: the RTL's only addend is ADDIN, which PSIN models.
     g.compute_cyc = r + DIMC_MACRO_LATENCY;
     g.psin_rows   = this->job_reg_ctx(ctx, DIMC_HWPE_PSIN_EN) & 0x1;
+    g.nb_vec         = this->job_reg_ctx(ctx, DIMC_HWPE_NB_VEC);
+    if (g.nb_vec == 0) g.nb_vec = 1;
+    if (g.nb_vec > 1 && !DIMC_PREFILL_NEXT_JOB)
+        this->trace.fatal("NB_VEC=%u needs DIMC_PREFILL_NEXT_JOB\n", g.nb_vec);
+    g.fb_vec_stride  = this->job_reg_ctx(ctx, DIMC_HWPE_FB_VEC_STRIDE);
+    g.ps_vec_stride  = this->job_reg_ctx(ctx, DIMC_HWPE_PSIN_VEC_STRIDE);
+    g.out_vec_stride = this->job_reg_ctx(ctx, DIMC_HWPE_OUT_VEC_STRIDE);
+    this->geom_job[ctx] = this->ctx_job_id[ctx];
 
-    uint32_t kb_src = this->job_reg_ctx(ctx, DIMC_HWPE_JOB_KB_SRC_ADDR);
-    bool all_skip = true;
-    for (Dimc_InnerBlock &blk : this->inner_blocks)
-        for (uint32_t m = 0; m < n; m++) {
-            Dimc_Macro &mc = blk.macros[m];
-            mc.skip_kb = (kb_src == mc.last_kb_src);
-            if (!mc.skip_kb) all_skip = false;
-        }
-    g.skip_kb = all_skip;
-    g.kb_src  = kb_src;
-    // last_kb_src is NOT stamped here: it records that a weight load actually
-    // landed, and stamping it at planning time would let a fill that never ran
-    // be mistaken for one that did.
+    g.skip_kb    = this->job_reg_ctx(ctx, DIMC_HWPE_KB_REUSE) & 0x1;
+    g.psin_dep   = this->job_reg_ctx(ctx, DIMC_HWPE_PSIN_DEP);
+    g.psin_chain = this->job_reg_ctx(ctx, DIMC_HWPE_PSIN_CHAIN) & 0x1;
+    g.addr_mode  = this->job_reg_ctx(ctx, DIMC_HWPE_ADDR_MODE) & 0x1;
+    g.kb_ms  = this->job_reg_ctx(ctx, DIMC_HWPE_KB_MSTRIDE);
+    g.kb_bs  = this->job_reg_ctx(ctx, DIMC_HWPE_KB_BSTRIDE);
+    g.fb_ms  = this->job_reg_ctx(ctx, DIMC_HWPE_FB_MSTRIDE);
+    g.fb_bs  = this->job_reg_ctx(ctx, DIMC_HWPE_FB_BSTRIDE);
+    g.ps_ms  = this->job_reg_ctx(ctx, DIMC_HWPE_PSIN_MSTRIDE);
+    g.ps_bs  = this->job_reg_ctx(ctx, DIMC_HWPE_PSIN_BSTRIDE);
+    g.out_ms = this->job_reg_ctx(ctx, DIMC_HWPE_OUT_MSTRIDE);
+    g.out_bs = this->job_reg_ctx(ctx, DIMC_HWPE_OUT_BSTRIDE);
 }
 
-void Dimc_HWPE::plan_fill(int ctx)
+uint32_t Dimc_HWPE::slot_offset(const JobGeom &g, uint32_t blk_id, uint32_t m, uint8_t kind) const
 {
+    if (g.addr_mode) {
+        switch (kind) {
+        case DIMC_LOAD_KB:   return m * g.kb_ms  + blk_id * g.kb_bs;
+        case DIMC_LOAD_FB:   return m * g.fb_ms  + blk_id * g.fb_bs;
+        case DIMC_LOAD_PSIN: return m * g.ps_ms  + blk_id * g.ps_bs;
+        default:             return m * g.out_ms + blk_id * g.out_bs;
+        }
+    }
+    // Slot slicing: one kernel block and one output block per slot, one feature block for all.
+    const uint32_t slot = blk_id * g.num_active + m;
+    switch (kind) {
+    case DIMC_LOAD_KB: return slot * g.row_count * DIMC_MACRO_KB_EW;
+    case DIMC_LOAD_FB: return 0;
+    default:           return slot * g.row_count * DIMC_OUT_SLOT_BYTES;
+    }
+}
 
+// The input streamers read the operands of the job and vector (run) being FILLED, not
+// the running one: the fill runs ahead. Per macro, so macros on different jobs or runs
+// do not share a base.
+void Dimc_HWPE::configure_macro_streams(uint32_t blk_id, uint32_t m, int ctx, uint32_t run,
+                                        bool kernel, bool feature, bool psum)
+{
+    const JobGeom &g = this->job_geom[ctx];
+    Dimc_InnerBlock &blk = this->inner_blocks[blk_id];
+    const uint32_t kb_one  = g.row_count * DIMC_MACRO_KB_EW;
+    const uint32_t fb_one  = DIMC_MACRO_FB_EW;
+    const uint32_t out_one = g.row_count * DIMC_OUT_SLOT_BYTES;   // psin reads output slots
+    if (kernel)
+        blk.weight_stream[m].configure(
+            this->job_reg_ctx(ctx, DIMC_HWPE_JOB_KB_SRC_ADDR)
+                + this->slot_offset(g, blk_id, m, DIMC_LOAD_KB), kb_one,
+            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D0_LENGTH),
+            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D0_STRIDE),
+            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D1_LENGTH),
+            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D1_STRIDE), 0, 0, 0);
+    if (feature)
+        blk.input_stream[m].configure(
+            this->job_reg_ctx(ctx, DIMC_HWPE_JOB_FB_SRC_ADDR) + run * g.fb_vec_stride
+                + this->slot_offset(g, blk_id, m, DIMC_LOAD_FB), fb_one,
+            this->job_reg_ctx(ctx, DIMC_HWPE_FB_D0_LENGTH),
+            this->job_reg_ctx(ctx, DIMC_HWPE_FB_D0_STRIDE), 0, 0, 0, 0, 0);
+    // Per-row partial sums, laid out like the outputs they came from.
+    if (psum)
+        blk.psin_stream[m].configure(
+            this->job_reg_ctx(ctx, DIMC_HWPE_JOB_PSIN_SRC_ADDR) + run * g.ps_vec_stride
+                + this->slot_offset(g, blk_id, m, DIMC_LOAD_PSIN), out_one, 0, 0, 0, 0, 0, 0, 0);
+}
+
+void Dimc_HWPE::configure_fill_streams(int ctx)
+{
+    for (uint32_t b = 0; b < this->inner_blocks.size(); b++)
+        for (uint32_t m = 0; m < this->job_geom[ctx].num_active; m++)
+            this->configure_macro_streams(b, m, ctx, 0, true, true, true);
+}
+
+// The output streamer of run (macro, vector) of the job in context ctx, which need not be
+// the running one.
+void Dimc_HWPE::configure_out_stream_ctx(uint32_t blk_id, uint32_t m, uint32_t run, uint32_t ctx)
+{
+    const JobGeom &g = this->job_geom[ctx];
+    const uint32_t out_one = g.row_count * DIMC_OUT_SLOT_BYTES;
+    this->inner_blocks[blk_id].out_stream[m].configure(
+        this->job_reg_ctx((int)ctx, DIMC_HWPE_JOB_DST_ADDR) + run * g.out_vec_stride
+            + this->slot_offset(g, blk_id, m, DIMC_LOAD_NONE),
+        out_one, this->job_reg_ctx((int)ctx, DIMC_HWPE_OUT_D0_LENGTH),
+        this->job_reg_ctx((int)ctx, DIMC_HWPE_OUT_D0_STRIDE), 0, 0, 0, 0, 0);
+}
+
+// The output streamer of run (macro, vector) of the running job.
+void Dimc_HWPE::configure_out_stream(uint32_t blk_id, uint32_t m, uint32_t run)
+{
+    const JobGeom &g = this->job_geom[this->exec_slot];
+    const uint32_t out_one = g.row_count * DIMC_OUT_SLOT_BYTES;
+    this->inner_blocks[blk_id].out_stream[m].configure(
+        this->job_reg(DIMC_HWPE_JOB_DST_ADDR) + run * g.out_vec_stride
+            + this->slot_offset(g, blk_id, m, DIMC_LOAD_NONE),
+        out_one, this->job_reg(DIMC_HWPE_OUT_D0_LENGTH),
+        this->job_reg(DIMC_HWPE_OUT_D0_STRIDE), 0, 0, 0, 0, 0);
+}
+
+// Beats per macro for one job: [kernel rows if fresh] + NB_VEC x (partial sums + feature).
+void Dimc_HWPE::size_fill(int ctx)
+{
     const uint32_t port_bytes = this->inner_port_bytes;
     JobGeom &g = this->job_geom[ctx];
-    uint32_t num_active = g.num_active, row_count = g.row_count;
-
     g.kb_beats_per_row   = (DIMC_MACRO_KB_EW + port_bytes - 1) / port_bytes;
     g.fb_beats_per_macro = (DIMC_MACRO_FB_EW + port_bytes - 1) / port_bytes;
+    // Partial sums are read from the slots a previous job wrote, port_bytes / SLOT rows
+    // per port word. Per vector.
     g.psin_beats_per_macro = g.psin_rows
-        ? (row_count * 4 + port_bytes - 1) / port_bytes : 0;
-    uint32_t kb_rows = g.skip_kb ? 0 : row_count;
+        ? (g.row_count * DIMC_OUT_SLOT_BYTES + port_bytes - 1) / port_bytes : 0;
+    const uint32_t kb_rows = g.skip_kb ? 0 : g.row_count;
     g.beats_per_macro = kb_rows * g.kb_beats_per_row
-                      + g.fb_beats_per_macro + g.psin_beats_per_macro;
+                      + g.nb_vec * (g.fb_beats_per_macro + g.psin_beats_per_macro);
+}
 
+// Start macro m's fill program for the job in context ctx (already latched and sized).
+void Dimc_HWPE::plan_macro_fill(uint32_t blk_id, uint32_t m, int ctx)
+{
+    const JobGeom &g = this->job_geom[ctx];
+    Dimc_InnerBlock &blk = this->inner_blocks[blk_id];
+    Dimc_InnerBlock::Cursor &cur = blk.fill;
+    if (m >= g.num_active) return;
+    if (cur.macro_beat_index.size() < blk.macros.size())
+        cur.reset((uint32_t)blk.macros.size());
+    Dimc_Macro &mc = blk.macros[m];
+    mc.fill_job  = this->ctx_job_id[ctx];
+    mc.fill_slot = (uint32_t)ctx;
+    mc.owed++;
+    cur.macro_beat_index[m] = 0;
+    cur.macro_beat_total[m] = g.beats_per_macro;
+    cur.beat_total += g.beats_per_macro;
+    // A macro still holding the running job's operands keeps its stamp: it has rows
+    // left to issue against them.
+    if (mc.filled_job != this->running_job) mc.fill_done_cycle = 0;
+    // A kernel already being streamed ahead for this job keeps its stream position. A job
+    // that keeps the kernel in the macro leaves the kernel streamer alone: it may be
+    // streaming the kernel of a later job.
+    const bool kernel_ahead = mc.kpf_job == mc.fill_job && mc.kfetched > 0;
+    this->configure_macro_streams(blk_id, m, ctx, 0, !kernel_ahead && !g.skip_kb, true, true);
+}
+
+// Every macro at once, from an empty cursor.
+void Dimc_HWPE::plan_fill(int ctx)
+{
+    this->size_fill(ctx);
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         Dimc_InnerBlock &blk = this->inner_blocks[b];
-        Dimc_InnerBlock::Cursor &cur = blk.fill;
-        cur.reset((uint32_t)blk.macros.size());
-        cur.beat_total = num_active * g.beats_per_macro;
-        for (uint32_t m = 0; m < num_active; m++) {
-            cur.macro_beat_total[m] = g.beats_per_macro;
-            blk.macros[m].fill_done_cycle = 0;
-        }
+        blk.fill.reset((uint32_t)blk.macros.size());
+        for (uint32_t m = 0; m < this->job_geom[ctx].num_active; m++)
+            this->plan_macro_fill(b, m, ctx);
     }
 }
 
@@ -298,6 +370,64 @@ static inline size_t retire_due(std::queue<uint64_t> &q, uint64_t now)
 {
     while (!q.empty() && q.front() <= now) q.pop();
     return q.size();
+}
+
+// Blocks book the shared outer port in turn: the first one served rotates every cycle.
+uint32_t Dimc_HWPE::block_order(uint32_t i) const
+{
+    return (uint32_t)((i + this->fsm_timestamp) % this->inner_blocks.size());
+}
+
+// Drop the responses that are due, and advance the sink's write-back position.
+void Dimc_HWPE::retire_block(Dimc_InnerBlock &blk)
+{
+    retire_due(blk.port_pending, this->fsm_timestamp);
+    retire_due(blk.kb_pending, this->fsm_timestamp);
+    retire_due(blk.in_pending, this->fsm_timestamp);
+    while (!blk.run_pending.empty() && blk.run_pending.front().due <= this->fsm_timestamp) {
+        const Dimc_InnerBlock::RunDone &d = blk.run_pending.front();
+        blk.retired[d.macro].job  = d.job;
+        blk.retired[d.macro].runs = d.run + 1;
+        blk.run_pending.pop_front();
+    }
+}
+
+// Run (m, run) of `job` reads partial sums that another run wrote: with PSIN_CHAIN the
+// same run of the macro before it (macro 0: of the last macro, PSIN_DEP jobs back),
+// otherwise its own run PSIN_DEP jobs back. Fetch them only once that run is
+// written back.
+bool Dimc_HWPE::psum_ready(const Dimc_InnerBlock &blk, uint32_t m, const JobGeom &g,
+                           uint32_t job, uint32_t run) const
+{
+    if (!g.psin_rows) return true;
+    uint32_t pm = m;
+    int64_t  pj = (int64_t)job;
+    if (g.psin_chain && m > 0) {
+        pm = m - 1;
+    } else {
+        if (g.psin_dep == 0 || job < g.psin_dep) return true;
+        pj = (int64_t)(job - g.psin_dep);
+        if (g.psin_chain) pm = g.num_active - 1;
+    }
+    const Dimc_InnerBlock::Retired &p = blk.retired[pm];
+    return p.job > pj || (p.job == pj && p.runs > run);
+}
+
+void Dimc_HWPE::handover_step()
+{
+    this->fetch_kernels_first();
+    for (uint32_t i = 0; i < this->inner_blocks.size(); i++) {
+        const uint32_t b = this->block_order(i);
+        Dimc_InnerBlock &blk = this->inner_blocks[b];
+        this->block_cycle(blk, b);
+    }
+    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) this->tracer.end_cycle(b);
+    this->fsm_timestamp++;
+    for (Dimc_InnerBlock &blk : this->inner_blocks) {
+        this->retire_block(blk);
+        retire_due(blk.store_pending, this->fsm_timestamp);
+        this->retire_store_acks(blk);
+    }
 }
 
 int Dimc_HWPE::fsm()
@@ -348,8 +478,10 @@ int Dimc_HWPE::fsm()
 void Dimc_HWPE::phase_end_reset()
 {
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
-        blk.fill.beat_total = 0;
-        blk.fill.beat_index = 0;
+        if (!this->fill_active) {
+            blk.fill.beat_total = 0;
+            blk.fill.beat_index = 0;
+        }
         blk.rows_issued = 0;
         blk.phase_done  = false;
     }
@@ -364,6 +496,160 @@ void Dimc_HWPE::beat_issued(Dimc_InnerBlock &blk, Dimc_InnerBlock::Cursor &curso
 }
 
 
+void Dimc_HWPE::advance_fill()
+{
+    bool any = false;
+    for (Dimc_InnerBlock &blk : this->inner_blocks)
+        if (blk.fill.beat_index < blk.fill.beat_total
+            || !blk.wgt_fifo.empty() || !blk.inp_fifo.empty()) any = true;
+    this->fill_active = any;
+    if (!DIMC_PREFILL_NEXT_JOB || this->ctx_queue.empty()) return;
+    if (DIMC_JOB_LOOKAHEAD > 1) {
+        this->advance_fill_ahead();
+        return;
+    }
+    const int nxt = this->ctx_queue.front();
+    if ((uint32_t)nxt == this->exec_slot) return;
+    const uint32_t nxt_job = this->ctx_job_id[nxt];
+
+    // One job of lookahead: a program is chained only from the running job's own.
+    if (this->job_geom[this->exec_slot].nb_vec <= 1) {
+        // One vector per job: the next job's fill starts once every macro has fetched all of
+        // this job's program. Not fill_active: a prefetched kernel in the weight FIFO keeps it set.
+        bool spent = true;
+        for (const Dimc_InnerBlock &blk : this->inner_blocks)
+            if (blk.fill.beat_index < blk.fill.beat_total) spent = false;
+        if (spent && this->fill_job == this->running_job) {
+            this->latch_geom(nxt);
+            this->fill_slot   = (uint32_t)nxt;
+            this->fill_job    = nxt_job;
+            this->plan_fill(nxt);
+            this->fill_active = true;
+        }
+        return;
+    }
+    // Batched job: each macro chains on its own as soon as its program for the running job
+    // is spent, so it may load the next kernel while its sibling still runs its last vectors.
+    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
+        Dimc_InnerBlock &blk = this->inner_blocks[b];
+        for (uint32_t m = 0; m < blk.macros.size(); m++) {
+            Dimc_Macro &mc = blk.macros[m];
+            if (mc.fill_job != this->running_job) continue;
+            if (blk.fill.macro_beat_index[m] < blk.fill.macro_beat_total[m]) continue;
+            if (this->geom_job[nxt] != nxt_job) {
+                this->latch_geom(nxt);
+                this->size_fill(nxt);
+            }
+            if (m >= this->job_geom[nxt].num_active) continue;
+            this->plan_macro_fill(b, m, nxt);
+            this->fill_slot   = (uint32_t)nxt;
+            this->fill_job    = nxt_job;
+            this->fill_active = true;
+        }
+    }
+}
+
+// The context holding `job`, among the running job and the queued ones; -1: none.
+int Dimc_HWPE::slot_of_job(uint32_t job) const
+{
+    if (this->running_ctx >= 0 && this->ctx_job_id[this->running_ctx] == job) return this->running_ctx;
+    for (int c : this->ctx_queue)
+        if (this->ctx_job_id[c] == job) return c;
+    return -1;
+}
+
+// DIMC_JOB_LOOKAHEAD > 1: each macro chains on its own to the job after its program's, as
+// soon as that program is spent: up to DIMC_JOB_LOOKAHEAD jobs past the running one for jobs
+// of one vector, one for a batched job. The FIFOs, not this, bound how far fetches run ahead.
+void Dimc_HWPE::advance_fill_ahead()
+{
+    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
+        Dimc_InnerBlock &blk = this->inner_blocks[b];
+        for (uint32_t m = 0; m < blk.macros.size() && m < blk.fill.macro_beat_index.size(); m++) {
+            Dimc_Macro &mc = blk.macros[m];
+            if (mc.fill_job == Dimc_Macro::JOB_NONE || mc.fill_job < this->running_job) continue;
+            if (blk.fill.macro_beat_index[m] < blk.fill.macro_beat_total[m]) continue;
+            const uint32_t nxt_job = mc.fill_job + 1;
+            if (nxt_job - this->running_job > (uint32_t)DIMC_JOB_LOOKAHEAD) continue;
+            const int nxt = this->slot_of_job(nxt_job);
+            if (nxt < 0) continue;
+            if (this->geom_job[nxt] != nxt_job) {
+                this->latch_geom(nxt);
+                this->size_fill(nxt);
+            }
+            if (nxt_job - this->running_job > 1
+                && (this->job_geom[nxt].nb_vec > 1 || this->job_geom[mc.fill_slot].nb_vec > 1
+                    || this->job_geom[this->exec_slot].nb_vec > 1)) continue;
+            if (m >= this->job_geom[nxt].num_active) continue;
+            this->plan_macro_fill(b, m, nxt);
+            this->fill_slot   = (uint32_t)nxt;
+            this->fill_job    = nxt_job;
+            this->fill_active = true;
+        }
+    }
+}
+
+// Fill program of one macro for one job. With the prefill: vector 0's partial sums and
+// feature, then the kernel rows (fresh jobs only), then vectors 1..NB_VEC-1, each partial
+// sums then feature; with PSIN_CHAIN the kernel rows come first. Without the prefill (one
+// vector only): feature, partial sums, kernel rows.
+Dimc_HWPE::BeatPos Dimc_HWPE::beat_pos(const JobGeom &g, uint32_t within) const
+{
+    const uint32_t fb  = g.fb_beats_per_macro;
+    const uint32_t ps  = g.psin_beats_per_macro;
+    const uint32_t kb  = g.skip_kb ? 0 : g.row_count * g.kb_beats_per_row;
+    if (!DIMC_PREFILL_NEXT_JOB) {
+        if (within < fb)      return {DIMC_LOAD_FB,   0, within};
+        if (within < fb + ps) return {DIMC_LOAD_PSIN, 0, within - fb};
+        return {DIMC_LOAD_KB, 0, within - fb - ps};
+    }
+    const uint32_t per = ps + fb;
+    // PSIN_CHAIN: vector 0's partial sums wait for a sibling run, so the kernel rows go
+    // first and the wait does not hold the kernel load.
+    const bool kb_first = g.psin_chain != 0;
+    if (kb_first) {
+        if (within < kb) return {DIMC_LOAD_KB, 0, within};
+        within -= kb;
+    }
+    if (within < ps)       return {DIMC_LOAD_PSIN, 0, within};
+    if (within < per)      return {DIMC_LOAD_FB,   0, within - ps};
+    if (!kb_first) {
+        if (within < per + kb) return {DIMC_LOAD_KB, 0, within - per};
+        within -= kb;
+    }
+    const uint32_t w = within - per;
+    const uint32_t run = 1 + w / per, k = w % per;
+    if (k < ps) return {DIMC_LOAD_PSIN, run, k};
+    return {DIMC_LOAD_FB, run, k - ps};
+}
+
+uint8_t Dimc_HWPE::beat_kind(const JobGeom &g, uint32_t within) const
+{
+    return this->beat_pos(g, within).kind;
+}
+
+// Beats after which the macro may start issuing vector 0: its feature and the kernel
+// rows. Later vectors each wait for their own feature (fb_run / fb_ready_cycle).
+uint32_t Dimc_HWPE::stamp_beats(const JobGeom &g) const
+{
+    if (!DIMC_PREFILL_NEXT_JOB) return g.beats_per_macro;
+    const uint32_t kb = g.skip_kb ? 0 : g.row_count * g.kb_beats_per_row;
+    return g.psin_beats_per_macro + g.fb_beats_per_macro + kb;
+}
+
+uint32_t Dimc_HWPE::core_beats(const JobGeom &g) const
+{
+    return this->stamp_beats(g);
+}
+
+// The macro holds operands of a job it has not finished triggering. Writing a
+// different job's feature or kernel rows into it would change those rows.
+bool Dimc_HWPE::holds_unissued(const Dimc_Macro &m) const
+{
+    return m.exec_ready && m.filled_job != Dimc_Macro::JOB_NONE
+        && !(m.issue_job == m.filled_job && m.runs_issued >= m.job_nb_vec);
+}
+
 // ================= STARTING =================
 bool Dimc_HWPE::preload_iter(int *latency)
 {
@@ -373,53 +659,117 @@ bool Dimc_HWPE::preload_iter(int *latency)
     // ---- first cycle of the phase: latch the job shape, plan every block ----
     if (!this->phase_planned) {
         const uint32_t slot = this->exec_slot;
-        this->fill_slot = slot;
-        this->latch_geom((int)slot);
-        this->plan_fill((int)slot);
+        // Latched once per job: a macro that chained ahead already latched it, and
+        // re-latching would rewrite the geometry its cursor was built from.
+        if (this->geom_job[slot] != this->running_job) this->latch_geom((int)slot);
+        // Plan the macros whose fill program is not yet for this job (or, with
+        // DIMC_JOB_LOOKAHEAD > 1, a later one). None planned: all from an empty cursor.
+        auto planned = [&](const Dimc_Macro &mc) -> bool {
+            if (mc.fill_job == this->running_job) return true;
+            return DIMC_JOB_LOOKAHEAD > 1 && mc.fill_job != Dimc_Macro::JOB_NONE
+                && mc.fill_job > this->running_job;
+        };
+        bool any_planned = false;
+        for (Dimc_InnerBlock &blk : this->inner_blocks)
+            for (uint32_t m = 0; m < this->job_geom[slot].num_active; m++)
+                if (planned(blk.macros[m])) any_planned = true;
+        if (!any_planned) {
+            this->fill_slot   = slot;
+            this->fill_job    = this->running_job;
+            this->plan_fill((int)slot);
+            this->fill_active = true;
+        } else {
+            for (uint32_t b = 0; b < this->inner_blocks.size(); b++)
+                for (uint32_t m = 0; m < this->job_geom[slot].num_active; m++)
+                    if (!planned(this->inner_blocks[b].macros[m]))
+                        this->plan_macro_fill(b, m, (int)slot);
+        }
         JobGeom &g = this->job_geom[slot];
         for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
             Dimc_InnerBlock &blk = this->inner_blocks[b];
-            for (uint32_t m = 0; m < g.num_active; m++) {
-                blk.macros[m].rows_issued  = 0;
-                blk.macros[m].rows_retired = 0;
-            }
             // The store is planned here, not at the start of DIMC_STORING: its
             // beats now issue from inside this phase, as soon as the rows they
-            // carry retire.
-            g.out_beats = (g.row_count * 4 + port_bytes - 1) / port_bytes;
+            // carry retire. rows_issued and the result set are reset per macro at its
+            // first row of this job (compute_indep): it may already be computing it.
+            // Port words per macro: SLOT-byte results, packed port_bytes / SLOT per word.
+            g.out_beats = g.nb_vec
+                * ((g.row_count * DIMC_OUT_SLOT_BYTES + port_bytes - 1) / port_bytes);
             blk.store.reset((uint32_t)blk.macros.size());
             blk.store.beat_total = g.num_active * g.out_beats;
-            blk.out_buf.assign(g.num_active,
-                               std::vector<uint8_t>(g.row_count * 4, 0));
+            if (DIMC_JOB_LOOKAHEAD > 1) {
+                // Beats of this job that left while earlier jobs ran (the tracer's view).
+                const uint32_t per_word = port_bytes / DIMC_OUT_SLOT_BYTES;
+                for (uint32_t m = 0; m < g.num_active; m++) {
+                    if (blk.stored[m] != Dimc_Macro::JOB_NONE && blk.stored[m] >= this->running_job)
+                        blk.store.beat_index += g.out_beats;
+                    else if (!blk.to_store[m].empty() && blk.to_store[m].front().job == this->running_job)
+                        blk.store.beat_index += (blk.out_results[m] + per_word - 1) / per_word;
+                }
+            } else if (DIMC_NEXT_JOB_SINK) {
+                // Results of this job that left while the previous one ran.
+                blk.store.beat_index = blk.store_next_beats;
+                for (uint32_t m = 0; m < blk.macros.size(); m++) {
+                    blk.out_results[m] = blk.out_results_next[m];
+                    blk.out_results_next[m] = 0;
+                }
+                blk.store_next_beats = 0;
+                while (!blk.store_next_pending.empty()) {
+                    blk.store_pending.push(blk.store_next_pending.front());
+                    blk.store_next_pending.pop();
+                }
+            }
         }
         this->phase_planned = true;
     }
 
-    // ---- outer-port fills ----
-    // Every block asks for its working set when the job starts. Whether the
-    // fills overlap or serialize is decided by the outer port, not here: it
-    // books bytes, so blocks whose combined demand fits one cycle all go.
-    // Per-block buffer depth (single vs ping-pong L1) is not modelled: there is
-    // one fill per block per job, so depth could only matter across triggers.
-    // ---- at most one beat per block per cycle, outer port permitting ----
-    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
+    // ---- per inner block and cycle: fill, compute, write back ----
+    // Each macro follows its own fill program, which may be for a later job than the
+    // running one. Whether the blocks' fetches overlap or serialize is decided by the
+    // outer port: it books bytes, so blocks whose combined demand fits one cycle all go.
+    this->fetch_kernels_first();
+    for (uint32_t i = 0; i < this->inner_blocks.size(); i++) {
+        const uint32_t b = this->block_order(i);
         Dimc_InnerBlock &blk = this->inner_blocks[b];
-        this->preload_block(blk, b, blk.fill);  // one beat, to the first macro still owing
-        this->compute_indep(blk, b);  // every macro whose own fill has landed
-        this->store_block(blk, b);    // and ship whatever has already retired
-        this->tracer.end_cycle(b);
+        this->block_cycle(blk, b);    // one fetch per feed, the macros' rows, one write per FIFO
+        if (DIMC_JOB_LOOKAHEAD > 1) this->store_block_ahead(blk, b);
+        else                        this->store_block(blk, b);    // and ship whatever has already retired
     }
+    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) this->tracer.end_cycle(b);
 
+    // Lowest priority: the next jobs' kernels, only on port bytes the programs left over.
+    if (DIMC_KB_PREFETCH)
+        for (uint32_t i = 0; i < this->inner_blocks.size(); i++) {
+            const uint32_t b = this->block_order(i);
+            Dimc_InnerBlock &blk = this->inner_blocks[b];
+            if (blk.wgt_fifo.size() >= DIMC_WGT_FIFO_DEPTH) continue;
+            if (blk.kb_pending.size() >= this->outstanding_depth) continue;
+            if (this->outer_port_in.busy_until() > (int64_t)this->fsm_timestamp) {
+                this->tracer.kernel_skip(b, DIMC_WHY_WAIT_OUTER_PORT);
+                continue;
+            }
+            this->kernel_prefetch(blk, b);
+        }
     this->fsm_timestamp++;
+
+    this->advance_fill();
 
     bool all_done = true;
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
-        retire_due(blk.port_pending, this->fsm_timestamp);
+        this->retire_block(blk);
+        retire_due(blk.store_pending, this->fsm_timestamp);
+        retire_due(blk.store_next_pending, this->fsm_timestamp);
+        this->retire_store_acks(blk);
+        // Done when every row of the running job has retired. The pipe may already
+        // hold the next job's rows, so its emptiness says nothing about this one.
         bool done = true;
-        for (uint32_t m = 0; m < this->job_geom[this->fill_slot].num_active; m++) {
+        const uint32_t s = this->running_job & 1;
+        for (uint32_t m = 0; m < this->job_geom[this->exec_slot].num_active; m++) {
             Dimc_Macro &mac = blk.macros[m];
-            if (mac.rows_issued < this->job_geom[this->fill_slot].row_count || !mac.pipe.empty()) done = false;
+            if (mac.set_job[s] != this->running_job ||
+                mac.rows_retired_set[s] < this->job_geom[this->exec_slot].nb_vec
+                                          * this->job_geom[this->exec_slot].row_count) done = false;
         }
+        if (DIMC_JOB_LOOKAHEAD > 1) done = this->rows_done_ahead(blk);
         blk.phase_done = done;
         if (!done) all_done = false;
     }
@@ -431,105 +781,651 @@ bool Dimc_HWPE::preload_iter(int *latency)
     return true;
 }
 
-// Issue at most one beat of one inner block. The linear beat_index is the only
-// position state; (macro, row, offset) are derived, so they cannot drift apart.
-// Phase completion is decided by the caller from beat_index and the pending
-// queue, not here, so there is nothing to report back.
+// One fill beat per feed per cycle. The kernel and input feeds each have their own TCDM
+// port and dual FIFO, and a macro's kernel and feature write ports are independent, so a
+// kernel beat and a feature beat go in the same cycle. Partial sums ride the input feed.
 void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
                               Dimc_InnerBlock::Cursor &cursor)
 {
-    const uint32_t port_bytes = this->inner_port_bytes;
-    std::queue<uint64_t> &blk_pending = blk.port_pending;
+    // Per feed and cycle: one section fetched from L1 into the dual's FIFO, and one
+    // popped from it into a macro. The fetch sees the FIFO before this cycle's pop.
+    this->fetch_feeds(blk, blk_id, cursor);
+    this->write_feeds(blk, blk_id);
+}
 
-    if (cursor.beat_index >= cursor.beat_total ||
-        blk_pending.size() >= this->outstanding_depth) {
-        if (cursor.beat_index < cursor.beat_total)
-            this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
+void Dimc_HWPE::fetch_feeds(Dimc_InnerBlock &blk, uint32_t blk_id,
+                            Dimc_InnerBlock::Cursor &cursor)
+{
+    if (cursor.beat_index < cursor.beat_total)
+        this->fill_feed(blk, blk_id, cursor, false);   // input: feature, partial sums
+    if (!blk.kb_fed_first)
+        this->fill_feed(blk, blk_id, cursor, true);    // kernel rows, or the next job's ahead
+    blk.kb_fed_first = false;
+}
+
+// DIMC_KB_FEED_FIRST: the kernel feed of each dual about to run out of the kernel being
+// written, before the block loop books any input.
+void Dimc_HWPE::fetch_kernels_first()
+{
+    if (!DIMC_KB_FEED_FIRST) return;
+    for (uint32_t i = 0; i < this->inner_blocks.size(); i++) {
+        const uint32_t b = this->block_order(i);
+        Dimc_InnerBlock &blk = this->inner_blocks[b];
+        for (uint32_t m = 0; m < blk.macros.size(); m++) {
+            const Dimc_Macro &t = blk.macros[m];
+            if (t.write_job == Dimc_Macro::JOB_NONE || t.stamped) continue;
+            const JobGeom &g = this->job_geom[t.write_slot];
+            const uint32_t kb_all = g.skip_kb ? 0 : g.row_count * g.kb_beats_per_row;
+            if (t.kw == 0 || t.kw >= kb_all) continue;
+            uint32_t n = 0;
+            for (const Dimc_InnerBlock::FeedEntry &q : blk.wgt_fifo) if (q.macro == m) n++;
+            if (n > DIMC_KB_FEED_FIRST) continue;
+            this->fill_feed(blk, b, blk.fill, true);
+            blk.kb_fed_first = true;
+            break;
+        }
+    }
+}
+
+void Dimc_HWPE::write_feeds(Dimc_InnerBlock &blk, uint32_t blk_id)
+{
+    if (DIMC_INP_FIFO_SHARED) this->write_feed(blk, blk_id, blk.inp_fifo[0]);   // one inp_pop
+    else for (auto &q : blk.inp_fifo) this->write_feed(blk, blk_id, q);
+    this->write_feed(blk, blk_id, blk.wgt_fifo);
+}
+
+// With DIMC_FB_WRITE_ON_LAST_ROW the pops follow the cycle's triggers, so a feature section
+// whose wait ends with this cycle's last row goes in now; a kernel section is held off a
+// trigger cycle by beat_writable. Otherwise the pops go first and see last cycle's state.
+void Dimc_HWPE::block_cycle(Dimc_InnerBlock &blk, uint32_t blk_id)
+{
+    if (DIMC_FB_WRITE_ON_LAST_ROW) {
+        this->fetch_feeds(blk, blk_id, blk.fill);
+        this->compute_indep(blk, blk_id);
+        this->write_feeds(blk, blk_id);
+    } else {
+        this->preload_block(blk, blk_id, blk.fill);
+        this->compute_indep(blk, blk_id);
+    }
+}
+
+// May this section be written into the macro now? Kernel and feature sections wait for
+// the write port: triggering shuts the kernel write port, and a new feature would change
+// the rows still to come. A feature of vector b >= 1 waits until vector b - 1 is fully
+// triggered (one feature buffer). Partial sums go to the ADDIN queue outside the macro.
+bool Dimc_HWPE::beat_writable(const Dimc_Macro &mc, uint32_t job, const BeatPos &pos) const
+{
+    if (pos.kind == DIMC_LOAD_PSIN) {
+        // The two ADDIN sets alternate between runs. A run's first section opens its set,
+        // which the run two before it (or the previous job's run of that parity) read last:
+        // every row of that run has to be triggered first.
+        if (pos.sub != 0 || mc.issue_job == Dimc_Macro::JOB_NONE) return true;
+        if (mc.issue_job == job) return pos.run < 2u || mc.runs_issued + 1u >= pos.run;
+        if (mc.issue_job + 1u == job)
+            return pos.run < 2u && mc.runs_issued + 1u >= mc.job_nb_vec + pos.run;
+        return false;
+    }
+    if (mc.filled_job != job && this->holds_unissued(mc)) return false;
+    // The kernel write port is shut in a trigger cycle (COMPE). Only reachable with the
+    // pops after the triggers: holds_unissued turns false in the last row's own cycle.
+    if (pos.kind == DIMC_LOAD_KB && mc.last_trigger_cycle == (int64_t)this->fsm_timestamp)
+        return false;
+    // A kernel replaces the one every earlier job of the macro computes with, so the macro
+    // must have finished triggering every job before it. Its programs are for consecutive
+    // jobs up to fill_job; `owed` of them are not finished. A kernel fetched ahead of its
+    // program is for the job after fill_job.
+    if (pos.kind == DIMC_LOAD_KB && mc.fill_job != Dimc_Macro::JOB_NONE) {
+        if (job - mc.fill_job == 1u) {
+            if (mc.owed != 0u) return false;
+        } else if (mc.fill_job - job < 0x80000000u) {
+            if (mc.owed > mc.fill_job - job + 1u) return false;
+        } else {
+            return false;
+        }
+    }
+    // The job being written is not handed to the compute side yet (its kernel may be
+    // complete while vector 0's feature still waits for its partial sums): another job's
+    // sections would overwrite it.
+    if (mc.write_job != Dimc_Macro::JOB_NONE && mc.write_job != job && !mc.stamped) return false;
+    if (pos.kind == DIMC_LOAD_FB && pos.run >= 1
+        && !(mc.issue_job == job && mc.runs_issued >= pos.run)) return false;
+    return true;
+}
+
+void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
+                          Dimc_InnerBlock::Cursor &cursor, bool kernel_feed)
+{
+    std::queue<uint64_t> &feed_pending = kernel_feed ? blk.kb_pending : blk.in_pending;
+    if (kernel_feed && DIMC_KB_PREFETCH) {
+        // Program kernel sections already fetched ahead are consumed without a fetch.
+        for (uint32_t m = 0; m < blk.macros.size() && m < cursor.macro_beat_index.size(); m++) {
+            Dimc_Macro &t = blk.macros[m];
+            if (t.kpf_job != t.fill_job) continue;
+            const JobGeom &fsel = this->job_geom[t.fill_slot];
+            while (cursor.macro_beat_index[m] < cursor.macro_beat_total[m]) {
+                const BeatPos p = this->beat_pos(fsel, cursor.macro_beat_index[m]);
+                if (p.kind != DIMC_LOAD_KB || p.sub >= t.kfetched) break;
+                cursor.macro_beat_index[m]++;
+                cursor.beat_index++;
+            }
+        }
+    }
+    if (cursor.beat_index >= cursor.beat_total && !(kernel_feed && DIMC_KB_PREFETCH)) return;
+    if (kernel_feed && blk.wgt_fifo.size() >= DIMC_WGT_FIFO_DEPTH) {
+        this->tracer.kernel_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
+        this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
         return;
     }
-    // Every block's beats share one outer port, so a block that arrives after
-    // the port is booked for this cycle waits. store_block books the same
-    // budget, so fills and stores compete for it instead of each getting a
-    // beat of their own every cycle.
-    if (this->outer_port.busy_until() > (int64_t)this->fsm_timestamp) {
+    if (feed_pending.size() >= this->outstanding_depth) {
+        if (kernel_feed) this->tracer.kernel_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
+        this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
+        return;
+    }
+    if (this->outer_port_in.busy_until() > (int64_t)this->fsm_timestamp) {
+        if (kernel_feed) this->tracer.kernel_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
         this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
         return;
     }
 
-    // Lowest-index macro that still owes beats. Same order the block-wide
-    // cursor produced, so this substitution changes nothing by itself.
-    uint32_t macro = 0;
-    while (macro < this->job_geom[this->fill_slot].num_active &&
-           cursor.macro_beat_index[macro] >= cursor.macro_beat_total[macro]) macro++;
-    if (macro >= this->job_geom[this->fill_slot].num_active) return;
-    uint32_t within = cursor.macro_beat_index[macro];
-    const JobGeom &fg = this->job_geom[this->fill_slot];
-    // The feature and the partial sums go first, then the kernel rows. The
-    // macro needs the feature vector before it can compute anything, so
-    // sending it last would keep every row waiting for the whole fill; the RTL
-    // drives FD/FA and D/WA on independent ports and imposes no order between
-    // them.
-    const uint32_t fb_span   = fg.fb_beats_per_macro;
-    const uint32_t ps_span   = fb_span + fg.psin_beats_per_macro;
-    const uint32_t kb_span   = fg.skip_kb ? 0 : fg.row_count * fg.kb_beats_per_row;
-    int lat;
-    uint32_t w = 0;   // this beat's width, charged to the outer port below
-    bool feature_done = false;
-
-    if (within >= ps_span) {                      // ---- kernel beat ----
-        uint32_t idx  = within - ps_span;
-        uint32_t row  = idx / fg.kb_beats_per_row;
-        uint32_t sub  = idx % fg.kb_beats_per_row;
-        uint32_t off  = sub * port_bytes;
-                 w    = DIMC_MACRO_KB_EW - off;
-        if (w > port_bytes) w = port_bytes;
-        lat = blk.weight_stream[macro].issue_beat((int)w, blk.macros[macro].row_buffer + off);
-        if (sub == fg.kb_beats_per_row - 1) {  // row complete -> commit
-            uint32_t row_idx = (fg.row_base + row) % DIMC_MACRO_KB_LEN;
-            blk.macros[macro].write_row((int)row_idx, blk.macros[macro].row_buffer);
-        }
-    } else if (within < fb_span) {                // ---- feature beat ----
-        uint32_t sub = within;
-        uint32_t off = sub * port_bytes;
-                 w   = DIMC_MACRO_FB_EW - off;
-        if (w > port_bytes) w = port_bytes;
-        lat = blk.input_stream[macro].issue_beat((int)w, blk.macros[macro].row_buffer + off);
-        if (sub == fb_span - 1) {                 // feature complete
-            blk.macros[macro].write_fb(blk.macros[macro].row_buffer);
-            blk.macros[macro].kb_ready = true;
-            blk.macros[macro].fb_ready = true;
-            blk.macros[macro].pipe.clear();
-            blk.macros[macro].psin_scalar = (int32_t)this->job_reg(DIMC_HWPE_PSIN);
-            feature_done = true;
-        }
-    } else {                                      // ---- partial-sum beat ----
-        uint32_t sub  = within - fb_span;
-        uint32_t off  = sub * port_bytes;
-        uint32_t left = fg.row_count * 4 - off;
-                 w    = left > port_bytes ? port_bytes : left;
-        lat = blk.psin_stream[macro].issue_beat((int)w, blk.macros[macro].row_buffer + off);
-        // A beat carries several rows; commit them once the last one lands.
-        if (sub == fg.psin_beats_per_macro - 1) {
-            for (uint32_t r = 0; r < fg.row_count; r++) {
-                uint32_t row_idx = (fg.row_base + r) % DIMC_MACRO_KB_LEN;
-                blk.macros[macro].write_psin_row((int)row_idx, blk.macros[macro].row_buffer + r * 4);
+    // Pick the macro this section is fetched for, among those whose next section is on this
+    // feed. Kernel: a macro that can take it now, else the one with the fewest runs left.
+    // Input: into the macro's own half of the input FIFO when it has room; partial sums only
+    // when no macro wants a feature, and once their producer is written back. The half is in
+    // order, so run r + 2's partial sums (run r's set) land only after run r is triggered.
+    // Rows the macro still triggers before vector `run` of `job` may enter its feature buffer.
+    auto rows_before_feature = [](const Dimc_Macro &mc, uint32_t job, uint32_t run) -> uint32_t {
+        if (mc.issue_job == Dimc_Macro::JOB_NONE) return 0;
+        uint32_t target;
+        if (mc.issue_job == job)                    target = run;
+        else if (mc.issue_job + 1u == job && !run) target = mc.job_nb_vec;
+        else                                        return 0xFFFFFFFFu;
+        if (mc.runs_issued >= target) return 0;
+        const uint32_t cur = mc.rows_issued < mc.job_rows ? mc.rows_issued : 0;
+        return (target - mc.runs_issued) * mc.job_rows - cur;
+    };
+    const uint32_t nb_fill = (uint32_t)blk.macros.size();
+    // Room per macro: half the storage each, or all of it shared.
+    const size_t   half    = DIMC_INP_FIFO_SHARED ? DIMC_INP_FIFO_DEPTH : DIMC_INP_FIFO_DEPTH / nb_fill;
+    // Shared FIFO: among the macros that may fetch, the one whose section is needed first
+    // (fewest rows before its vector may enter, plus kernel sections its job still writes).
+    auto urgency = [&](const Dimc_Macro &t, const BeatPos &pos) -> uint64_t {
+        uint64_t u = rows_before_feature(t, t.fill_job, pos.run);
+        const JobGeom &fg = this->job_geom[t.fill_slot];
+        const uint32_t kb_all = fg.skip_kb ? 0 : fg.row_count * fg.kb_beats_per_row;
+        const uint32_t kw = t.write_job == t.fill_job ? t.kw : 0;
+        if (kw < kb_all) u += kb_all - kw;
+        return u;
+    };
+    uint64_t best_u = ~(uint64_t)0;
+    uint32_t macro = nb_fill;
+    bool held_by_compute = false, held_by_psum = false;
+    for (int pass = 0; pass < 2 && macro == nb_fill; pass++) {
+        for (uint32_t m = 0; m < nb_fill; m++) {
+            if (m >= cursor.macro_beat_index.size()) break;
+            const uint32_t at = cursor.macro_beat_index[m];
+            if (at >= cursor.macro_beat_total[m]) continue;
+            const Dimc_Macro &t = blk.macros[m];
+            const JobGeom &fsel = this->job_geom[t.fill_slot];
+            const BeatPos pos = this->beat_pos(fsel, at);
+            const uint8_t k = pos.kind;
+            if ((k == DIMC_LOAD_KB) != kernel_feed) continue;
+            if (kernel_feed && DIMC_KB_PREFETCH) {
+                const uint32_t ip = this->kernel_in_progress(blk);
+                if (ip != nb_fill && ip != m) continue;
             }
+            if (kernel_feed) {
+                if (!this->beat_writable(t, t.fill_job, pos)) { held_by_compute = true; continue; }
+                macro = m;
+                break;
+            }
+            if (blk.inp_queue(m).size() >= half) continue;
+            const bool psum = k == DIMC_LOAD_PSIN;
+            if (pass == 0 && psum) continue;
+            if (psum && !this->psum_ready(blk, m, fsel, t.fill_job, pos.run)) { held_by_psum = true; continue; }
+            // A run's first partial-sum section clears its set's row flags (fill_beat). With the
+            // shared FIFO's full depth it can be fetched while an earlier run still triggers rows
+            // of that set: it waits until the set is free.
+            if (DIMC_INP_FIFO_SHARED && psum && pos.sub == 0 && !this->beat_writable(t, t.fill_job, pos)) {
+                held_by_compute = true;
+                continue;
+            }
+            // The shared FIFO pops in order: a feature section is fetched once the rows it waits
+            // for (the previous run, or the macro's current job) are at most
+            // DIMC_INP_FETCH_LEAD from triggered, so a head its macro cannot take yet holds the
+            // other macro's sections for at most that long.
+            if (DIMC_INP_FIFO_SHARED && k == DIMC_LOAD_FB && !this->beat_writable(t, t.fill_job, pos)
+                && rows_before_feature(t, t.fill_job, pos.run) > DIMC_INP_FETCH_LEAD) {
+                held_by_compute = true;
+                continue;
+            }
+            if (!DIMC_INP_FIFO_SHARED) { macro = m; break; }
+            const uint64_t u = urgency(t, pos);
+            if (u < best_u) { best_u = u; macro = m; }
         }
     }
+    if (macro == nb_fill && kernel_feed) {
+        uint32_t best_left = 0xFFFFFFFFu;
+        for (uint32_t m = 0; m < nb_fill; m++) {
+            if (m >= cursor.macro_beat_index.size()) break;
+            const uint32_t at = cursor.macro_beat_index[m];
+            if (at >= cursor.macro_beat_total[m]) continue;
+            const Dimc_Macro &t = blk.macros[m];
+            if (this->beat_pos(this->job_geom[t.fill_slot], at).kind != DIMC_LOAD_KB) continue;
+            if (DIMC_KB_PREFETCH) {
+                const uint32_t ip = this->kernel_in_progress(blk);
+                if (ip != nb_fill && ip != m) continue;
+            }
+            const uint32_t left = t.job_nb_vec > t.runs_issued ? t.job_nb_vec - t.runs_issued : 0;
+            if (left < best_left) { best_left = left; macro = m; }
+        }
+    }
+    if (macro == nb_fill) {
+        if (held_by_psum) {
+            this->psum_waits++;
+            this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_PSUM);
+        } else if (held_by_compute) {
+            this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_COMPUTE);
+        }
+        return;
+    }
+    this->fill_beat(blk, blk_id, cursor, macro, feed_pending);
+}
+
+// The macro whose kernel is partly in the weight FIFO (started, not finished), or nb.
+// Its sections must all go in before any other macro's, or the FIFO holds two kernels
+// interleaved and the first macro waits behind the second's compute.
+uint32_t Dimc_HWPE::kernel_in_progress(const Dimc_InnerBlock &blk) const
+{
+    for (uint32_t m = 0; m < blk.macros.size(); m++) {
+        const Dimc_Macro &t = blk.macros[m];
+        if (t.kpf_job == Dimc_Macro::JOB_NONE || t.kfetched == 0) continue;
+        const JobGeom &g = this->job_geom[t.kpf_slot];
+        if (this->geom_job[t.kpf_slot] != t.kpf_job) continue;
+        if (t.kfetched < g.row_count * g.kb_beats_per_row) return m;
+    }
+    return (uint32_t)blk.macros.size();
+}
+
+// True when every macro of the dual has fetched the whole kernel of every job from the
+// running one up to (not including) `job` that needs a kernel on it.
+bool Dimc_HWPE::kernels_fetched_before(Dimc_InnerBlock &blk, uint32_t job)
+{
+    auto check = [&](uint32_t j, int slot) -> bool {
+        if (j >= job) return true;
+        if (this->geom_job[slot] != j) { this->latch_geom(slot); this->size_fill(slot); }
+        const JobGeom &g = this->job_geom[slot];
+        if (g.skip_kb) return true;
+        const uint32_t kb_all = g.row_count * g.kb_beats_per_row;
+        for (uint32_t m = 0; m < blk.macros.size() && m < g.num_active; m++) {
+            const Dimc_Macro &t = blk.macros[m];
+            if (t.kpf_job != Dimc_Macro::JOB_NONE && t.kpf_job > j) continue;
+            if (t.kpf_job == j && t.kfetched >= kb_all) continue;
+            // The running job's kernel may already sit in the macro from before this bookkeeping.
+            if (j == this->running_job && (t.filled_job == j || t.write_job == j) && t.kw >= kb_all) continue;
+            return false;
+        }
+        return true;
+    };
+    if (this->running_ctx >= 0 && !check(this->running_job, (int)this->exec_slot)) return false;
+    for (int c : this->ctx_queue) {
+        const uint32_t j = this->ctx_job_id[c];
+        if (j >= job) break;
+        if (!check(j, c)) return false;
+    }
+    return true;
+}
+
+// First program index after a macro's kernel sections for a job of geometry g.
+uint32_t Dimc_HWPE::kb_end(const JobGeom &g) const
+{
+    const uint32_t kb = g.skip_kb ? 0 : g.row_count * g.kb_beats_per_row;
+    if (g.psin_chain != 0) return kb;
+    return g.psin_beats_per_macro + g.fb_beats_per_macro + kb;
+}
+
+// Fetch one kernel section of a macro's next job (or of its current one-vector job whose
+// program has not reached the kernel) into the weight FIFO, ahead of the program. Only while
+// no other macro of the dual owes kernel sections its program has reached; one macro at a
+// time: the one in progress, else the one with the fewest runs left.
+bool Dimc_HWPE::kernel_prefetch(Dimc_InnerBlock &blk, uint32_t blk_id)
+{
+    Dimc_InnerBlock::Cursor &cur = blk.fill;
+    const uint32_t nb = (uint32_t)blk.macros.size();
+    const uint32_t ip = this->kernel_in_progress(blk);
+    uint32_t own = 0;   // macros whose kernel of their current program is fetched ahead
+    for (uint32_t m = 0; m < nb && m < cur.macro_beat_index.size(); m++) {
+        if (m == ip) continue;
+        const Dimc_Macro &t = blk.macros[m];
+        if (t.fill_job == Dimc_Macro::JOB_NONE) continue;
+        if (cur.macro_beat_index[m] >= cur.macro_beat_total[m]) continue;
+        const JobGeom &g = this->job_geom[t.fill_slot];
+        if (g.skip_kb) continue;
+        const uint32_t kb_all = g.row_count * g.kb_beats_per_row;
+        if (cur.macro_beat_index[m] < this->kb_end(g)
+            && !(t.kpf_job == t.fill_job && t.kfetched >= kb_all)) {
+            // One vector, program still before its kernel sections: fetched ahead below.
+            if (g.nb_vec <= 1 && cur.macro_beat_index[m] < this->kb_end(g) - kb_all) {
+                own |= 1u << m;
+                continue;
+            }
+            return false;
+        }
+    }
+    // The job after each macro's current fill job.
+    auto next_of = [&](uint32_t job, int *slot) -> bool {
+        if (job == this->running_job) {
+            if (this->ctx_queue.empty() || (uint32_t)this->ctx_queue.front() == this->exec_slot) return false;
+            *slot = this->ctx_queue.front(); return true;
+        }
+        for (size_t i = 0; i + 1 < this->ctx_queue.size(); i++)
+            if (this->ctx_job_id[this->ctx_queue[i]] == job) { *slot = this->ctx_queue[i + 1]; return true; }
+        return false;
+    };
+    uint32_t pick = nb, best_left = 0xFFFFFFFFu;
+    int pick_slot = -1;
+    if (ip != nb) {
+        // Finish the kernel already under way, whether or not its program is planned.
+        pick = ip; pick_slot = (int)blk.macros[ip].kpf_slot;
+    }
+    for (uint32_t m = 0; m < nb && pick == nb; m++) {
+        const Dimc_Macro &t = blk.macros[m];
+        if (t.fill_job == Dimc_Macro::JOB_NONE) continue;
+        int slot;
+        if (own >> m & 1u)                    slot = (int)t.fill_slot;
+        else if (!next_of(t.fill_job, &slot)) continue;
+        uint32_t job = this->ctx_job_id[slot];
+        if (this->geom_job[slot] != job) { this->latch_geom(slot); this->size_fill(slot); }
+        // DIMC_JOB_LOOKAHEAD > 1: skip the jobs that keep the held kernel, to the next one
+        // that loads its own, so it is fetched on leftover port bytes.
+        while (DIMC_JOB_LOOKAHEAD > 1 && this->job_geom[slot].skip_kb
+               && m < this->job_geom[slot].num_active && this->job_geom[slot].nb_vec <= 1) {
+            if (!next_of(job, &slot)) { slot = -1; break; }
+            job = this->ctx_job_id[slot];
+            if (this->geom_job[slot] != job) { this->latch_geom(slot); this->size_fill(slot); }
+        }
+        if (slot < 0) continue;
+        const JobGeom &gn = this->job_geom[slot];
+        if (m >= gn.num_active || gn.skip_kb) continue;
+        const uint32_t kb_all = gn.row_count * gn.kb_beats_per_row;
+        const uint32_t done = t.kpf_job == job ? t.kfetched : 0;
+        if (done >= kb_all) continue;
+        // Every macro of the dual, this one included, must have fetched its kernel of every
+        // earlier job still to run, or this kernel would enter the FIFO ahead of one needed first.
+        if (done == 0 && !this->kernels_fetched_before(blk, job)) continue;
+        if (done > 0) { pick = m; pick_slot = slot; break; }       // the one in progress
+        const uint32_t left = t.job_nb_vec > t.runs_issued ? t.job_nb_vec - t.runs_issued : 0;
+        if (left < best_left) { best_left = left; pick = m; pick_slot = slot; }
+    }
+    if (pick == nb) return false;
+    // Only one macro's kernel ahead in the FIFO at a time. With DIMC_JOB_LOOKAHEAD > 1 a
+    // kernel that is fetched whole may have another macro's behind it: the FIFO keeps
+    // their order, and the second is in when the first macro has taken its own.
+    for (const Dimc_InnerBlock::FeedEntry &q : blk.wgt_fifo) {
+        if (q.macro == pick) continue;
+        const Dimc_Macro &o = blk.macros[q.macro];
+        const JobGeom &og = this->job_geom[q.slot];
+        if (DIMC_JOB_LOOKAHEAD > 1 && o.kpf_job == q.job && this->geom_job[q.slot] == q.job
+            && o.kfetched >= og.row_count * og.kb_beats_per_row) continue;
+        return false;
+    }
+    Dimc_Macro &fm = blk.macros[pick];
+    const uint32_t job = this->ctx_job_id[pick_slot];
+    const JobGeom &fg = this->job_geom[pick_slot];
+    if (fm.kpf_job != job) {
+        fm.kpf_job = job; fm.kpf_slot = (uint32_t)pick_slot; fm.kfetched = 0;
+        this->configure_macro_streams(blk_id, pick, pick_slot, 0, true, false, false);
+    }
+    const uint32_t port_bytes = this->inner_port_bytes;
+    const uint32_t sub = fm.kfetched;
+    Dimc_InnerBlock::FeedEntry e;
+    e.macro = pick; e.slot = (uint32_t)pick_slot; e.job = job;
+    e.within = (fg.psin_chain != 0 ? 0u : fg.psin_beats_per_macro + fg.fb_beats_per_macro) + sub;
+    const uint32_t off = (sub % fg.kb_beats_per_row) * port_bytes;
+    e.bytes = DIMC_MACRO_KB_EW - off < port_bytes ? DIMC_MACRO_KB_EW - off : port_bytes;
+    int lat = blk.weight_stream[pick].issue_beat((int)e.bytes, e.data);
+    if (lat < 1) lat = 1;
+    e.ready = this->fsm_timestamp + (uint64_t)lat + 1;
+    blk.wgt_fifo.push_back(e);
+    fm.kfetched++;
+    this->outer_port_in.request((int64_t)this->fsm_timestamp, e.bytes);
+    this->tracer.outer_port_booked(blk_id, false);
+    blk.kb_pending.push(this->fsm_timestamp + (uint64_t)lat);
+    blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
+    return true;
+}
+
+// DIMC_HELD_KB_PRELOAD: one cycle while the engine is idle and the queue is held. Each dual
+// fetches the first held job's kernel, one macro at a time, into its weight FIFO and writes
+// the head section into its macro; the job's fill program then skips what is done (kfetched, kw).
+void Dimc_HWPE::held_handler(vp::Block *__this, vp::ClockEvent *event)
+{
+    Dimc_HWPE *_this = (Dimc_HWPE *)__this;
+    if (_this->job_running || _this->ctx_queue.empty()) return;
+    const int ctx = _this->ctx_queue.front();
+    const uint32_t job = _this->ctx_job_id[ctx];
+    if (_this->geom_job[ctx] != job) { _this->latch_geom(ctx); _this->size_fill(ctx); }
+    bool more = false, did = false;
+    for (uint32_t b = 0; b < _this->inner_blocks.size(); b++) {
+        Dimc_InnerBlock &blk = _this->inner_blocks[b];
+        const size_t q0 = blk.wgt_fifo.size();
+        uint32_t f0 = 0;
+        for (const Dimc_Macro &m : blk.macros) f0 += m.kfetched;
+        if (_this->held_kernel_step(blk, b, ctx)) more = true;
+        const size_t q1 = blk.wgt_fifo.size();
+        _this->write_feed(blk, b, blk.wgt_fifo);
+        uint32_t f1 = 0;
+        for (const Dimc_Macro &m : blk.macros) f1 += m.kfetched;
+        if (f1 != f0 || blk.wgt_fifo.size() != q1 || q1 != q0) did = true;
+        if (!blk.wgt_fifo.empty()) more = true;
+    }
+    for (uint32_t b = 0; b < _this->inner_blocks.size(); b++) _this->tracer.end_cycle(b);
+    // A call with nothing to do (the one after the last write) only records the idle
+    // cycle, so the trace does not keep the last load until the job starts.
+    if (!more && !did) return;
+    _this->fsm_timestamp++;
+    for (Dimc_InnerBlock &blk : _this->inner_blocks) _this->retire_block(blk);
+    _this->event_enqueue(_this->held_event, 1);
+}
+
+// Fetch one kernel section of the held job for the lowest macro whose kernel is not all
+// fetched, while the FIFO holds no other macro's sections. False when there is nothing
+// left to fetch for this dual.
+bool Dimc_HWPE::held_kernel_step(Dimc_InnerBlock &blk, uint32_t blk_id, int ctx)
+{
+    const JobGeom &g = this->job_geom[ctx];
+    const uint32_t job = this->ctx_job_id[ctx];
+    if (g.skip_kb) return false;
+    const uint32_t kb_all = g.row_count * g.kb_beats_per_row;
+    uint32_t pick = (uint32_t)blk.macros.size();
+    for (uint32_t m = 0; m < blk.macros.size() && m < g.num_active; m++) {
+        const Dimc_Macro &t = blk.macros[m];
+        if (t.kpf_job == job && t.kfetched >= kb_all) continue;
+        pick = m;
+        break;
+    }
+    if (pick == blk.macros.size()) return false;
+    for (const Dimc_InnerBlock::FeedEntry &q : blk.wgt_fifo)
+        if (q.macro != pick) return true;          // the previous macro's kernel drains first
+    if (blk.wgt_fifo.size() >= DIMC_WGT_FIFO_DEPTH) return true;
+    if (blk.kb_pending.size() >= this->outstanding_depth) return true;
+    if (this->outer_port_in.busy_until() > (int64_t)this->fsm_timestamp) return true;
+    Dimc_Macro &fm = blk.macros[pick];
+    if (fm.kpf_job != job) {
+        fm.kpf_job = job; fm.kpf_slot = (uint32_t)ctx; fm.kfetched = 0;
+        this->configure_macro_streams(blk_id, pick, ctx, 0, true, false, false);
+    }
+    const uint32_t port_bytes = this->inner_port_bytes;
+    const uint32_t sub = fm.kfetched;
+    Dimc_InnerBlock::FeedEntry e;
+    e.macro = pick; e.slot = (uint32_t)ctx; e.job = job;
+    e.within = (g.psin_chain != 0 ? 0u : g.psin_beats_per_macro + g.fb_beats_per_macro) + sub;
+    const uint32_t off = (sub % g.kb_beats_per_row) * port_bytes;
+    e.bytes = DIMC_MACRO_KB_EW - off < port_bytes ? DIMC_MACRO_KB_EW - off : port_bytes;
+    int lat = blk.weight_stream[pick].issue_beat((int)e.bytes, e.data);
+    if (lat < 1) lat = 1;
+    e.ready = this->fsm_timestamp + (uint64_t)lat + 1;
+    blk.wgt_fifo.push_back(e);
+    fm.kfetched++;
+    this->outer_port_in.request((int64_t)this->fsm_timestamp, e.bytes);
+    blk.kb_pending.push(this->fsm_timestamp + (uint64_t)lat);
+    blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
+    return true;
+}
+
+// Fetch one section of macro `macro`'s program from L1 into the dual's FIFO.
+void Dimc_HWPE::fill_beat(Dimc_InnerBlock &blk, uint32_t blk_id,
+                          Dimc_InnerBlock::Cursor &cursor, uint32_t macro,
+                          std::queue<uint64_t> &feed_pending)
+{
+    const uint32_t port_bytes = this->inner_port_bytes;
+    const uint32_t within = cursor.macro_beat_index[macro];
+    Dimc_Macro &fm = blk.macros[macro];
+    const JobGeom &fg = this->job_geom[fm.fill_slot];
+    const BeatPos  pos = this->beat_pos(fg, within);
+    const uint32_t ps_span = fg.psin_beats_per_macro;
+    const uint32_t pset    = (fm.fill_job * fg.nb_vec + pos.run) & 1;
+    const uint8_t  kind    = pos.kind;
+
+    // First section of a run: mark its partial sums outstanding, in the run's set, which
+    // no row still to trigger reads.
+    const bool run_start = pos.sub == 0
+        && kind == (ps_span ? DIMC_LOAD_PSIN : DIMC_LOAD_FB);
+    if (run_start)
+        for (uint64_t &r : fm.psin_row_ready[pset])
+            r = fg.psin_rows ? ~(uint64_t)0 : 0;
+    // Vectors after the first read their own feature and partial-sum blocks.
+    if (pos.run >= 1 && pos.sub == 0 && kind != DIMC_LOAD_KB)
+        this->configure_macro_streams(blk_id, macro, (int)fm.fill_slot, pos.run,
+                                      false, kind == DIMC_LOAD_FB, kind == DIMC_LOAD_PSIN);
+
+    Dimc_InnerBlock::FeedEntry e;
+    e.macro = macro; e.slot = fm.fill_slot; e.job = fm.fill_job; e.within = within;
+    int lat;
+    if (kind == DIMC_LOAD_KB) {
+        const uint32_t off = (pos.sub % fg.kb_beats_per_row) * port_bytes;
+        e.bytes = DIMC_MACRO_KB_EW - off < port_bytes ? DIMC_MACRO_KB_EW - off : port_bytes;
+        lat = blk.weight_stream[macro].issue_beat((int)e.bytes, e.data);
+        if (fm.kpf_job != fm.fill_job) { fm.kpf_job = fm.fill_job; fm.kpf_slot = fm.fill_slot; fm.kfetched = 0; }
+        fm.kfetched++;
+    } else if (kind == DIMC_LOAD_FB) {
+        const uint32_t off = pos.sub * port_bytes;
+        e.bytes = DIMC_MACRO_FB_EW - off < port_bytes ? DIMC_MACRO_FB_EW - off : port_bytes;
+        lat = blk.input_stream[macro].issue_beat((int)e.bytes, e.data);
+    } else {
+        const uint32_t per   = port_bytes / DIMC_OUT_SLOT_BYTES;
+        const uint32_t first = pos.sub * per;
+        const uint32_t n     = fg.row_count - first < per ? fg.row_count - first : per;
+        e.bytes = n * DIMC_OUT_SLOT_BYTES;
+        lat = blk.psin_stream[macro].issue_beat((int)e.bytes, e.data);
+    }
+    if (lat < 1) lat = 1;
+    e.ready = this->fsm_timestamp + (uint64_t)lat + 1;   // fifo_v3, not fall-through
+    (kind == DIMC_LOAD_KB ? blk.wgt_fifo : blk.inp_queue(macro)).push_back(e);
 
     cursor.macro_beat_index[macro]++;
-    const bool macro_filled = cursor.macro_beat_index[macro] >= cursor.macro_beat_total[macro];
-    if (macro_filled) {
-        blk.macros[macro].fill_done_cycle = this->fsm_timestamp + (uint64_t)lat;
-        // Hand the freshly filled buffers to the compute side.
-        Dimc_Macro &mc = blk.macros[macro];
-        mc.exec_ready = true;
-        mc.last_kb_src = this->job_geom[this->fill_slot].kb_src;   // the fill landed
-    }
-    this->outer_port.request((int64_t)this->fsm_timestamp, w);
-    this->tracer.outer_port_booked();
+    this->outer_port_in.request((int64_t)this->fsm_timestamp, e.bytes);
+    this->tracer.outer_port_booked(blk_id, false);
+    feed_pending.push(this->fsm_timestamp + (uint64_t)lat);
     this->beat_issued(blk, cursor, lat);
-    this->tracer.fill_beat(blk_id, macro, within, macro_filled, feature_done, lat);
+}
+
+// Pop the head of one feed's FIFO into its macro, once landed and once the macro's
+// write port takes it (head-of-line: a section the macro cannot take yet holds the
+// sections behind it).
+void Dimc_HWPE::write_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
+                           std::deque<Dimc_InnerBlock::FeedEntry> &fifo)
+{
+    if (fifo.empty()) return;
+    const Dimc_InnerBlock::FeedEntry &e = fifo.front();
+    if (e.ready > this->fsm_timestamp) return;
+    Dimc_Macro &mc = blk.macros[e.macro];
+    const JobGeom &g = this->job_geom[e.slot];
+    const BeatPos pos = this->beat_pos(g, e.within);
+    if (!this->beat_writable(mc, e.job, pos)) {
+        this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_COMPUTE);
+        return;
+    }
+    // The macro's write program follows its sections: a new job's first one opens it.
+    if (mc.write_job != e.job) {
+        mc.write_job  = e.job;
+        mc.write_slot = e.slot;
+        mc.written    = 0;
+        mc.kw = 0; mc.f0 = false; mc.stamped = false;
+    }
+    if (pos.kind == DIMC_LOAD_KB) mc.kw++;
+    const uint32_t port_bytes = this->inner_port_bytes;
+    const uint32_t pset       = (e.job * g.nb_vec + pos.run) & 1;
+    bool feature_done = false;
+
+    if (pos.kind == DIMC_LOAD_KB) {
+        const uint32_t row = pos.sub / g.kb_beats_per_row;
+        const uint32_t sub = pos.sub % g.kb_beats_per_row;
+        std::memcpy(mc.kb_row_buffer + sub * port_bytes, e.data, e.bytes);
+        if (sub == g.kb_beats_per_row - 1)   // row complete -> commit
+            mc.write_row((int)((g.row_base + row) % DIMC_MACRO_KB_LEN), mc.kb_row_buffer);
+    } else if (pos.kind == DIMC_LOAD_FB) {
+        std::memcpy(mc.row_buffer + pos.sub * port_bytes, e.data, e.bytes);
+        if (pos.sub == g.fb_beats_per_macro - 1) {   // feature complete
+            mc.write_fb(mc.row_buffer);
+            mc.kb_ready = true;
+            mc.fb_ready = true;
+            // The pipe is NOT cleared here: when the fill runs ahead, it still holds
+            // the previous job's last rows, triggered before this feature landed.
+            mc.psin_scalar = (int32_t)this->job_reg_ctx((int)e.slot, DIMC_HWPE_PSIN);
+            mc.fb_run = pos.run;
+            mc.fb_ready_cycle = this->fsm_timestamp + 1;
+            feature_done = true;
+            if (pos.run == 0) mc.f0 = true;
+        }
+    } else {
+        // Rows [first, first + n) in one port word; each row's value is the low 4 bytes
+        // of its SLOT-byte slot.
+        const uint32_t per   = port_bytes / DIMC_OUT_SLOT_BYTES;
+        const uint32_t first = pos.sub * per;
+        const uint32_t n     = e.bytes / DIMC_OUT_SLOT_BYTES;
+        // The set these partial sums go into was last read by the run two before this one,
+        // or by the previous job's run of that parity; its rows must all be triggered.
+        // beat_writable already holds such a section: this is a consistency check.
+        if (pos.sub == 0) {
+            bool free_set;
+            if (mc.issue_job == Dimc_Macro::JOB_NONE) free_set = true;          /* never triggered */
+            else if (mc.issue_job == e.job)           free_set = pos.run < 2u || mc.runs_issued + 1u >= pos.run;
+            else if (mc.issue_job + 1u == e.job)      free_set = pos.run < 2u
+                                                          && (mc.runs_issued + 1u >= mc.job_nb_vec + pos.run);
+            else                                       free_set = false;   /* two or more jobs ahead */
+            if (!free_set)
+                this->trace.force_warning("DIMC psin set overwrite: macro %u job %u run %u set %u while the "
+                    "set's previous run still has rows to trigger\n", (unsigned)e.macro, e.job, pos.run, pset);
+        }
+        for (uint32_t j = 0; j < n; j++) {
+            const uint32_t row_idx = (g.row_base + first + j) % DIMC_MACRO_KB_LEN;
+            mc.write_psin_row((int)row_idx, e.data + j * DIMC_OUT_SLOT_BYTES, (int)pset);
+            mc.psin_row_ready[pset][row_idx] = this->fsm_timestamp + 1;
+        }
+    }
+    const uint32_t within = e.within, macro = e.macro;
+    fifo.pop_front();
+    mc.written++;
+    const bool macro_filled = mc.written >= g.beats_per_macro;
+    // Vector 0's feature and the whole kernel (unless reused) are in. The partial sums
+    // are gated per row (psin_row_ready), so they need not be counted here.
+    const uint32_t kb_all = g.skip_kb ? 0 : g.row_count * g.kb_beats_per_row;
+    const bool ready = DIMC_KB_PREFETCH ? (!mc.stamped && mc.f0 && mc.kw >= kb_all)
+                                        : mc.written == this->stamp_beats(g);
+    if (ready) {
+        mc.stamped = true;
+        // Vector 0's feature and the kernel rows are in: hand the macro to the compute
+        // side, with the shape of the job it now holds.
+        mc.fill_done_cycle = this->fsm_timestamp + 1;
+        mc.exec_ready   = true;
+        mc.filled_job   = mc.write_job;
+        mc.filled_slot  = mc.write_slot;
+        mc.job_nb_vec   = g.nb_vec;
+        mc.job_rows     = g.row_count;
+        mc.job_row_base = g.row_base;
+        mc.psin_rows    = (uint8_t)g.psin_rows;
+    }
+    this->tracer.fill_beat(blk_id, macro, within, macro_filled, feature_done, 1);
 }
 
 // Rows are issued and drained inside the fill phase, one macro at a time as
@@ -541,20 +1437,72 @@ void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
 // sibling that is ready to compute. That overlap is the inner double buffer.
 void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
 {
-    const uint32_t num_active = this->job_geom[this->exec_slot].num_active;
-    const uint32_t row_count  = this->job_geom[this->exec_slot].row_count;
-
     this->drain_ready_rows(blk);
 
-    for (uint32_t m = 0; m < num_active; m++) {
+    // Each macro triggers whenever its own vector is ready; results go to its own out_fifo,
+    // so two macros may trigger in one cycle. With DIMC_JOB_OVERLAP a macro holding a later
+    // job's operands issues its rows too, only into free out_fifo entries.
+    const uint32_t J = this->running_job;
+    const size_t fifo_cap = DIMC_OUT_FIFO_DEPTH / blk.macros.size();
+    // DIMC_OUT_FIFO_SHARED: the macros in trigger priority (older job, then lower index);
+    // one trigger per cycle, and only while every result in flight has an entry.
+    uint32_t order[8];
+    const uint32_t nb_mac = (uint32_t)blk.macros.size();
+    for (uint32_t i = 0; i < nb_mac; i++) order[i] = i;
+    size_t in_flight = blk.out_shared.size();
+    if (DIMC_OUT_FIFO_SHARED) {
+        std::stable_sort(order, order + nb_mac, [&](uint32_t a, uint32_t b) {
+            return blk.macros[a].filled_job < blk.macros[b].filled_job;
+        });
+        for (uint32_t i = 0; i < nb_mac; i++) in_flight += blk.macros[i].pipe.size();
+    }
+    bool push_slot_taken = false;
+    for (uint32_t i = 0; i < nb_mac; i++) {
+        const uint32_t m = order[i];
         Dimc_Macro &mac = blk.macros[m];
-        bool filled = mac.exec_ready
-                   && this->fsm_timestamp >= mac.fill_done_cycle;
-        if (filled && mac.rows_issued < row_count && mac.can_accept()) {
-            uint32_t row_idx = (this->job_geom[this->exec_slot].row_base + mac.rows_issued) % DIMC_MACRO_KB_LEN;
-            mac.issue((int)row_idx, (int)mac.rows_issued, this->job_geom[this->exec_slot].bias);
-            mac.rows_issued++;
-            this->tracer.row_issued(blk_id, m, mac.rows_issued, row_count);
+        const bool ahead = DIMC_JOB_OVERLAP
+            && (DIMC_JOB_LOOKAHEAD > 1 ? (mac.filled_job != Dimc_Macro::JOB_NONE && mac.filled_job > J)
+                                       : mac.filled_job == J + 1);
+        if (mac.exec_ready && (mac.filled_job == J || ahead)) {
+            const uint32_t jj = mac.filled_job;
+            if (mac.issue_job != jj) {
+                const uint32_t s = jj & 1;
+                mac.issue_job = jj;
+                mac.issue_slot = mac.filled_slot;
+                mac.rows_issued = 0;
+                mac.runs_issued = 0;
+                mac.set_job[s] = jj;
+                mac.rows_retired_set[s] = 0;
+                if (DIMC_JOB_LOOKAHEAD > 1) {
+                    const uint32_t rows = mac.job_rows * mac.job_nb_vec;
+                    blk.in_pipe[m].push_back({jj, mac.filled_slot, rows});
+                    blk.to_store[m].push_back({jj, mac.filled_slot, rows});
+                }
+            }
+            const uint32_t b = mac.runs_issued;   // the vector it issues next
+            const bool room = DIMC_OUT_FIFO_SHARED
+                ? !push_slot_taken && in_flight < DIMC_OUT_FIFO_DEPTH
+                : !ahead || blk.out_fifo[m].size() + mac.pipe.size() < fifo_cap;
+            if (b < mac.job_nb_vec && mac.fb_run == b && room
+                && this->fsm_timestamp >= mac.fb_ready_cycle
+                && this->fsm_timestamp >= mac.fill_done_cycle && mac.can_accept()) {
+                if (mac.rows_issued >= mac.job_rows) mac.rows_issued = 0;   // next run
+                const uint32_t row_idx = (mac.job_row_base + mac.rows_issued) % DIMC_MACRO_KB_LEN;
+                const uint32_t pset = (jj * mac.job_nb_vec + b) & 1;
+                if (!mac.psin_rows || this->fsm_timestamp >= mac.psin_row_ready[pset][row_idx]) {
+                    mac.psin_sel = (uint8_t)pset;
+                    mac.issue((int)row_idx, (int)mac.rows_issued, (int)(jj & 1), (int)b);
+                    mac.last_trigger_cycle = (int64_t)this->fsm_timestamp;
+                    push_slot_taken = true;
+                    in_flight++;
+                    mac.rows_issued++;
+                    this->tracer.row_issued(blk_id, m, mac.rows_issued, mac.job_rows);
+                    if (mac.rows_issued >= mac.job_rows) {
+                        mac.runs_issued++;
+                        if (mac.runs_issued >= mac.job_nb_vec && mac.owed) mac.owed--;
+                    }
+                }
+            }
         }
         mac.tick();
     }
@@ -562,17 +1510,44 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
 
 void Dimc_HWPE::drain_ready_rows(Dimc_InnerBlock &blk)
 {
-    const uint32_t out_w = 4;
-    for (uint32_t m = 0; m < this->job_geom[this->exec_slot].num_active; m++) {
-        uint8_t *out_buf = blk.out_buf[m].data();
-        while (blk.macros[m].has_ready()) {
-            DimcPipeEntry e = blk.macros[m].drain();
-            uint32_t psout_u = (uint32_t)e.psout;
-            std::memcpy(out_buf + e.job_row * out_w, &psout_u, out_w);
-            blk.macros[m].rows_retired++;
-            // The same pop clocks the output accumulator (cleopatra.sv).
-            blk.out_accum.push(e.psout);
+    // A macro is never stalled for its out_fifo: a result the FIFO cannot take is lost, as
+    // in the RTL. The model also warns, and a force_warning fails the run.
+    bool pushed = false;   // DIMC_OUT_FIFO_SHARED: the cycle's one push
+    for (uint32_t m = 0; m < blk.macros.size(); m++) {
+        if (!blk.macros[m].has_ready()) continue;
+        DimcPipeEntry e = blk.macros[m].drain();
+        blk.macros[m].rows_retired_set[e.set]++;
+        if (DIMC_JOB_LOOKAHEAD > 1 && !blk.in_pipe[m].empty()) {
+            // The pipe is in trigger order: the row belongs to the oldest job in it.
+            Dimc_InnerBlock::JobLeft &f = blk.in_pipe[m].front();
+            if (--f.left == 0) {
+                blk.pipe_done[m] = f.job;
+                blk.in_pipe[m].pop_front();
+            }
         }
+        if (DIMC_OUT_FIFO_SHARED) {
+            if (blk.out_shared.size() >= DIMC_OUT_FIFO_DEPTH || pushed) {
+                this->out_dropped++;
+                if (this->out_dropped <= 8)
+                    this->trace.force_warning("DIMC result lost: macro %u row %d (shared out_fifo %s)\n",
+                                              m, e.job_row, pushed ? "push slot taken" : "full");
+                continue;
+            }
+            pushed = true;
+            blk.out_shared.push_back({e.psout, (uint16_t)e.job_row, (uint16_t)e.run, (uint16_t)m});
+            blk.out_accum.push(e.psout);
+            continue;
+        }
+        if (blk.out_fifo[m].size() >= DIMC_OUT_FIFO_DEPTH / blk.macros.size()) {
+            this->out_dropped++;
+            if (this->out_dropped <= 8)
+                this->trace.force_warning("DIMC result lost: macro %u row %d (out_fifo full)\n",
+                                          m, e.job_row);
+            continue;
+        }
+        blk.out_fifo[m].push_back({e.psout, (uint16_t)e.job_row, (uint16_t)e.run});
+        // The same pop clocks the output accumulator.
+        blk.out_accum.push(e.psout);
     }
 }
 
@@ -585,26 +1560,34 @@ bool Dimc_HWPE::store_iter(int *latency)
         this->phase_planned = true;
     }
 
-    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
+    for (uint32_t i = 0; i < this->inner_blocks.size(); i++) {
+        const uint32_t b = this->block_order(i);
         Dimc_InnerBlock &blk = this->inner_blocks[b];
+        if (i == 0) this->fetch_kernels_first();
         // The macro pipeline does not stop because the job moved on to
         // storing: rows issued near the end of the fill are still in flight and
-        // have to retire before their beats can go out. compute_indep issues
-        // nothing here -- every row is already issued -- it ticks and drains.
-        this->compute_indep(blk, b);
-        if (!blk.phase_done) this->store_block(blk, b);
-        this->tracer.end_cycle(b);
+        // have to retire before their beats can go out. Every row of the running
+        // job is already issued; compute_indep ticks and drains, and may issue a
+        // later job's rows.
+        this->block_cycle(blk, b);                // the next job keeps filling
+        if (DIMC_JOB_LOOKAHEAD > 1) this->store_block_ahead(blk, b);
+        else if (!blk.phase_done)   this->store_block(blk, b);
     }
+    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) this->tracer.end_cycle(b);
 
     this->fsm_timestamp++;
+    this->advance_fill();
 
     bool all_done = true;
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
-        size_t after = retire_due(blk.port_pending, this->fsm_timestamp);
+        this->retire_block(blk);
+        size_t after = retire_due(blk.store_pending, this->fsm_timestamp);
+        this->retire_store_acks(blk);
         bool beats_done = (blk.store.beat_index >= blk.store.beat_total) && (after == 0);
         if (beats_done) blk.phase_done = true;
         else            all_done = false;
     }
+    if (DIMC_JOB_LOOKAHEAD > 1) all_done = this->store_done_ahead();
 
     if (!all_done) return false;
 
@@ -617,8 +1600,9 @@ bool Dimc_HWPE::store_iter(int *latency)
 
 bool Dimc_HWPE::store_done() const
 {
+    if (DIMC_JOB_LOOKAHEAD > 1) return this->store_done_ahead();
     for (const Dimc_InnerBlock &blk : this->inner_blocks)
-        if (blk.store.beat_index < blk.store.beat_total || !blk.port_pending.empty())
+        if (blk.store.beat_index < blk.store.beat_total || !blk.store_pending.empty())
             return false;
     return true;
 }
@@ -636,42 +1620,255 @@ void Dimc_HWPE::close_job()
 void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
 {
     const uint32_t port_bytes = this->inner_port_bytes;
-    const uint32_t row_count  = this->job_geom[this->exec_slot].row_count;
-    const uint32_t out_bytes  = row_count * 4;
-    const uint32_t out_beats  = this->job_geom[this->exec_slot].out_beats;
+    const JobGeom &g          = this->job_geom[this->exec_slot];
+    const uint32_t rows       = g.row_count;
+    const uint32_t per_word   = port_bytes / DIMC_OUT_SLOT_BYTES;
 
-    if (blk.store.beat_index >= blk.store.beat_total) return;
-    if (blk.port_pending.size() >= this->outstanding_depth) {
+    // One port word per dual per cycle, straight from a macro's out_fifo: its head entries are
+    // the running job's next results in order (row k % rows of vector k / rows). The lowest-index
+    // macro holding a whole word goes; an unexpected head fails the run (the RTL would misplace it).
+    for (uint32_t m = 0; m < g.num_active; m++) {
+        std::deque<Dimc_InnerBlock::OutEntry> &fifo = blk.out_fifo[m];
+        const uint32_t k = blk.out_results[m];
+        // Every result of this job from this macro has left; what is behind it in the
+        // out_fifo belongs to the next job and waits for its sink.
+        if (k >= rows * g.nb_vec) continue;
+        const uint32_t r = k % rows, vec = k / rows;
+        const uint32_t n = rows - r < per_word ? rows - r : per_word;
+        if (fifo.size() < n) continue;
+        bool in_order = true;
+        for (uint32_t j = 0; j < n; j++)
+            if (fifo[j].row != r + j || fifo[j].run != vec) in_order = false;
+        if (!in_order) {
+            this->trace.force_warning("DIMC out_fifo order: macro %u head is vector %u row %u, "
+                "the sink expects vector %u row %u; the RTL would misplace it\n",
+                m, fifo[0].run, fifo[0].row, vec, r);
+            continue;
+        }
+        if (blk.store_pending.size() >= this->outstanding_depth) {
+            this->tracer.store_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
+            return;
+        }
+        if (this->outer_port_out.busy_until() > (int64_t)this->fsm_timestamp) {
+            this->tracer.store_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
+            return;
+        }
+        // First word of a run: point the macro's output streamer at the run's block.
+        if (r == 0) this->configure_out_stream(blk_id, m, vec);
+        uint8_t word[32];
+        for (uint32_t j = 0; j < n; j++) {
+            uint8_t *slot = word + j * DIMC_OUT_SLOT_BYTES;
+            std::memset(slot, fifo[j].psout < 0 ? 0xFF : 0x00, DIMC_OUT_SLOT_BYTES);
+            std::memcpy(slot, &fifo[j].psout, 4);
+        }
+        const uint32_t w = n * DIMC_OUT_SLOT_BYTES;
+        int lat = blk.out_stream[m].issue_beat((int)w, word);
+        this->tracer.store_beat(blk_id, m, lat, g.out_beats);
+        if (lat < 1) lat = 1;
+        blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
+        blk.store_pending.push(this->fsm_timestamp + (uint64_t)lat);
+        this->outer_port_out.request((int64_t)this->fsm_timestamp, w);
+        this->tracer.outer_port_booked(blk_id, true);
+        if (r + n == rows)
+            blk.run_pending.push_back({this->fsm_timestamp + (uint64_t)lat, this->running_job, m, vec});
+        fifo.erase(fifo.begin(), fifo.begin() + n);
+        blk.out_results[m] += n;
+        blk.store.beat_index++;
+        return;
+    }
+    // Nothing of the running job went out this cycle.
+    if (DIMC_JOB_OVERLAP && DIMC_NEXT_JOB_SINK) this->store_next_job(blk, blk_id);
+}
+
+// DIMC_NEXT_JOB_SINK: one port word of a macro's next-job results, once every result of
+// the running job from that macro has left. The word goes to the next job's destination,
+// from its own context; the order check and the port rules are store_block's.
+void Dimc_HWPE::store_next_job(Dimc_InnerBlock &blk, uint32_t blk_id)
+{
+    const uint32_t port_bytes = this->inner_port_bytes;
+    const uint32_t per_word   = port_bytes / DIMC_OUT_SLOT_BYTES;
+    const JobGeom &gr         = this->job_geom[this->exec_slot];
+    const uint32_t next       = this->running_job + 1;
+    for (uint32_t m = 0; m < blk.macros.size(); m++) {
+        const Dimc_Macro &mac = blk.macros[m];
+        if (mac.issue_job != next) continue;
+        if (m < gr.num_active && blk.out_results[m] < gr.row_count * gr.nb_vec) continue;
+        std::deque<Dimc_InnerBlock::OutEntry> &fifo = blk.out_fifo[m];
+        const JobGeom &g   = this->job_geom[mac.issue_slot];
+        const uint32_t rows = g.row_count;
+        const uint32_t k = blk.out_results_next[m];
+        const uint32_t r = k % rows, vec = k / rows;
+        const uint32_t n = rows - r < per_word ? rows - r : per_word;
+        if (fifo.size() < n) continue;
+        bool in_order = true;
+        for (uint32_t j = 0; j < n; j++)
+            if (fifo[j].row != r + j || fifo[j].run != vec) in_order = false;
+        if (!in_order) {
+            this->trace.force_warning("DIMC out_fifo order (next job): macro %u head is vector %u "
+                "row %u, the sink expects vector %u row %u\n", m, fifo[0].run, fifo[0].row, vec, r);
+            continue;
+        }
+        if (blk.store_pending.size() + blk.store_next_pending.size() >= this->outstanding_depth) return;
+        if (this->outer_port_out.busy_until() > (int64_t)this->fsm_timestamp) return;
+        if (r == 0) this->configure_out_stream_ctx(blk_id, m, vec, mac.issue_slot);
+        uint8_t word[32];
+        for (uint32_t j = 0; j < n; j++) {
+            uint8_t *slot = word + j * DIMC_OUT_SLOT_BYTES;
+            std::memset(slot, fifo[j].psout < 0 ? 0xFF : 0x00, DIMC_OUT_SLOT_BYTES);
+            std::memcpy(slot, &fifo[j].psout, 4);
+        }
+        const uint32_t w = n * DIMC_OUT_SLOT_BYTES;
+        int lat = blk.out_stream[m].issue_beat((int)w, word);
+        this->tracer.store_beat(blk_id, m, lat,
+                                g.nb_vec * ((rows * DIMC_OUT_SLOT_BYTES + port_bytes - 1) / port_bytes));
+        if (lat < 1) lat = 1;
+        blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
+        blk.store_next_pending.push(this->fsm_timestamp + (uint64_t)lat);
+        this->outer_port_out.request((int64_t)this->fsm_timestamp, w);
+        this->tracer.outer_port_booked(blk_id, true);
+        if (r + n == rows)
+            blk.run_pending.push_back({this->fsm_timestamp + (uint64_t)lat, next, m, vec});
+        fifo.erase(fifo.begin(), fifo.begin() + n);
+        blk.out_results_next[m] += n;
+        blk.store_next_beats++;
+        return;
+    }
+}
+
+// ---- DIMC_JOB_LOOKAHEAD > 1 ----
+
+void Dimc_HWPE::retire_store_acks(Dimc_InnerBlock &blk)
+{
+    while (!blk.store_acks.empty() && blk.store_acks.front().due <= this->fsm_timestamp)
+        blk.store_acks.pop_front();
+}
+
+// Every active macro has retired every row of the running job from its pipe.
+bool Dimc_HWPE::rows_done_ahead(const Dimc_InnerBlock &blk) const
+{
+    const JobGeom &g = this->job_geom[this->exec_slot];
+    for (uint32_t m = 0; m < g.num_active; m++)
+        if (blk.pipe_done[m] == Dimc_Macro::JOB_NONE || blk.pipe_done[m] < this->running_job)
+            return false;
+    return true;
+}
+
+// Every active macro has written back every result of the running job, and every such
+// beat is acknowledged.
+bool Dimc_HWPE::store_done_ahead() const
+{
+    const JobGeom &g = this->job_geom[this->exec_slot];
+    for (const Dimc_InnerBlock &blk : this->inner_blocks) {
+        for (uint32_t m = 0; m < g.num_active; m++)
+            if (blk.stored[m] == Dimc_Macro::JOB_NONE || blk.stored[m] < this->running_job)
+                return false;
+        for (const Dimc_InnerBlock::StoreAck &a : blk.store_acks)
+            if (a.job <= this->running_job) return false;
+    }
+    return true;
+}
+
+// One port word per dual per cycle, from the out_fifo of the macro whose next results
+// belong to the oldest job (the lowest index among equals): the running job's before a
+// later job's. Each macro's results go to the destination of the job they belong to,
+// from that job's context. The order check and the outer-port rule are store_block's; the
+// outstanding-depth limit counts beats per job (below).
+void Dimc_HWPE::store_block_ahead(Dimc_InnerBlock &blk, uint32_t blk_id)
+{
+    const uint32_t port_bytes = this->inner_port_bytes;
+    const uint32_t per_word   = port_bytes / DIMC_OUT_SLOT_BYTES;
+    uint32_t pick = (uint32_t)blk.macros.size(), pick_job = 0, pick_n = 0;
+    if (DIMC_OUT_FIFO_SHARED) {
+        // In order: the head macro's consecutive results, a full word unless the other
+        // macro's results follow them.
+        const std::deque<Dimc_InnerBlock::OutEntry> &fifo = blk.out_shared;
+        if (fifo.empty()) return;
+        const uint32_t m = fifo.front().macro;
+        if (blk.to_store[m].empty()) return;
+        const Dimc_InnerBlock::JobLeft &f = blk.to_store[m].front();
+        const uint32_t rows = this->job_geom[f.slot].row_count;
+        const uint32_t k = blk.out_results[m];
+        const uint32_t r = k % rows, vec = k / rows;
+        const uint32_t n = rows - r < per_word ? rows - r : per_word;
+        uint32_t have = 0;
+        while (have < n && have < fifo.size() && fifo[have].macro == m) have++;
+        if (have < n && have == fifo.size()) return;
+        for (uint32_t j = 0; j < have; j++)
+            if (fifo[j].row != r + j || fifo[j].run != vec) {
+                this->trace.force_warning("DIMC out_fifo order: macro %u job %u head is vector %u row %u, "
+                    "the sink expects vector %u row %u; the RTL would misplace it\n",
+                    m, f.job, fifo[j].run, fifo[j].row, vec, r + j);
+                return;
+            }
+        pick = m; pick_job = f.job; pick_n = have;
+    }
+    for (uint32_t m = 0; m < blk.macros.size() && !DIMC_OUT_FIFO_SHARED; m++) {
+        if (blk.to_store[m].empty()) continue;
+        const Dimc_InnerBlock::JobLeft &f = blk.to_store[m].front();
+        const JobGeom &g = this->job_geom[f.slot];
+        const std::deque<Dimc_InnerBlock::OutEntry> &fifo = blk.out_fifo[m];
+        const uint32_t rows = g.row_count;
+        const uint32_t k = blk.out_results[m];
+        const uint32_t r = k % rows, vec = k / rows;
+        const uint32_t n = rows - r < per_word ? rows - r : per_word;
+        if (fifo.size() < n) continue;
+        bool in_order = true;
+        for (uint32_t j = 0; j < n; j++)
+            if (fifo[j].row != r + j || fifo[j].run != vec) in_order = false;
+        if (!in_order) {
+            this->trace.force_warning("DIMC out_fifo order: macro %u job %u head is vector %u row %u, "
+                "the sink expects vector %u row %u; the RTL would misplace it\n",
+                m, f.job, fifo[0].run, fifo[0].row, vec, r);
+            continue;
+        }
+        if (pick == blk.macros.size() || f.job < pick_job) { pick = m; pick_job = f.job; pick_n = n; }
+    }
+    if (pick == blk.macros.size()) return;
+
+    // Beats in flight against the depth: for a running-job word, those of jobs up to the
+    // running one; for a later job's word, all of them.
+    size_t in_flight = 0;
+    for (const Dimc_InnerBlock::StoreAck &a : blk.store_acks)
+        if (pick_job > this->running_job || a.job <= this->running_job) in_flight++;
+    if (in_flight >= this->outstanding_depth) {
         this->tracer.store_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
         return;
     }
-    if (this->outer_port.busy_until() > (int64_t)this->fsm_timestamp) {
+    if (this->outer_port_out.busy_until() > (int64_t)this->fsm_timestamp) {
         this->tracer.store_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
         return;
     }
-
-    uint32_t macro = blk.store.beat_index / out_beats;
-    uint32_t sub   = blk.store.beat_index % out_beats;
-    uint32_t off   = sub * port_bytes;
-    uint32_t w     = out_bytes - off;
-    if (w > port_bytes) w = port_bytes;
-
-    // A beat carries port_bytes/4 rows. It may only go once this macro has
-    // retired every row it covers -- drain_ready_rows writes them into out_buf
-    // as they pop, so sending early would ship whatever was in the buffer
-    // before. This is what lets the store run inside the compute phase instead
-    // of waiting for the last macro to finish.
-    const uint32_t rows_per_beat = port_bytes / 4;
-    uint32_t need = (sub + 1) * rows_per_beat;
-    if (need > row_count) need = row_count;
-    if (blk.macros[macro].rows_retired < need) return;
-
-    int lat = blk.out_stream[macro].issue_beat((int)w, blk.out_buf[macro].data() + off);
-    this->tracer.store_beat(blk_id, macro, lat, out_beats);
-
+    Dimc_InnerBlock::JobLeft &f = blk.to_store[pick].front();
+    const JobGeom &g = this->job_geom[f.slot];
+    std::deque<Dimc_InnerBlock::OutEntry> &fifo = DIMC_OUT_FIFO_SHARED ? blk.out_shared : blk.out_fifo[pick];
+    const uint32_t rows = g.row_count;
+    const uint32_t r = blk.out_results[pick] % rows, vec = blk.out_results[pick] / rows;
+    const uint32_t n = pick_n;
+    // First word of a run: point the macro's output streamer at the run's block.
+    if (r == 0) this->configure_out_stream_ctx(blk_id, pick, vec, f.slot);
+    uint8_t word[32];
+    for (uint32_t j = 0; j < n; j++) {
+        uint8_t *slot = word + j * DIMC_OUT_SLOT_BYTES;
+        std::memset(slot, fifo[j].psout < 0 ? 0xFF : 0x00, DIMC_OUT_SLOT_BYTES);
+        std::memcpy(slot, &fifo[j].psout, 4);
+    }
+    const uint32_t w = n * DIMC_OUT_SLOT_BYTES;
+    int lat = blk.out_stream[pick].issue_beat((int)w, word);
+    this->tracer.store_beat(blk_id, pick, lat,
+                            g.nb_vec * ((rows * DIMC_OUT_SLOT_BYTES + port_bytes - 1) / port_bytes));
     if (lat < 1) lat = 1;
     blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
-    this->outer_port.request((int64_t)this->fsm_timestamp, w);
-    this->tracer.outer_port_booked();
-    blk.store.beat_index++;
+    blk.store_acks.push_back({this->fsm_timestamp + (uint64_t)lat, f.job});
+    this->outer_port_out.request((int64_t)this->fsm_timestamp, w);
+    this->tracer.outer_port_booked(blk_id, true);
+    if (r + n == rows)
+        blk.run_pending.push_back({this->fsm_timestamp + (uint64_t)lat, f.job, pick, vec});
+    fifo.erase(fifo.begin(), fifo.begin() + n);
+    blk.out_results[pick] += n;
+    if (f.job == this->running_job) blk.store.beat_index++;
+    if (blk.out_results[pick] >= rows * g.nb_vec) {
+        blk.stored[pick] = f.job;
+        blk.out_results[pick] = 0;
+        blk.to_store[pick].pop_front();
+    }
 }

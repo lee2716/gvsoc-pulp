@@ -43,6 +43,7 @@ void Dimc_Tracer::build(vp::Component &owner, vp::Trace &text,
         owner.traces.new_trace_event(pfx + "beat_index",  &blk.beat_event, 32);
         owner.traces.new_trace_event(pfx + "rows_issued", &blk.rows_event, 32);
         owner.traces.new_trace_event(pfx + "load_active", &blk.load_event, 1);
+        owner.traces.new_trace_event(pfx + "fill_grant",  &blk.fill_grant_event, 8);
         owner.traces.new_trace_event(pfx + "comp_active", &blk.comp_event, 1);
         owner.traces.new_trace_event(pfx + "wb_active",   &blk.wb_event,   1);
         for (uint32_t m = 0; m < nb_macros; m++) {
@@ -52,10 +53,12 @@ void Dimc_Tracer::build(vp::Component &owner, vp::Trace &text,
             owner.traces.new_trace_event(mpfx + "comp_active", &mac.comp_event, 1);
             owner.traces.new_trace_event(mpfx + "wb_active",   &mac.wb_event,   1);
             owner.traces.new_trace_event(mpfx + "why",         &mac.why_event,  8);
+            owner.traces.new_trace_event(mpfx + "load_kind",   &mac.load_kind_event, 8);
         }
     }
     owner.traces.new_trace_event("commit_job_id", &this->commit_event, 32);
     owner.traces.new_trace_event("idle_why", &this->idle_why_event, 8);
+    owner.traces.new_trace_event("outer_grant", &this->outer_grant_event, 8);
 }
 
 void Dimc_Tracer::reset()
@@ -124,6 +127,13 @@ void Dimc_Tracer::fill_beat(uint32_t b, uint32_t macro, uint32_t within,
     this->acc_beat_lat += (uint64_t)(lat < 1 ? 1 : lat);
     blk.loaded = true;
     mac.loaded = 1;
+    blk.fill_grant = (uint8_t)macro;   // a FIFO section was written into this macro
+    // Beat kind from the engine's own beat_kind.
+    {
+        const uint32_t slot = this->dimc.inner_blocks[b].macros[macro].write_slot;
+        const Dimc_HWPE::JobGeom &fg = this->dimc.job_geom[slot];
+        mac.load_kind = this->dimc.beat_kind(fg, within);
+    }
     uint32_t idx = this->dimc.inner_blocks[b].fill.beat_index;
     blk.beat_event.event((uint8_t *)&idx);
 }
@@ -132,6 +142,12 @@ void Dimc_Tracer::fill_skip(uint32_t b, uint8_t why)
 {
     if (why == DIMC_WHY_WAIT_DEPTH) this->acc_stall_full++;
     this->blocks[b].fill_skip = why;
+}
+
+void Dimc_Tracer::kernel_skip(uint32_t b, uint8_t why)
+{
+    this->blocks[b].kernel_skip = why;
+    if (why == DIMC_WHY_WAIT_OUTER_PORT) this->blocks[b].kernel_port_refused = this->dimc.fsm_timestamp;
 }
 
 void Dimc_Tracer::row_issued(uint32_t b, uint32_t m, uint32_t rows_issued,
@@ -160,9 +176,14 @@ void Dimc_Tracer::store_skip(uint32_t b, uint8_t why)
     this->blocks[b].store_skip = why;
 }
 
-void Dimc_Tracer::outer_port_booked()
+void Dimc_Tracer::outer_port_booked(uint32_t who, bool is_store)
 {
-    const Dimc_OuterPort &port = this->dimc.outer_port;
+    // Stores are offset by 16 so one track shows both: 0,1 = block 0,1 filling;
+    // 16,17 = block 0,1 writing back.
+    this->outer_grant = (uint8_t)(who + (is_store ? 16u : 0u));
+    // The two directions have their own budget; report the one this beat booked.
+    const Dimc_OuterPort &port = is_store ? this->dimc.outer_port_out
+                                          : this->dimc.outer_port_in;
     uint32_t nf = (uint32_t)((port.cursor_bytes + port.bandwidth_bytes - 1)
                              / port.bandwidth_bytes);
     this->next_free_event.event((uint8_t *)&nf);
@@ -187,32 +208,63 @@ void Dimc_Tracer::end_cycle(uint32_t b)
         mac.comp_event.event(&mac.computed);
         mac.wb_event.event(&mac.wrote_back);
         mac.why_event.event(&blk.why[m]);
+        mac.load_kind_event.event(&mac.load_kind);
         mac.loaded = mac.computed = mac.wrote_back = 0;
+        mac.load_kind = DIMC_LOAD_NONE;
     }
+    blk.fill_grant_event.event(&blk.fill_grant);
     blk.loaded = blk.computed = blk.wrote_back = false;
-    blk.fill_skip = blk.store_skip = 0;
+    blk.fill_skip = blk.store_skip = blk.kernel_skip = 0;
+    blk.fill_grant = DIMC_GRANT_NONE;
+    // The outer port is shared: flush it with the last block, after every block has booked.
+    if (b + 1 == this->blocks.size()) {
+        this->outer_grant_event.event(&this->outer_grant);
+        this->outer_grant = DIMC_GRANT_NONE;
+    }
 }
 
 uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
 {
     const Block &tb = this->blocks[b];
     const Macro &tm = tb.macros[m];
-    if (tm.loaded)     return DIMC_WHY_LOAD;
+    if (tm.loaded)     return tm.load_kind == DIMC_LOAD_KB   ? DIMC_WHY_LOAD_KB
+                            : tm.load_kind == DIMC_LOAD_FB   ? DIMC_WHY_LOAD_FB
+                            : tm.load_kind == DIMC_LOAD_PSIN ? DIMC_WHY_LOAD_PSIN
+                                                             : DIMC_WHY_UNKNOWN;
     if (tm.computed)   return DIMC_WHY_COMPUTE;
     if (tm.wrote_back) return DIMC_WHY_WRITE_BACK;
+    // No job running: nothing to wait for.
+    if (this->cur_state == DIMC_IDLE) return DIMC_WHY_IDLE;
 
     const Dimc_InnerBlock &blk = this->dimc.inner_blocks[b];
     const Dimc_HWPE::JobGeom &g = this->dimc.job_geom[this->dimc.exec_slot];
     if (m >= g.num_active) return DIMC_WHY_IDLE;
     const Dimc_Macro &mac = blk.macros[m];
 
-    // Still owes fill beats: the inner port serves the lowest-index macro
-    // first, otherwise this macro's own beat was held back.
+    // Inside a kernel window (sections written, not all): the weight FIFO's head says why no
+    // section went in. In flight: late because the kernel feed lost the outer port within the
+    // fetch latency, else the response is still out. Another macro's section: the dual's FIFO
+    // is in order. Landed: beat_writable refused it. Empty: this cycle's kernel-feed refusal.
+    if (mac.write_job != Dimc_Macro::JOB_NONE && !mac.stamped) {
+        const Dimc_HWPE::JobGeom &wg = this->dimc.job_geom[mac.write_slot];
+        const uint32_t kb_all = wg.skip_kb ? 0 : wg.row_count * wg.kb_beats_per_row;
+        if (mac.kw > 0 && mac.kw < kb_all) {
+            const uint64_t now = this->dimc.fsm_timestamp;
+            const bool port_late = tb.kernel_port_refused != ~0ull && now - tb.kernel_port_refused <= 3;
+            if (blk.wgt_fifo.empty())
+                return tb.kernel_skip ? tb.kernel_skip : port_late ? DIMC_WHY_WAIT_OUTER_PORT : DIMC_WHY_WAIT_FILL_ACK;
+            const Dimc_InnerBlock::FeedEntry &h = blk.wgt_fifo.front();
+            if (h.macro != m) return DIMC_WHY_WAIT_INNER_PORT;
+            if (h.ready > now) return port_late ? DIMC_WHY_WAIT_OUTER_PORT : DIMC_WHY_WAIT_FILL_ACK;
+            return DIMC_WHY_WAIT_COMPUTE;
+        }
+    }
+    // Still owes fill sections. A heuristic: fill_feed picks a macro per feed, not by
+    // index, but a lower macro still owing is reported as holding the port.
     if (this->cur_state == DIMC_STARTING) {
         const Dimc_InnerBlock::Cursor &f = blk.fill;
         if (f.macro_beat_index[m] < f.macro_beat_total[m]) {
-            // A lower macro that still owes beats, or that took this cycle's
-            // beat as its last one, holds the inner port.
+            // A lower macro that still owes sections, or was written one this cycle.
             for (uint32_t k = 0; k < m; k++)
                 if (f.macro_beat_index[k] < f.macro_beat_total[k] || tb.macros[k].loaded)
                     return DIMC_WHY_WAIT_INNER_PORT;
@@ -232,10 +284,12 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
     if (cur < first)
         return mac.pipe.empty() ? DIMC_WHY_WAIT_STORE_ORDER : DIMC_WHY_PIPE_DRAIN;
     if (cur < last) {
-        const uint32_t rows_per_beat = this->dimc.inner_port_bytes / 4;
-        uint32_t need = (cur - first + 1) * rows_per_beat;
+        const uint32_t per = this->dimc.inner_port_bytes / DIMC_OUT_SLOT_BYTES;
+        uint32_t need = (cur - first + 1) * per;   // rows retired through this beat, cumulative
         if (need > g.row_count) need = g.row_count;
-        if (mac.rows_retired < need) return DIMC_WHY_PIPE_DRAIN;
+        const uint32_t s = this->dimc.running_job & 1;
+        if (mac.set_job[s] != this->dimc.running_job || mac.rows_retired_set[s] < need)
+            return DIMC_WHY_PIPE_DRAIN;
         return tb.store_skip ? tb.store_skip : DIMC_WHY_UNKNOWN;
     }
 
@@ -312,8 +366,20 @@ void Dimc_Tracer::job_end()
     this->state_event.event(&st);
     // job_queued, called after this when another job is waiting, overrides it.
     this->idle_why_event.event(&why);
-    for (Block &blk : this->blocks)
-        for (Macro &mac : blk.macros) mac.why_event.event(&zero);
+    // Levels hold until the next event, so drop every activity level here or
+    // the job's last cycle stays drawn across the idle gap.
+    for (Block &blk : this->blocks) {
+        blk.load_event.event(&zero);
+        blk.comp_event.event(&zero);
+        blk.wb_event.event(&zero);
+        for (Macro &mac : blk.macros) {
+            mac.load_event.event(&zero);
+            mac.comp_event.event(&zero);
+            mac.wb_event.event(&zero);
+            mac.why_event.event(&zero);
+            mac.load_kind_event.event(&zero);
+        }
+    }
     this->text->msg(vp::TraceLevel::WARNING,
         "DIMC job done, STATUS=1, finished_jobs=%u\n", this->dimc.finished_jobs);
 }

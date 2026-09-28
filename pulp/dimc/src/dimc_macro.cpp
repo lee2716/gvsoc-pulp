@@ -37,7 +37,9 @@ void Dimc_Macro::reset()
     this->psin_scalar = 0;
     this->psin_rows   = 0;
     this->psout     = 0;
-    for (int r = 0; r < DIMC_MACRO_KB_LEN; r++) this->psin_buf[r] = 0;
+    for (int s = 0; s < 2; s++)
+        for (int r = 0; r < DIMC_MACRO_KB_LEN; r++) this->psin_buf_set[s][r] = 0;
+    this->psin_sel = 0;
     this->sout      = 0;
 
     this->kb_ready = false;
@@ -47,17 +49,18 @@ void Dimc_Macro::reset()
 
 bool Dimc_Macro::can_accept() const
 {
+    // The RTL pipeline never back-pressures: one trigger per cycle always fits.
     return this->kb_ready && this->fb_ready
-        && (int)this->pipe.size() < DIMC_MACRO_LATENCY;
+        && (int)this->pipe.size() < DIMC_MACRO_LATENCY + DIMC_OUT_FIFO_DELAY;
 }
 
-void Dimc_Macro::issue(int row, int job_row, int32_t bias)
+void Dimc_Macro::issue(int row, int job_row, int set, int run)
 {
     if (!this->can_accept()) return;
 
     this->compute_PP(row);
-    this->final_compute(bias);
-    this->pipe.push_back({this->psout, job_row, DIMC_MACRO_LATENCY});
+    this->final_compute();
+    this->pipe.push_back({this->psout, job_row, DIMC_MACRO_LATENCY + DIMC_OUT_FIFO_DELAY, set, run});
 }
 
 void Dimc_Macro::tick()
@@ -100,109 +103,65 @@ void Dimc_Macro::write_fb(const uint8_t *src)
 
 // One 32-bit partial sum, stored against the row it belongs to. compute_PP()
 // picks it up when that row is selected, and only while PSIN_EN is set.
-void Dimc_Macro::write_psin_row(int row, const uint8_t *src)
+void Dimc_Macro::write_psin_row(int row, const uint8_t *src, int set)
 {
     if (row < 0 || row >= DIMC_MACRO_KB_LEN) return;
-    std::memcpy(&this->psin_buf[row], src, 4);
+    std::memcpy(&this->psin_buf_set[set & 1][row], src, 4);
 }
 
+// Bit-level model of the macro datapath. Stage 1 zeroes every bit i >= 1024 - compute_mask
+// of both operands, so an element straddling that boundary keeps its low bits; stage 2
+// sums per MODE; stage 3 adds ADDIN. Bit i of the row is bit (i % 8) of byte i / 8.
 int32_t Dimc_Macro::compute_PP(int row_sel)
 {
-    // compute_mask is a COUNT, not a bit pattern: setting it to x masks off the
-    // x most-significant bits of the 1024-bit row (spatz_dimc.sv).
-    uint32_t valid_bits = 1024u - (uint32_t)this->compute_mask;
-    if (valid_bits > 1024u) valid_bits = 0;
-    uint32_t valid_bytes = valid_bits / 8u;
-    uint32_t tail_bits   = valid_bits & 7u;
+    uint32_t valid_bits = 1024u - ((uint32_t)this->compute_mask & 0x3FFu);
+    uint8_t k[DIMC_MACRO_KB_EW], f[DIMC_MACRO_FB_EW];
+    for (uint32_t i = 0; i < DIMC_MACRO_KB_EW; i++) {
+        uint32_t keep = valid_bits <= 8 * i ? 0 : valid_bits - 8 * i;
+        uint8_t  m    = keep >= 8 ? 0xFF : (uint8_t)((1u << keep) - 1u);
+        k[i] = this->KB[row_sel][i] & m;
+        f[i] = this->FB[i] & m;
+    }
 
     int32_t comp = 0;
-
     switch (this->ci) {
-    case DIMC_CI_1BIT: {
-        // 1-bit multiply = XNOR + popcount (bipolar encoding: bit 0 = -1, bit 1 = +1,
-        // so the product is +1 exactly when the two bits AGREE).
-        // Alternative convention: AND is the literal unsigned {0,1} multiply.
-        for (uint32_t i = 0; i < valid_bytes; i++) {
-            uint8_t x = ~((uint8_t)(this->KB[row_sel][i] ^ this->FB[i]));
-            for (int b = 0; b < 8; b++)
-                comp += (x >> b) & 1;
-        }
-        if (tail_bits) {
-            uint8_t x = ~((uint8_t)(this->KB[row_sel][valid_bytes] ^ this->FB[valid_bytes]));
-            for (uint32_t b = 0; b < tail_bits; b++)
-                comp += (x >> b) & 1;
-        }
+    case DIMC_CI_1BIT:
+        // sum(kernel[i] * feature[i]): AND, not XNOR, as in the RTL.
+        for (uint32_t i = 0; i < DIMC_MACRO_KB_EW; i++)
+            comp += __builtin_popcount((unsigned)(k[i] & f[i]));
         break;
-    }
-    case DIMC_CI_2BIT: {
-        for (uint32_t i = 0; i < valid_bytes; i++) {
-            uint8_t k = this->KB[row_sel][i];
-            uint8_t f = this->FB[i];
+    case DIMC_CI_2BIT:
+        for (uint32_t i = 0; i < DIMC_MACRO_KB_EW; i++)
             for (int s = 0; s < 4; s++)
-                comp += ((k >> (s*2)) & 0x3) * ((f >> (s*2)) & 0x3);
-        }
-        // Partial trailing byte: the mask can end mid-byte, and only WHOLE
-        // 2-bit elements inside it still count.
-        if (tail_bits) {
-            uint8_t k = this->KB[row_sel][valid_bytes];
-            uint8_t f = this->FB[valid_bytes];
-            for (uint32_t s = 0; s < tail_bits / 2u; s++)
-                comp += ((k >> (s*2)) & 0x3) * ((f >> (s*2)) & 0x3);
-        }
+                comp += ((k[i] >> (s * 2)) & 0x3) * ((f[i] >> (s * 2)) & 0x3);
         break;
-    }
-    case DIMC_CI_4BIT: {
-        for (uint32_t i = 0; i < valid_bytes; i++) {
-            uint8_t k = this->KB[row_sel][i];
-            uint8_t f = this->FB[i];
-            comp += ( k        & 0xF) * ( f        & 0xF)
-                  + ((k >> 4) & 0xF) * ((f >> 4) & 0xF);
-        }
-        // Partial trailing byte: only WHOLE 4-bit elements inside it count.
-        if (tail_bits) {
-            uint8_t k = this->KB[row_sel][valid_bytes];
-            uint8_t f = this->FB[valid_bytes];
-            for (uint32_t n = 0; n < tail_bits / 4u; n++)
-                comp += ((k >> (n*4)) & 0xF) * ((f >> (n*4)) & 0xF);
-        }
+    case DIMC_CI_4BIT:
+        for (uint32_t i = 0; i < DIMC_MACRO_KB_EW; i++)
+            comp += (k[i] & 0xF) * (f[i] & 0xF) + ((k[i] >> 4) & 0xF) * ((f[i] >> 4) & 0xF);
         break;
-    }
     case DIMC_CI_8BIT:
-    default: {
-        // No tail handling needed: a partial trailing byte can never hold a whole
-        // 8-bit element, so it is dropped.
-        for (uint32_t i = 0; i < valid_bytes; i++) {
-            int32_t k = (this->sign_8b & 0x1) ? (int32_t)(int8_t)this->KB[row_sel][i]
-                                              : (int32_t)(uint8_t)this->KB[row_sel][i];
-            int32_t f = (this->sign_8b & 0x2) ? (int32_t)(int8_t)this->FB[i]
-                                              : (int32_t)(uint8_t)this->FB[i];
-            comp += k * f;
+    default:
+        // sign_8b bit 0: kernel signed, bit 1: feature signed. The sign bit is the
+        // masked byte's bit 7, as in the RTL.
+        for (uint32_t i = 0; i < DIMC_MACRO_KB_EW; i++) {
+            int32_t kv = (this->sign_8b & 0x1) ? (int32_t)(int8_t)k[i] : (int32_t)k[i];
+            int32_t fv = (this->sign_8b & 0x2) ? (int32_t)(int8_t)f[i] : (int32_t)f[i];
+            comp += kv * fv;
         }
         break;
-    }
     }
 
-    comp += this->psin_rows ? this->psin_buf[row_sel] : this->psin_scalar;
+    // ADDIN: the row's partial sum, or the job's constant when PSIN_EN is off.
+    comp += this->psin_rows ? this->psin_buf_set[this->psin_sel][row_sel] : this->psin_scalar;
 
     this->psout = comp;
     return comp;
 }
 
-// Unused path: issue() discards the return value and the FSM never reads
-// `sout`, since the pipeline carries `psout`. So `bias` does not reach the
-// 32-bit output, the ReLU + 8-bit saturation result goes nowhere, and there is
-// no requantisation before the saturation.
-int32_t Dimc_Macro::final_compute(int32_t bias)
+// SOUT: ReLU, then unsigned 8-bit saturation of PSOUT. Nothing reads SOUT, as in the RTL dual.
+void Dimc_Macro::final_compute()
 {
-    int32_t psum = this->psout + bias;
-
-    // ReLU + 8-bit saturation (ARCHYTAS PDF: Sout = 8-bit port)
-    if (psum < 0)
-        this->sout = 0;
-    else if (psum > 255)
-        this->sout = 255;
-    else
-        this->sout = (uint8_t)psum;
-
-    return psum;
+    if (this->psout < 0)        this->sout = 0;
+    else if (this->psout > 255) this->sout = 255;
+    else                        this->sout = (uint8_t)this->psout;
 }
