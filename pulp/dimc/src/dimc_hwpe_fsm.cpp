@@ -782,8 +782,8 @@ bool Dimc_HWPE::preload_iter(int *latency)
 }
 
 // One fill beat per feed per cycle. The kernel and input feeds each have their own TCDM
-// port and dual FIFO, and a macro's kernel and feature write ports are independent, so a
-// kernel beat and a feature beat go in the same cycle. Partial sums ride the input feed.
+// port and dual FIFO, so both fetch in the same cycle; with DIMC_ONE_WRITE_PER_CYCLE a
+// macro takes only one of their sections per cycle. Partial sums ride the input feed.
 void Dimc_HWPE::preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
                               Dimc_InnerBlock::Cursor &cursor)
 {
@@ -1344,6 +1344,11 @@ void Dimc_HWPE::write_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
     if (!this->beat_writable(mc, e.job, pos)) {
         this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_COMPUTE);
         return;
+    }
+    // Kernel and feature sections: with DIMC_ONE_WRITE_PER_CYCLE, one per macro per cycle.
+    if (pos.kind != DIMC_LOAD_PSIN) {
+        if (DIMC_ONE_WRITE_PER_CYCLE && mc.last_write_cycle == (int64_t)this->fsm_timestamp) return;
+        mc.last_write_cycle = (int64_t)this->fsm_timestamp;
     }
     // The macro's write program follows its sections: a new job's first one opens it.
     if (mc.write_job != e.job) {

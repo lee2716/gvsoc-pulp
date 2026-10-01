@@ -89,6 +89,12 @@
 #ifndef DIMC_FB_WRITE_ON_LAST_ROW
 #define DIMC_FB_WRITE_ON_LAST_ROW 0
 #endif
+// 1: a macro takes one kernel or feature section per cycle; a feature section goes first
+// and the kernel section waits for the next cycle. 0: one of each in the same cycle.
+// Partial sums go to the ADDIN sets outside the macro and are not counted.
+#ifndef DIMC_ONE_WRITE_PER_CYCLE
+#define DIMC_ONE_WRITE_PER_CYCLE 1
+#endif
 // The dual's weight and input FIFOs: 256 b sections, one kernel and two feature vectors
 // deep, written into a macro one section per cycle when its write port is open.
 #define DIMC_WGT_FIFO_DEPTH 128
@@ -246,6 +252,8 @@ class Dimc_Macro {
         // Cycle of the last row trigger. No section is written into the macro in that
         // cycle, except a feature section with DIMC_FB_WRITE_ON_LAST_ROW 1.
         int64_t  last_trigger_cycle = -1;
+        // Cycle of the last kernel or feature section written into the macro.
+        int64_t  last_write_cycle = -1;
         // Rows retired from the pipe per result set, with the set's job: two jobs can be
         // in flight on one macro. Store watermark: beat k may go once the count covers its rows.
         uint32_t rows_retired_set[2] = {0, 0};
@@ -256,7 +264,7 @@ class Dimc_Macro {
         // overwrite the other's half-assembled vector.
         uint8_t  row_buffer[DIMC_MACRO_KB_EW] = {0};
         // Kernel rows are assembled apart from features: the two FIFOs pop independently,
-        // so a row's sections and a feature's can arrive in the same cycles.
+        // so a feature's sections can arrive between a kernel row's.
         uint8_t  kb_row_buffer[DIMC_MACRO_KB_EW] = {0};
         static_assert(DIMC_MACRO_FB_EW <= DIMC_MACRO_KB_EW,
                       "row_buffer holds a feature vector; FB_EW must fit KB_EW");
