@@ -83,11 +83,11 @@
 #ifndef DIMC_HELD_KB_PRELOAD
 #define DIMC_HELD_KB_PRELOAD 1
 #endif
-// 1: a feature section may enter a macro in the cycle of the previous vector's last row
-// trigger, which still reads the old vector; sections 1..3 and kernel sections never share
-// a trigger cycle. 0: every section waits for the cycle after the trigger it depends on.
+// 0: no section is written into a macro in a cycle in which it computes; each waits for
+// the cycle after the row trigger it depends on. 1: a feature section may enter in the
+// cycle of the previous vector's last row trigger, which the macro does not allow.
 #ifndef DIMC_FB_WRITE_ON_LAST_ROW
-#define DIMC_FB_WRITE_ON_LAST_ROW 1
+#define DIMC_FB_WRITE_ON_LAST_ROW 0
 #endif
 // The dual's weight and input FIFOs: 256 b sections, one kernel and two feature vectors
 // deep, written into a macro one section per cycle when its write port is open.
@@ -243,9 +243,8 @@ class Dimc_Macro {
         // Rows pushed into this macro's pipe. Per macro, not per block, so a
         // macro that finished filling does not wait for its sibling.
         uint32_t rows_issued = 0;
-        // Cycle of the last row trigger. A kernel section is never written in a trigger
-        // cycle (COMPE selects one of the two); a feature section may share it
-        // (DIMC_FB_WRITE_ON_LAST_ROW).
+        // Cycle of the last row trigger. No section is written into the macro in that
+        // cycle, except a feature section with DIMC_FB_WRITE_ON_LAST_ROW 1.
         int64_t  last_trigger_cycle = -1;
         // Rows retired from the pipe per result set, with the set's job: two jobs can be
         // in flight on one macro. Store watermark: beat k may go once the count covers its rows.
