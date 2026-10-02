@@ -64,7 +64,13 @@ class Dimc_HWPE_Streamer {
         // Issue ONE beat (inner_port_bytes wide) and return the cycle count after
         // which its response is due. The caller keeps the timestamp in a pending
         // queue instead of blocking, so several beats can be in flight at once.
+        // A read at a 64 B-aligned address fetches the whole 64 B port word: the
+        // second section is kept in `pair` and the next beat, if it is that section,
+        // returns NO_REQUEST without touching the memory.
+        static const int NO_REQUEST = -1;
         int issue_beat(int width, void* buf);
+        // The next beat is the kept second section: no request, no port.
+        bool pair_ready() const;
         // Address of the next beat, linear or strided; see the .cpp.
         uint32_t walk_addr() const;
 
@@ -85,14 +91,17 @@ class Dimc_HWPE_Streamer {
         uint32_t    d2_stride;
         uint32_t    d3_stride;
         bool        is_write;
+        uint8_t     pair[32];
+        uint32_t    pair_addr;
+        bool        pair_valid;
 };
 
 
 // ---- Outer port: the tile's shared port towards memory ----
 // A bandwidth limiter in the same idiom as interco/router's: the port remembers
 // when it is free again, so a client arriving before that waits. Accounting is
-// byte-granular, so two 32-byte beats occupy one cycle of a 64 B/cycle port
-// rather than one cycle each.
+// byte-granular; every request books the whole port word, so a port carries one
+// request (one address) per cycle.
 class Dimc_OuterPort {
     public:
         void    configure(uint32_t bandwidth);
@@ -222,30 +231,31 @@ class Dimc_InnerBlock {
         // Accumulates across jobs, so reset_job_state() must not touch it.
         Dimc_OutAccum out_accum;
 
-        // Clear everything the engine tracks for one job. Called from the
-        // constructor, from reset(), and at every job start, so the three sites
-        // cannot drift apart.
-        // keep_fill leaves the fill cursor and the in-flight beats alone: the
-        // fill runs ahead into the next job, so a job boundary must not reset it.
-        // keep_wgt leaves the weight FIFO alone: it may hold a held job's kernel
-        // that the macro takes once the job runs.
-        void reset_job_state(bool keep_fill = false, bool keep_store = false, bool keep_wgt = false)
+        // Clear what the engine tracks for one job, at every job start. keep_fill leaves
+        // the fill cursor, the in-flight beats and the input FIFO alone: the fill runs
+        // ahead into the next job, so a job boundary must not reset it. The weight FIFO
+        // is never cleared here: it may hold a held job's kernel that the macro takes once
+        // the job runs.
+        void reset_job_state(bool keep_fill)
         {
             if (!keep_fill) {
                 this->fill.reset(this->macros.size());
-                if (!keep_wgt) this->wgt_fifo.clear();
                 for (auto &q : this->inp_fifo) q.clear();
                 while (!this->port_pending.empty()) this->port_pending.pop();
                 while (!this->kb_pending.empty()) this->kb_pending.pop();
                 while (!this->in_pending.empty()) this->in_pending.pop();
             }
-            if (!keep_store) {
-                while (!this->store_pending.empty()) this->store_pending.pop();
-                this->store.reset(this->macros.size());
-                for (uint32_t &n : this->out_results) n = 0;
-            }
+            while (!this->store_pending.empty()) this->store_pending.pop();
+            this->store.reset(this->macros.size());
+            for (uint32_t &n : this->out_results) n = 0;
             this->rows_issued = 0;
             this->phase_done = false;
+        }
+        // Construction, reset and soft clear: the weight FIFO too.
+        void reset_all()
+        {
+            this->wgt_fifo.clear();
+            this->reset_job_state(false);
         }
 };
 

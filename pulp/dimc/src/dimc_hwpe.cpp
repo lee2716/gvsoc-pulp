@@ -60,7 +60,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
             blk.out_stream   .emplace_back(this, true);
             blk.psin_stream  .emplace_back(this, false);
         }
-        blk.reset_job_state();
+        blk.reset_all();
     }
 
     // Every trace signal lives in the tracer, registered once the blocks are
@@ -174,7 +174,7 @@ void Dimc_HWPE::reset(bool active)
     this->fill_job    = 0xFFFFFFFFu;
         this->job_geom[0].psin_beats_per_macro = 0;
         this->job_geom[0].psin_rows        = 0;
-        for (Dimc_InnerBlock &blk : this->inner_blocks) blk.reset_job_state();
+        for (Dimc_InnerBlock &blk : this->inner_blocks) blk.reset_all();
         for (Dimc_InnerBlock &blk : this->inner_blocks)
             for (Dimc_Macro &mc : blk.macros) {
                 mc.exec_ready  = false;

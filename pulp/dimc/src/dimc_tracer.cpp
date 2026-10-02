@@ -134,9 +134,8 @@ void Dimc_Tracer::fill_beat(uint32_t b, uint32_t macro, uint32_t within,
         const uint32_t slot = this->dimc.inner_blocks[b].macros[macro].write_slot;
         const Dimc_HWPE::JobGeom &fg = this->dimc.job_geom[slot];
         const uint8_t k = this->dimc.beat_kind(fg, within), prev = mac.load_kind;
-        const uint8_t in = prev == DIMC_LOAD_KB ? k : k == DIMC_LOAD_KB ? prev : DIMC_LOAD_NONE;
-        mac.load_kind = in == DIMC_LOAD_FB   ? DIMC_LOAD_KB_FB
-                      : in == DIMC_LOAD_PSIN ? DIMC_LOAD_KB_PSIN : k;
+        const bool kb_psin = (prev == DIMC_LOAD_KB && k == DIMC_LOAD_PSIN) || (prev == DIMC_LOAD_PSIN && k == DIMC_LOAD_KB);
+        mac.load_kind = kb_psin ? DIMC_LOAD_KB_PSIN : k;
     }
     uint32_t idx = this->dimc.inner_blocks[b].fill.beat_index;
     blk.beat_event.event((uint8_t *)&idx);
@@ -245,8 +244,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
 {
     const Block &tb = this->blocks[b];
     const Macro &tm = tb.macros[m];
-    if (tm.loaded)     return tm.load_kind == DIMC_LOAD_KB || tm.load_kind == DIMC_LOAD_KB_FB
-                              || tm.load_kind == DIMC_LOAD_KB_PSIN ? DIMC_WHY_LOAD_KB
+    if (tm.loaded)     return tm.load_kind == DIMC_LOAD_KB || tm.load_kind == DIMC_LOAD_KB_PSIN ? DIMC_WHY_LOAD_KB
                             : tm.load_kind == DIMC_LOAD_FB   ? DIMC_WHY_LOAD_FB
                             : tm.load_kind == DIMC_LOAD_PSIN ? DIMC_WHY_LOAD_PSIN
                                                              : DIMC_WHY_UNKNOWN;

@@ -68,8 +68,12 @@ class Democritos_D_TileTcdm(gvsoc.systree.Component):
             # atomics and truncate_size match the banks in magia_v2/tile.py. Without
             # atomics the banks reject RISC-V atomic instructions; truncate_size
             # masks an incoming address with (size - 1), so a bank sees an
-            # in-range offset instead of running past its end.
+            # in-range offset instead of running past its end. width_log2 2: a
+            # single-port 32-bit bank serves one word per cycle, so a second
+            # access in the same cycle, from any of the three interleavers, is
+            # delayed by a cycle.
             bank = memory.Memory(self, f'bank_{i}', atomics=True, size=bank_size,
+                                 width_log2=2,
                                  latency=DemocritosDSE.TILE_TCDM_LATENCY,
                                  truncate_size=bank_size)
             banks.append(bank)
@@ -134,8 +138,10 @@ class Democritos_D_Tile(gvsoc.systree.Component):
                     nb_inner_blocks   = 2,    # 2 blocks x 2 macros = 4 macros
                     # Two port widths, and every STARTING and STORING beat count
                     # is derived from them: an inner block reaches memory at
-                    # 32 B/cycle (256 bit), and both blocks' beats then pass
-                    # through one shared 64 B/cycle (512 bit) outer port.
+                    # 32 B/cycle (256 bit), and both blocks' beats pass through one
+                    # shared 512-bit outer port per direction, the D-tile's DIMC-to-L1
+                    # port, one 64 B address per cycle. The banks above serialise
+                    # same-cycle accesses to one bank.
                     inner_port_bytes  = 32,
                     outer_port_bytes  = 64)
         self.dimc = dimc

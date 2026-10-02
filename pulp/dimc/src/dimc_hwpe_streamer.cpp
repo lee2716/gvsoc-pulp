@@ -15,6 +15,7 @@
  */
 
 #include <dimc.hpp>
+#include <cstring>
 
 
 Dimc_HWPE_Streamer::Dimc_HWPE_Streamer(Dimc_HWPE* dimc, bool is_write) {
@@ -33,6 +34,8 @@ Dimc_HWPE_Streamer::Dimc_HWPE_Streamer(Dimc_HWPE* dimc, bool is_write) {
     this->tot_iters = 0;
     this->req       = this->dimc->stream_mst.req_new(0, 0, 0, is_write);
     this->is_write  = is_write;
+    this->pair_valid = false;
+    this->pair_addr  = 0;
 }
 
 Dimc_HWPE_Streamer::Dimc_HWPE_Streamer() {
@@ -61,6 +64,7 @@ void Dimc_HWPE_Streamer::configure(
     this->d3_stride = d3_stride;
     this->pos       = 0;
     this->tot_iters = 0;
+    this->pair_valid = false;
 
     this->dimc->trace.msg("base addr %x\ntot len %d\nd0 len %d\nd0 stride %d\nd1 len %d\nd1 stride %d\nd2 stride %d\nd3 stride %d\n",
         this->base_addr,
@@ -79,6 +83,10 @@ void Dimc_HWPE_Streamer::configure(
 // true on the same beat that exhausts the engine's own beat_total. It is the
 // streamer's own guard, not the bound that ends a phase.
 bool Dimc_HWPE_Streamer::is_done() { return this->pos >= this->tot_len; }
+
+bool Dimc_HWPE_Streamer::pair_ready() const {
+    return !this->is_write && this->pair_valid && this->walk_addr() == this->pair_addr;
+}
 
 // Where the next beat reads or writes. `pos` counts bytes consumed, which is
 // also the address offset while the walk is linear.
@@ -130,23 +138,46 @@ int Dimc_HWPE_Streamer::issue_beat(int width, void* buf) {
 
     // A beat is one request at one address, so it must not straddle the end of
     // a contiguous run. Clamp it to what is left of the current run.
+    uint32_t left = this->tot_len - this->pos;
     if (this->d0_len != 0) {
         const uint32_t left_in_run = this->d0_len - (this->pos % this->d0_len);
-        if ((uint32_t)beat > left_in_run) beat = (int)left_in_run;
+        if (left_in_run < left) left = left_in_run;
     }
+    if ((uint32_t)beat > left) beat = (int)left;
+
+    // The second section of a port word already fetched: no request.
+    if (!this->is_write && buf != NULL && this->pair_valid && base == this->pair_addr
+        && beat == (int)sizeof(this->pair)) {
+        std::memcpy(buf, this->pair, sizeof(this->pair));
+        this->pair_valid = false;
+        this->pos += (uint32_t)beat;
+        this->tot_iters++;
+        return NO_REQUEST;
+    }
+    // A read of a port word's first section fetches the whole word (one address per
+    // request on the 512-bit port); the second section waits in `pair`.
+    const bool whole_word = !this->is_write && buf != NULL && beat == (int)sizeof(this->pair)
+        && (base & (2 * sizeof(this->pair) - 1)) == 0 && left >= 2 * sizeof(this->pair);
+    uint8_t word[2 * sizeof(this->pair)];
 
     int64_t latency = 1;
     if (buf != NULL) {
         this->req->prepare();
         this->req->set_addr(base);
-        this->req->set_data((uint8_t *) buf);
-        this->req->set_size(beat);
+        this->req->set_data(whole_word ? word : (uint8_t *) buf);
+        this->req->set_size(whole_word ? (int)sizeof(word) : beat);
         vp::IoReqStatus err = this->dimc->stream_mst.req(this->req);
         if (err != vp::IO_REQ_OK) {
             this->dimc->trace.fatal("Error while issuing a TCDM beat\n");
             return 0;
         }
         latency = (int64_t) this->req->get_latency();
+        if (whole_word) {
+            std::memcpy(buf, word, sizeof(this->pair));
+            std::memcpy(this->pair, word + sizeof(this->pair), sizeof(this->pair));
+            this->pair_addr  = base + (uint32_t)sizeof(this->pair);
+            this->pair_valid = true;
+        }
     }
 
     this->pos += (uint32_t)beat;

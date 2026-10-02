@@ -58,10 +58,9 @@ enum dimc_load_kind_t : uint8_t {
     DIMC_LOAD_KB   = 1,               // weights
     DIMC_LOAD_FB   = 2,               // inputs
     DIMC_LOAD_PSIN = 3,
-    // A kernel section went into the macro that cycle while partial sums went into its ADDIN
-    // sets (DIMC_LOAD_KB_FB: with a feature section, no longer produced).
-    DIMC_LOAD_KB_FB   = 4,
-    DIMC_LOAD_KB_PSIN = 5
+    // A kernel section went into the macro that cycle while partial sums went into its
+    // ADDIN sets.
+    DIMC_LOAD_KB_PSIN = 4
 };
 // outer_port/use: a write-back beat, and the packing of one cycle's beats. Two bits per kind
 // (0..2 beats of 32 B): kernel in bits 1:0, feature 3:2, partial sums 5:4, write-back 7:6.

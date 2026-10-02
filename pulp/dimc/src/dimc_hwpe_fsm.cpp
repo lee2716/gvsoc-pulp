@@ -88,7 +88,7 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
         }
 
     for (Dimc_InnerBlock &blk : _this->inner_blocks)
-        blk.reset_job_state(_this->fill_active, false, true);
+        blk.reset_job_state(_this->fill_active);
 
     _this->state.set(DIMC_STARTING);
     _this->tracer.job_start((uint64_t)_this->clock.get_cycles());
@@ -460,7 +460,7 @@ void Dimc_HWPE::advance_fill()
     if ((uint32_t)nxt == this->exec_slot) return;
     const uint32_t nxt_job = this->ctx_job_id[nxt];
 
-    // One job of lookahead: a program is chained only from the running job's own.
+    // The next job's programs chain from the running job's own.
     if (this->job_geom[this->exec_slot].nb_vec <= 1) {
         // One vector per job: the next job's fill starts once every macro has fetched all of
         // this job's program. Not fill_active: a prefetched kernel in the weight FIFO keeps it set.
@@ -497,10 +497,8 @@ void Dimc_HWPE::advance_fill()
     }
 }
 
-// Fill program of one macro for one job. With the prefill: vector 0's partial sums and
-// feature, then the kernel rows (fresh jobs only), then vectors 1..NB_VEC-1, each partial
-// sums then feature; with PSIN_CHAIN the kernel rows come first. Without the prefill (one
-// vector only): feature, partial sums, kernel rows.
+// Fill program of one macro for one job: vector 0's partial sums and feature, then the
+// kernel rows, then vectors 1..NB_VEC-1, each partial sums then feature.
 Dimc_HWPE::BeatPos Dimc_HWPE::beat_pos(const JobGeom &g, uint32_t within) const
 {
     const uint32_t fb  = g.fb_beats_per_macro;
@@ -620,11 +618,6 @@ bool Dimc_HWPE::preload_iter(int *latency)
         const uint32_t b = this->block_order(i);
         Dimc_InnerBlock &blk = this->inner_blocks[b];
         if (blk.wgt_fifo.size() >= DIMC_WGT_FIFO_DEPTH) continue;
-        if (blk.kb_pending.size() >= this->outstanding_depth) continue;
-        if (this->outer_port_in.busy_until() > (int64_t)this->fsm_timestamp) {
-            this->tracer.kernel_skip(b, DIMC_WHY_WAIT_OUTER_PORT);
-            continue;
-        }
         this->kernel_prefetch(blk, b);
     }
     this->tracer.port_cycle();
@@ -825,19 +818,6 @@ void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
         this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
         return;
     }
-    if (feed_pending.size() >= this->outstanding_depth) {
-        if (kernel_feed) this->tracer.kernel_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
-        else             this->tracer.input_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
-        this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
-        return;
-    }
-    if (this->outer_port_in.busy_until() > (int64_t)this->fsm_timestamp) {
-        if (kernel_feed) this->tracer.kernel_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
-        else             this->tracer.input_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
-        this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
-        return;
-    }
-
     // Pick the macro this section is fetched for, among those whose next section is on this
     // feed. Kernel: a macro that can take it now, else the one with the fewest runs left.
     // Input: into the macro's own half of the input FIFO when it has room; partial sums only
@@ -922,6 +902,26 @@ void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
         }
         return;
     }
+    // A request: within the outstanding depth, and the port free this cycle. The kept
+    // second section of a port word needs neither.
+    const Dimc_Macro &sel = blk.macros[macro];
+    const uint8_t sel_kind = this->beat_pos(this->job_geom[sel.fill_slot], cursor.macro_beat_index[macro]).kind;
+    const Dimc_HWPE_Streamer &st = sel_kind == DIMC_LOAD_KB ? blk.weight_stream[macro]
+                                 : sel_kind == DIMC_LOAD_FB ? blk.input_stream[macro] : blk.psin_stream[macro];
+    if (!st.pair_ready()) {
+        if (feed_pending.size() >= this->outstanding_depth) {
+            if (kernel_feed) this->tracer.kernel_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
+            else             this->tracer.input_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
+            this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
+            return;
+        }
+        if (this->outer_port_in.busy_until() > (int64_t)this->fsm_timestamp) {
+            if (kernel_feed) this->tracer.kernel_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
+            else             this->tracer.input_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
+            this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
+            return;
+        }
+    }
     this->fill_beat(blk, blk_id, cursor, macro, feed_pending);
 }
 
@@ -975,8 +975,8 @@ uint32_t Dimc_HWPE::kb_end(const JobGeom &g) const
     return g.psin_beats_per_macro + g.fb_beats_per_macro + kb;
 }
 
-// Fetch one kernel section of a macro's next job (or of its current one-vector job whose
-// program has not reached the kernel) into the weight FIFO, ahead of the program. Only while
+// Fetch one kernel section of a macro's next job (or of its current job whose program has
+// not reached the kernel) into the weight FIFO, ahead of the program. Only while
 // no other macro of the dual owes kernel sections its program has reached; one macro at a
 // time: the one in progress, else the one with the fewest runs left.
 bool Dimc_HWPE::kernel_prefetch(Dimc_InnerBlock &blk, uint32_t blk_id)
@@ -1049,6 +1049,13 @@ bool Dimc_HWPE::kernel_prefetch(Dimc_InnerBlock &blk, uint32_t blk_id)
         fm.kpf_job = job; fm.kpf_slot = (uint32_t)pick_slot; fm.kfetched = 0;
         this->configure_macro_streams(blk_id, pick, pick_slot, 0, true, false, false);
     }
+    if (!blk.weight_stream[pick].pair_ready()) {
+        if (blk.kb_pending.size() >= this->outstanding_depth) return false;
+        if (this->outer_port_in.busy_until() > (int64_t)this->fsm_timestamp) {
+            this->tracer.kernel_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
+            return false;
+        }
+    }
     const uint32_t port_bytes = this->inner_port_bytes;
     const uint32_t sub = fm.kfetched;
     Dimc_InnerBlock::FeedEntry e;
@@ -1057,14 +1064,17 @@ bool Dimc_HWPE::kernel_prefetch(Dimc_InnerBlock &blk, uint32_t blk_id)
     const uint32_t off = (sub % fg.kb_beats_per_row) * port_bytes;
     e.bytes = DIMC_MACRO_KB_EW - off < port_bytes ? DIMC_MACRO_KB_EW - off : port_bytes;
     int lat = blk.weight_stream[pick].issue_beat((int)e.bytes, e.data);
-    if (lat < 1) lat = 1;
+    const bool requested = lat != Dimc_HWPE_Streamer::NO_REQUEST;
+    if (lat < 1) lat = requested ? 1 : 0;
     e.ready = this->fsm_timestamp + (uint64_t)lat + 1;
     blk.wgt_fifo.push_back(e);
     fm.kfetched++;
-    this->outer_port_in.request((int64_t)this->fsm_timestamp, e.bytes);
-    this->tracer.outer_port_booked(blk_id, DIMC_LOAD_KB);
-    blk.kb_pending.push(this->fsm_timestamp + (uint64_t)lat);
-    blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
+    if (requested) {
+        this->outer_port_in.request((int64_t)this->fsm_timestamp, this->outer_port_bytes);
+        this->tracer.outer_port_booked(blk_id, DIMC_LOAD_KB);
+        blk.kb_pending.push(this->fsm_timestamp + (uint64_t)lat);
+        blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
+    }
     return true;
 }
 
@@ -1121,12 +1131,14 @@ bool Dimc_HWPE::held_kernel_step(Dimc_InnerBlock &blk, uint32_t blk_id, int ctx)
     for (const Dimc_InnerBlock::FeedEntry &q : blk.wgt_fifo)
         if (q.macro != pick) return true;          // the previous macro's kernel drains first
     if (blk.wgt_fifo.size() >= DIMC_WGT_FIFO_DEPTH) return true;
-    if (blk.kb_pending.size() >= this->outstanding_depth) return true;
-    if (this->outer_port_in.busy_until() > (int64_t)this->fsm_timestamp) return true;
     Dimc_Macro &fm = blk.macros[pick];
     if (fm.kpf_job != job) {
         fm.kpf_job = job; fm.kpf_slot = (uint32_t)ctx; fm.kfetched = 0;
         this->configure_macro_streams(blk_id, pick, ctx, 0, true, false, false);
+    }
+    if (!blk.weight_stream[pick].pair_ready()) {
+        if (blk.kb_pending.size() >= this->outstanding_depth) return true;
+        if (this->outer_port_in.busy_until() > (int64_t)this->fsm_timestamp) return true;
     }
     const uint32_t port_bytes = this->inner_port_bytes;
     const uint32_t sub = fm.kfetched;
@@ -1136,14 +1148,17 @@ bool Dimc_HWPE::held_kernel_step(Dimc_InnerBlock &blk, uint32_t blk_id, int ctx)
     const uint32_t off = (sub % g.kb_beats_per_row) * port_bytes;
     e.bytes = DIMC_MACRO_KB_EW - off < port_bytes ? DIMC_MACRO_KB_EW - off : port_bytes;
     int lat = blk.weight_stream[pick].issue_beat((int)e.bytes, e.data);
-    if (lat < 1) lat = 1;
+    const bool requested = lat != Dimc_HWPE_Streamer::NO_REQUEST;
+    if (lat < 1) lat = requested ? 1 : 0;
     e.ready = this->fsm_timestamp + (uint64_t)lat + 1;
     blk.wgt_fifo.push_back(e);
     fm.kfetched++;
-    this->outer_port_in.request((int64_t)this->fsm_timestamp, e.bytes);
-    this->tracer.outer_port_booked(blk_id, DIMC_LOAD_KB);
-    blk.kb_pending.push(this->fsm_timestamp + (uint64_t)lat);
-    blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
+    if (requested) {
+        this->outer_port_in.request((int64_t)this->fsm_timestamp, this->outer_port_bytes);
+        this->tracer.outer_port_booked(blk_id, DIMC_LOAD_KB);
+        blk.kb_pending.push(this->fsm_timestamp + (uint64_t)lat);
+        blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
+    }
     return true;
 }
 
@@ -1193,13 +1208,15 @@ void Dimc_HWPE::fill_beat(Dimc_InnerBlock &blk, uint32_t blk_id,
         e.bytes = n * DIMC_OUT_SLOT_BYTES;
         lat = blk.psin_stream[macro].issue_beat((int)e.bytes, e.data);
     }
-    if (lat < 1) lat = 1;
+    const bool requested = lat != Dimc_HWPE_Streamer::NO_REQUEST;
+    if (lat < 1) lat = requested ? 1 : 0;
     e.ready = this->fsm_timestamp + (uint64_t)lat + 1;   // fifo_v3, not fall-through
     (kind == DIMC_LOAD_KB ? blk.wgt_fifo : blk.inp_queue(macro)).push_back(e);
 
     cursor.macro_beat_index[macro]++;
     cursor.beat_index++;
-    this->outer_port_in.request((int64_t)this->fsm_timestamp, e.bytes);
+    if (!requested) return;
+    this->outer_port_in.request((int64_t)this->fsm_timestamp, this->outer_port_bytes);
     this->tracer.outer_port_booked(blk_id, kind);
     feed_pending.push(this->fsm_timestamp + (uint64_t)lat);
     blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
@@ -1497,7 +1514,7 @@ void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
         if (lat < 1) lat = 1;
         blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
         blk.store_pending.push(this->fsm_timestamp + (uint64_t)lat);
-        this->outer_port_out.request((int64_t)this->fsm_timestamp, w);
+        this->outer_port_out.request((int64_t)this->fsm_timestamp, this->outer_port_bytes);
         this->tracer.outer_port_booked(blk_id, DIMC_PORT_WB);
         if (r + n == rows)
             blk.run_pending.push_back({this->fsm_timestamp + (uint64_t)lat, this->running_job, m, vec});
@@ -1554,7 +1571,7 @@ void Dimc_HWPE::store_next_job(Dimc_InnerBlock &blk, uint32_t blk_id)
         if (lat < 1) lat = 1;
         blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
         blk.store_next_pending.push(this->fsm_timestamp + (uint64_t)lat);
-        this->outer_port_out.request((int64_t)this->fsm_timestamp, w);
+        this->outer_port_out.request((int64_t)this->fsm_timestamp, this->outer_port_bytes);
         this->tracer.outer_port_booked(blk_id, DIMC_PORT_WB);
         if (r + n == rows)
             blk.run_pending.push_back({this->fsm_timestamp + (uint64_t)lat, next, m, vec});
