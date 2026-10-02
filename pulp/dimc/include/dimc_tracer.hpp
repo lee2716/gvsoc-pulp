@@ -44,6 +44,7 @@ enum dimc_why_t : uint8_t {
     DIMC_WHY_FSM_STEP         = 14,   // a phase cycle with no work
     DIMC_WHY_WAIT_COMPUTE     = 15,   // a section fetch or write held: beat_writable refused it
     DIMC_WHY_WAIT_PSUM        = 16,   // the partial sums' producer run is not written back yet
+    DIMC_WHY_WAIT_WGT_FIFO    = 17,   // its kernel sections wait behind another macro's in the dual's weight FIFO
     DIMC_WHY_UNKNOWN          = 255   // must never appear
 };
 
@@ -56,7 +57,10 @@ enum dimc_load_kind_t : uint8_t {
     DIMC_LOAD_NONE = 0,
     DIMC_LOAD_KB   = 1,               // weights
     DIMC_LOAD_FB   = 2,               // inputs
-    DIMC_LOAD_PSIN = 3
+    DIMC_LOAD_PSIN = 3,
+    // The weight FIFO and the input FIFO each wrote a section into the macro that cycle.
+    DIMC_LOAD_KB_FB   = 4,
+    DIMC_LOAD_KB_PSIN = 5
 };
 
 // Why the engine has no job, traced as idle_why.
@@ -96,6 +100,8 @@ class Dimc_Tracer {
         void fill_skip(uint32_t blk, uint8_t why);
         // The kernel feed was refused (DIMC_WHY_WAIT_DEPTH / DIMC_WHY_WAIT_OUTER_PORT).
         void kernel_skip(uint32_t blk, uint8_t why);
+        // The input feed was refused (DIMC_WHY_WAIT_DEPTH / DIMC_WHY_WAIT_OUTER_PORT).
+        void input_skip(uint32_t blk, uint8_t why);
         void row_issued(uint32_t blk, uint32_t macro, uint32_t rows_issued,
                         uint32_t row_count);
         void store_beat(uint32_t blk, uint32_t macro, int lat, uint32_t out_beats);
@@ -135,6 +141,7 @@ class Dimc_Tracer {
             // was not due.
             uint8_t   fill_skip = 0, store_skip = 0;
             uint8_t   kernel_skip = 0;          // this cycle's kernel-feed refusal
+            uint8_t   input_skip = 0;           // this cycle's input-feed refusal
             uint64_t  kernel_port_refused = ~0ull;   // DIMC cycle the kernel feed last lost the outer port
             // Last store beat's latency times the beat count; report only.
             uint32_t  out_beat_lat_est = 0;

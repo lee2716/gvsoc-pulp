@@ -249,11 +249,13 @@ class Dimc_InnerBlock {
         // cannot drift apart.
         // keep_fill leaves the fill cursor and the in-flight beats alone: the
         // fill runs ahead into the next job, so a job boundary must not reset it.
-        void reset_job_state(bool keep_fill = false, bool keep_store = false)
+        // keep_wgt leaves the weight FIFO alone: it may hold a held job's kernel
+        // (DIMC_HELD_KB_TO_FIFO) that the macro takes once the job runs.
+        void reset_job_state(bool keep_fill = false, bool keep_store = false, bool keep_wgt = false)
         {
             if (!keep_fill) {
                 this->fill.reset(this->macros.size());
-                this->wgt_fifo.clear();
+                if (!keep_wgt) this->wgt_fifo.clear();
                 for (auto &q : this->inp_fifo) q.clear();
                 while (!this->port_pending.empty()) this->port_pending.pop();
                 while (!this->kb_pending.empty()) this->kb_pending.pop();
@@ -461,6 +463,8 @@ class Dimc_HWPE : public vp::Component {
         // them into the macros. Split so the pops can follow the cycle's row triggers.
         void fetch_feeds(Dimc_InnerBlock &blk, uint32_t blk_id, Dimc_InnerBlock::Cursor &cursor);
         void fetch_kernels_first();
+        uint32_t rows_before_feature(const Dimc_Macro &mc, uint32_t job, uint32_t run) const;
+        bool input_urgent() const;
         void write_feeds(Dimc_InnerBlock &blk, uint32_t blk_id);
         // One block's cycle of fetch, trigger and write, in the order the switch selects.
         void block_cycle(Dimc_InnerBlock &blk, uint32_t blk_id);

@@ -83,6 +83,12 @@
 #ifndef DIMC_HELD_KB_PRELOAD
 #define DIMC_HELD_KB_PRELOAD 1
 #endif
+// With DIMC_HELD_KB_PRELOAD: 1: the held job's kernel of each dual's first macro is fetched
+// into the weight FIFO only; it is written into the macro, one section per cycle, once the
+// job runs. 0: every macro's held kernel is fetched and written into the macro.
+#ifndef DIMC_HELD_KB_TO_FIFO
+#define DIMC_HELD_KB_TO_FIFO 1
+#endif
 // 0: no section is written into a macro in a cycle in which it computes; each waits for
 // the cycle after the row trigger it depends on. 1: a feature section may enter in the
 // cycle of the previous vector's last row trigger, which the macro does not allow.
@@ -105,8 +111,18 @@
 // N > 0: a dual whose weight FIFO holds at most N sections of the macro whose kernel is
 // being written books the outer port for its kernel feed before any dual's input feed; the
 // other duals, and every dual otherwise, book input then kernel. 0: always input then kernel.
+// 1: a macro's kernel is fetched ahead of its own fill program also for batched jobs (the
+// program fetches that run's partial sums and feature first), as for jobs of one vector.
+#ifndef DIMC_KB_AHEAD_BATCHED
+#define DIMC_KB_AHEAD_BATCHED 1
+#endif
 #ifndef DIMC_KB_FEED_FIRST
 #define DIMC_KB_FEED_FIRST 2
+#endif
+// N > 0: DIMC_KB_FEED_FIRST yields in a cycle where some macro's next input section is for
+// a vector it may start within N rows (the macro waits, or is about to wait, for its inputs).
+#ifndef DIMC_KB_FEED_YIELD
+#define DIMC_KB_FEED_YIELD 6
 #endif
 #ifndef DIMC_INP_FIFO_SHARED
 #define DIMC_INP_FIFO_SHARED 1

@@ -97,7 +97,7 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
         }
 
     for (Dimc_InnerBlock &blk : _this->inner_blocks)
-        blk.reset_job_state(_this->fill_active, DIMC_JOB_LOOKAHEAD > 1);
+        blk.reset_job_state(_this->fill_active, DIMC_JOB_LOOKAHEAD > 1, DIMC_HELD_KB_TO_FIFO);
 
     _this->state.set(DIMC_STARTING);
     _this->tracer.job_start((uint64_t)_this->clock.get_cycles());
@@ -803,11 +803,46 @@ void Dimc_HWPE::fetch_feeds(Dimc_InnerBlock &blk, uint32_t blk_id,
     blk.kb_fed_first = false;
 }
 
+// Rows the macro still triggers before vector `run` of `job` may enter its feature buffer.
+uint32_t Dimc_HWPE::rows_before_feature(const Dimc_Macro &mc, uint32_t job, uint32_t run) const
+{
+    // Nothing triggered yet: the first job's vector 0 is next; anything later waits for rows
+    // that have not started (the macro's kernel may still be going in).
+    if (mc.issue_job == Dimc_Macro::JOB_NONE)
+        return !run && (mc.write_job == Dimc_Macro::JOB_NONE || mc.write_job == job) ? 0 : 0xFFFFFFFFu;
+    uint32_t target;
+    if (mc.issue_job == job)                    target = run;
+    else if (mc.issue_job + 1u == job && !run) target = mc.job_nb_vec;
+    else                                        return 0xFFFFFFFFu;
+    if (mc.runs_issued >= target) return 0;
+    const uint32_t cur = mc.rows_issued < mc.job_rows ? mc.rows_issued : 0;
+    return (target - mc.runs_issued) * mc.job_rows - cur;
+}
+
+// DIMC_KB_FEED_YIELD: a macro whose next input section (partial sums or feature) is for a
+// vector it may start within that many rows.
+bool Dimc_HWPE::input_urgent() const
+{
+    for (const Dimc_InnerBlock &blk : this->inner_blocks) {
+        const Dimc_InnerBlock::Cursor &c = blk.fill;
+        for (uint32_t m = 0; m < blk.macros.size() && m < c.macro_beat_index.size(); m++) {
+            if (c.macro_beat_index[m] >= c.macro_beat_total[m]) continue;
+            const Dimc_Macro &t = blk.macros[m];
+            const BeatPos pos = this->beat_pos(this->job_geom[t.fill_slot], c.macro_beat_index[m]);
+            if (pos.kind == DIMC_LOAD_KB) continue;
+            if (this->rows_before_feature(t, t.fill_job, pos.run) <= DIMC_KB_FEED_YIELD) return true;
+        }
+    }
+    return false;
+}
+
 // DIMC_KB_FEED_FIRST: the kernel feed of each dual about to run out of the kernel being
-// written, before the block loop books any input.
+// written, before the block loop books any input; with DIMC_KB_FEED_YIELD, not while a
+// macro is about to wait for its inputs.
 void Dimc_HWPE::fetch_kernels_first()
 {
     if (!DIMC_KB_FEED_FIRST) return;
+    if (DIMC_KB_FEED_YIELD && this->input_urgent()) return;
     for (uint32_t i = 0; i < this->inner_blocks.size(); i++) {
         const uint32_t b = this->block_order(i);
         Dimc_InnerBlock &blk = this->inner_blocks[b];
@@ -856,10 +891,15 @@ void Dimc_HWPE::block_cycle(Dimc_InnerBlock &blk, uint32_t blk_id)
 bool Dimc_HWPE::beat_writable(const Dimc_Macro &mc, uint32_t job, const BeatPos &pos) const
 {
     if (pos.kind == DIMC_LOAD_PSIN) {
+        // A later job's section would open the macro's write program for that job and drop
+        // the one not yet handed to compute (its kernel may still be streaming in).
+        if (mc.write_job != Dimc_Macro::JOB_NONE && mc.write_job != job && !mc.stamped) return false;
         // The two ADDIN sets alternate between runs. A run's first section opens its set,
         // which the run two before it (or the previous job's run of that parity) read last:
         // every row of that run has to be triggered first.
-        if (pos.sub != 0 || mc.issue_job == Dimc_Macro::JOB_NONE) return true;
+        if (pos.sub != 0) return true;
+        // Nothing triggered yet: runs 0 and 1 open unused sets; run r >= 2 reuses run r - 2's.
+        if (mc.issue_job == Dimc_Macro::JOB_NONE) return pos.run < 2u;
         if (mc.issue_job == job) return pos.run < 2u || mc.runs_issued + 1u >= pos.run;
         if (mc.issue_job + 1u == job)
             return pos.run < 2u && mc.runs_issued + 1u >= mc.job_nb_vec + pos.run;
@@ -918,11 +958,13 @@ void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
     }
     if (feed_pending.size() >= this->outstanding_depth) {
         if (kernel_feed) this->tracer.kernel_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
+        else             this->tracer.input_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
         this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_DEPTH);
         return;
     }
     if (this->outer_port_in.busy_until() > (int64_t)this->fsm_timestamp) {
         if (kernel_feed) this->tracer.kernel_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
+        else             this->tracer.input_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
         this->tracer.fill_skip(blk_id, DIMC_WHY_WAIT_OUTER_PORT);
         return;
     }
@@ -932,24 +974,13 @@ void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
     // Input: into the macro's own half of the input FIFO when it has room; partial sums only
     // when no macro wants a feature, and once their producer is written back. The half is in
     // order, so run r + 2's partial sums (run r's set) land only after run r is triggered.
-    // Rows the macro still triggers before vector `run` of `job` may enter its feature buffer.
-    auto rows_before_feature = [](const Dimc_Macro &mc, uint32_t job, uint32_t run) -> uint32_t {
-        if (mc.issue_job == Dimc_Macro::JOB_NONE) return 0;
-        uint32_t target;
-        if (mc.issue_job == job)                    target = run;
-        else if (mc.issue_job + 1u == job && !run) target = mc.job_nb_vec;
-        else                                        return 0xFFFFFFFFu;
-        if (mc.runs_issued >= target) return 0;
-        const uint32_t cur = mc.rows_issued < mc.job_rows ? mc.rows_issued : 0;
-        return (target - mc.runs_issued) * mc.job_rows - cur;
-    };
     const uint32_t nb_fill = (uint32_t)blk.macros.size();
     // Room per macro: half the storage each, or all of it shared.
     const size_t   half    = DIMC_INP_FIFO_SHARED ? DIMC_INP_FIFO_DEPTH : DIMC_INP_FIFO_DEPTH / nb_fill;
     // Shared FIFO: among the macros that may fetch, the one whose section is needed first
     // (fewest rows before its vector may enter, plus kernel sections its job still writes).
     auto urgency = [&](const Dimc_Macro &t, const BeatPos &pos) -> uint64_t {
-        uint64_t u = rows_before_feature(t, t.fill_job, pos.run);
+        uint64_t u = this->rows_before_feature(t, t.fill_job, pos.run);
         const JobGeom &fg = this->job_geom[t.fill_slot];
         const uint32_t kb_all = fg.skip_kb ? 0 : fg.row_count * fg.kb_beats_per_row;
         const uint32_t kw = t.write_job == t.fill_job ? t.kw : 0;
@@ -994,7 +1025,7 @@ void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
             // DIMC_INP_FETCH_LEAD from triggered, so a head its macro cannot take yet holds the
             // other macro's sections for at most that long.
             if (DIMC_INP_FIFO_SHARED && k == DIMC_LOAD_FB && !this->beat_writable(t, t.fill_job, pos)
-                && rows_before_feature(t, t.fill_job, pos.run) > DIMC_INP_FETCH_LEAD) {
+                && this->rows_before_feature(t, t.fill_job, pos.run) > DIMC_INP_FETCH_LEAD) {
                 held_by_compute = true;
                 continue;
             }
@@ -1103,8 +1134,9 @@ bool Dimc_HWPE::kernel_prefetch(Dimc_InnerBlock &blk, uint32_t blk_id)
         const uint32_t kb_all = g.row_count * g.kb_beats_per_row;
         if (cur.macro_beat_index[m] < this->kb_end(g)
             && !(t.kpf_job == t.fill_job && t.kfetched >= kb_all)) {
-            // One vector, program still before its kernel sections: fetched ahead below.
-            if (g.nb_vec <= 1 && cur.macro_beat_index[m] < this->kb_end(g) - kb_all) {
+            // Program still before its kernel sections (one vector, or any with
+            // DIMC_KB_AHEAD_BATCHED): fetched ahead below.
+            if ((g.nb_vec <= 1 || DIMC_KB_AHEAD_BATCHED) && cur.macro_beat_index[m] < this->kb_end(g) - kb_all) {
                 own |= 1u << m;
                 continue;
             }
@@ -1212,11 +1244,17 @@ void Dimc_HWPE::held_handler(vp::Block *__this, vp::ClockEvent *event)
         for (const Dimc_Macro &m : blk.macros) f0 += m.kfetched;
         if (_this->held_kernel_step(blk, b, ctx)) more = true;
         const size_t q1 = blk.wgt_fifo.size();
-        _this->write_feed(blk, b, blk.wgt_fifo);
+        if (!DIMC_HELD_KB_TO_FIFO) _this->write_feed(blk, b, blk.wgt_fifo);
         uint32_t f1 = 0;
         for (const Dimc_Macro &m : blk.macros) f1 += m.kfetched;
         if (f1 != f0 || blk.wgt_fifo.size() != q1 || q1 != q0) did = true;
-        if (!blk.wgt_fifo.empty()) more = true;
+        if (!DIMC_HELD_KB_TO_FIFO) {
+            if (!blk.wgt_fifo.empty()) more = true;
+        } else {
+            // The FIFO keeps the kernel: run until its last section has landed.
+            for (const Dimc_InnerBlock::FeedEntry &q : blk.wgt_fifo)
+                if (q.ready > _this->fsm_timestamp) more = true;
+        }
     }
     for (uint32_t b = 0; b < _this->inner_blocks.size(); b++) _this->tracer.end_cycle(b);
     // A call with nothing to do (the one after the last write) only records the idle
@@ -1228,8 +1266,8 @@ void Dimc_HWPE::held_handler(vp::Block *__this, vp::ClockEvent *event)
 }
 
 // Fetch one kernel section of the held job for the lowest macro whose kernel is not all
-// fetched, while the FIFO holds no other macro's sections. False when there is nothing
-// left to fetch for this dual.
+// fetched (DIMC_HELD_KB_TO_FIFO: the first macro only), while the FIFO holds no other
+// macro's sections. False when there is nothing left to fetch for this dual.
 bool Dimc_HWPE::held_kernel_step(Dimc_InnerBlock &blk, uint32_t blk_id, int ctx)
 {
     const JobGeom &g = this->job_geom[ctx];
@@ -1237,7 +1275,8 @@ bool Dimc_HWPE::held_kernel_step(Dimc_InnerBlock &blk, uint32_t blk_id, int ctx)
     if (g.skip_kb) return false;
     const uint32_t kb_all = g.row_count * g.kb_beats_per_row;
     uint32_t pick = (uint32_t)blk.macros.size();
-    for (uint32_t m = 0; m < blk.macros.size() && m < g.num_active; m++) {
+    const uint32_t upto = DIMC_HELD_KB_TO_FIFO ? 1u : g.num_active;
+    for (uint32_t m = 0; m < blk.macros.size() && m < upto; m++) {
         const Dimc_Macro &t = blk.macros[m];
         if (t.kpf_job == job && t.kfetched >= kb_all) continue;
         pick = m;
@@ -1393,7 +1432,7 @@ void Dimc_HWPE::write_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
         // beat_writable already holds such a section: this is a consistency check.
         if (pos.sub == 0) {
             bool free_set;
-            if (mc.issue_job == Dimc_Macro::JOB_NONE) free_set = true;          /* never triggered */
+            if (mc.issue_job == Dimc_Macro::JOB_NONE) free_set = pos.run < 2u;  /* never triggered */
             else if (mc.issue_job == e.job)           free_set = pos.run < 2u || mc.runs_issued + 1u >= pos.run;
             else if (mc.issue_job + 1u == e.job)      free_set = pos.run < 2u
                                                           && (mc.runs_issued + 1u >= mc.job_nb_vec + pos.run);

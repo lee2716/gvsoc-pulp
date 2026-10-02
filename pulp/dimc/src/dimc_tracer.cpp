@@ -132,7 +132,10 @@ void Dimc_Tracer::fill_beat(uint32_t b, uint32_t macro, uint32_t within,
     {
         const uint32_t slot = this->dimc.inner_blocks[b].macros[macro].write_slot;
         const Dimc_HWPE::JobGeom &fg = this->dimc.job_geom[slot];
-        mac.load_kind = this->dimc.beat_kind(fg, within);
+        const uint8_t k = this->dimc.beat_kind(fg, within), prev = mac.load_kind;
+        const uint8_t in = prev == DIMC_LOAD_KB ? k : k == DIMC_LOAD_KB ? prev : DIMC_LOAD_NONE;
+        mac.load_kind = in == DIMC_LOAD_FB   ? DIMC_LOAD_KB_FB
+                      : in == DIMC_LOAD_PSIN ? DIMC_LOAD_KB_PSIN : k;
     }
     uint32_t idx = this->dimc.inner_blocks[b].fill.beat_index;
     blk.beat_event.event((uint8_t *)&idx);
@@ -148,6 +151,11 @@ void Dimc_Tracer::kernel_skip(uint32_t b, uint8_t why)
 {
     this->blocks[b].kernel_skip = why;
     if (why == DIMC_WHY_WAIT_OUTER_PORT) this->blocks[b].kernel_port_refused = this->dimc.fsm_timestamp;
+}
+
+void Dimc_Tracer::input_skip(uint32_t b, uint8_t why)
+{
+    this->blocks[b].input_skip = why;
 }
 
 void Dimc_Tracer::row_issued(uint32_t b, uint32_t m, uint32_t rows_issued,
@@ -214,7 +222,7 @@ void Dimc_Tracer::end_cycle(uint32_t b)
     }
     blk.fill_grant_event.event(&blk.fill_grant);
     blk.loaded = blk.computed = blk.wrote_back = false;
-    blk.fill_skip = blk.store_skip = blk.kernel_skip = 0;
+    blk.fill_skip = blk.store_skip = blk.kernel_skip = blk.input_skip = 0;
     blk.fill_grant = DIMC_GRANT_NONE;
     // The outer port is shared: flush it with the last block, after every block has booked.
     if (b + 1 == this->blocks.size()) {
@@ -227,7 +235,8 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
 {
     const Block &tb = this->blocks[b];
     const Macro &tm = tb.macros[m];
-    if (tm.loaded)     return tm.load_kind == DIMC_LOAD_KB   ? DIMC_WHY_LOAD_KB
+    if (tm.loaded)     return tm.load_kind == DIMC_LOAD_KB || tm.load_kind == DIMC_LOAD_KB_FB
+                              || tm.load_kind == DIMC_LOAD_KB_PSIN ? DIMC_WHY_LOAD_KB
                             : tm.load_kind == DIMC_LOAD_FB   ? DIMC_WHY_LOAD_FB
                             : tm.load_kind == DIMC_LOAD_PSIN ? DIMC_WHY_LOAD_PSIN
                                                              : DIMC_WHY_UNKNOWN;
@@ -254,9 +263,36 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
             if (blk.wgt_fifo.empty())
                 return tb.kernel_skip ? tb.kernel_skip : port_late ? DIMC_WHY_WAIT_OUTER_PORT : DIMC_WHY_WAIT_FILL_ACK;
             const Dimc_InnerBlock::FeedEntry &h = blk.wgt_fifo.front();
-            if (h.macro != m) return DIMC_WHY_WAIT_INNER_PORT;
+            if (h.macro != m) return DIMC_WHY_WAIT_WGT_FIFO;
             if (h.ready > now) return port_late ? DIMC_WHY_WAIT_OUTER_PORT : DIMC_WHY_WAIT_FILL_ACK;
             return DIMC_WHY_WAIT_COMPUTE;
+        }
+    }
+    // Kernel not started: its sections (fetched, or next in its program) are behind another
+    // macro's in the dual's weight FIFO, which pops in order.
+    if (this->cur_state == DIMC_STARTING && !blk.wgt_fifo.empty() && blk.wgt_fifo.front().macro != m) {
+        bool own = false;
+        for (const Dimc_InnerBlock::FeedEntry &q : blk.wgt_fifo) if (q.macro == m) { own = true; break; }
+        const Dimc_InnerBlock::Cursor &f = blk.fill;
+        if (!own && m < f.macro_beat_index.size() && f.macro_beat_index[m] < f.macro_beat_total[m])
+            own = this->dimc.beat_pos(this->dimc.job_geom[mac.fill_slot], f.macro_beat_index[m]).kind == DIMC_LOAD_KB;
+        if (own) return DIMC_WHY_WAIT_WGT_FIFO;
+    }
+    // Owes an input section (partial sums or feature): its first one in the input FIFO says
+    // why it is not in. In flight: the response is out. Behind another macro's section: the
+    // FIFO is in order. At the head: beat_writable refused it. Not fetched: this cycle's
+    // input-feed refusal, else the heuristic below.
+    if (this->cur_state == DIMC_STARTING) {
+        const Dimc_InnerBlock::Cursor &f = blk.fill;
+        if (m < f.macro_beat_index.size() && f.macro_beat_index[m] < f.macro_beat_total[m]
+            && this->dimc.beat_pos(this->dimc.job_geom[mac.fill_slot], f.macro_beat_index[m]).kind != DIMC_LOAD_KB) {
+            const std::deque<Dimc_InnerBlock::FeedEntry> &q = blk.inp_fifo[DIMC_INP_FIFO_SHARED ? 0 : m];
+            for (size_t i = 0; i < q.size(); i++) {
+                if (q[i].macro != m) continue;
+                if (q[i].ready > this->dimc.fsm_timestamp) return DIMC_WHY_WAIT_FILL_ACK;
+                return i ? DIMC_WHY_WAIT_INNER_PORT : DIMC_WHY_WAIT_COMPUTE;
+            }
+            if (tb.input_skip) return tb.input_skip;
         }
     }
     // Still owes fill sections. A heuristic: fill_feed picks a macro per feed, not by
