@@ -38,84 +38,35 @@
 // a port word leaves straight from the head entries. Not in the RTL, which has one push
 // through `sel` and one pop; same storage.
 #define DIMC_OUT_FIFO_DEPTH 64
-// 1: one out_fifo per dual shared by both macros, at most one push per cycle; a row is
-// triggered only if its result has a push slot and an entry (older job first, then the
-// lower macro index). 0: one out_fifo per macro of half the depth.
-#ifndef DIMC_OUT_FIFO_SHARED
-#define DIMC_OUT_FIFO_SHARED 0
-#endif
-// 1: a macro's next-job kernel is fetched into the dual's weight FIFO as soon as no macro
-// of the dual still owes kernel sections of its current program; the program then skips
-// the sections already fetched. 0: kernel sections only in program order.
-#ifndef DIMC_KB_PREFETCH
-#define DIMC_KB_PREFETCH 1
-#endif
-// A macro that holds a later job's operands issues that job's rows before the running
-// job closes (DIMC_JOB_LOOKAHEAD 1: only the next job). Their results wait in its
-// out_fifo until the write-back reaches that job; issue stops while the out_fifo has no
-// free entry, since a full out_fifo drops results.
-#ifndef DIMC_JOB_OVERLAP
-#define DIMC_JOB_OVERLAP 1
-#endif
-// With DIMC_JOB_OVERLAP and DIMC_JOB_LOOKAHEAD 1: a macro that has written back every
+// One out_fifo per macro of half that depth.
+// A macro's next-job kernel is fetched into the dual's weight FIFO as soon as no macro of
+// the dual still owes kernel sections of its current program; the program then skips the
+// sections already fetched. This holds for batched jobs too: the program fetches vector 0's
+// partial sums and feature first, the kernel is fetched ahead of them.
+// A macro that holds the next job's operands issues that job's rows before the running
+// job closes. Their results wait in its out_fifo until the write-back reaches that job;
+// issue stops while the out_fifo has no free entry, since a full out_fifo drops results.
+// A macro is at most one job ahead of the running one. A macro that has written back every
 // result of the running job writes its next job's results to that job's destination at
 // once (a second address generator per macro, the next job's context), instead of holding
-// them in its out_fifo until the running job closes. Above 1 the write-back always
-// follows each macro's jobs in order.
-#ifndef DIMC_NEXT_JOB_SINK
-#define DIMC_NEXT_JOB_SINK 1
-#endif
-// Jobs a macro may be ahead of the running job. 1: the running job and the next one
-// (DIMC_JOB_OVERLAP, DIMC_NEXT_JOB_SINK). Above 1, for jobs of one vector: each macro fills,
-// triggers and writes back up to this many jobs past the running one, and a job closes once
-// every macro has written it back. 7 = every context behind the running one. Logic only:
-// same contexts, address generators and FIFOs as 1.
-#ifndef DIMC_JOB_LOOKAHEAD
-#define DIMC_JOB_LOOKAHEAD 1
-#endif
-#if DIMC_OUT_FIFO_SHARED && DIMC_JOB_LOOKAHEAD <= 1
-#error "DIMC_OUT_FIFO_SHARED is modelled for the write-back of DIMC_JOB_LOOKAHEAD > 1 only"
-#endif
-
-// While the engine is idle and jobs are committed but held (commit-only), load the
-// kernel of the first held job into each macro. Kernels do not depend on the job's
-// inputs; features and partial sums are still fetched when the job starts.
-#ifndef DIMC_HELD_KB_PRELOAD
-#define DIMC_HELD_KB_PRELOAD 1
-#endif
-// With DIMC_HELD_KB_PRELOAD: 1: the held job's kernel of each dual's first macro is fetched
-// into the weight FIFO only; it is written into the macro, one section per cycle, once the
-// job runs. 0: every macro's held kernel is fetched and written into the macro.
-#ifndef DIMC_HELD_KB_TO_FIFO
-#define DIMC_HELD_KB_TO_FIFO 1
-#endif
-// 0: no section is written into a macro in a cycle in which it computes; each waits for
-// the cycle after the row trigger it depends on. 1: a feature section may enter in the
-// cycle of the previous vector's last row trigger, which the macro does not allow.
-#ifndef DIMC_FB_WRITE_ON_LAST_ROW
-#define DIMC_FB_WRITE_ON_LAST_ROW 0
-#endif
-// 1: a macro takes one kernel or feature section per cycle; a feature section goes first
-// and the kernel section waits for the next cycle. 0: one of each in the same cycle.
-// Partial sums go to the ADDIN sets outside the macro and are not counted.
-#ifndef DIMC_ONE_WRITE_PER_CYCLE
-#define DIMC_ONE_WRITE_PER_CYCLE 1
-#endif
+// them in its out_fifo until the running job closes.
+// While the engine is idle and jobs are committed but held (commit-only), the kernel of the
+// first held job is fetched into each dual's weight FIFO for its first macro; it is written
+// into the macro, one section per cycle, once the job runs. Kernels do not depend on the
+// job's inputs; features and partial sums are still fetched when the job starts.
+// Macro write rules: no section is written into a macro in a cycle in which it computes
+// (each waits for the cycle after the row trigger it depends on), and a macro takes one
+// kernel or feature section per cycle, the feature section first. Partial sums go to the
+// ADDIN sets outside the macro and are not counted.
 // The dual's weight and input FIFOs: 256 b sections, one kernel and two feature vectors
-// deep, written into a macro one section per cycle when its write port is open.
+// deep, written into a macro one section per cycle when its write port is open. One input
+// FIFO per dual shared by both macros, in fetch order, one pop per cycle; a head section its
+// macro cannot take yet holds the ones behind it.
 #define DIMC_WGT_FIFO_DEPTH 128
 #define DIMC_INP_FIFO_DEPTH 8
-// 1: one input FIFO per dual shared by both macros, in fetch order, one pop per cycle; a
-// head section its macro cannot take yet holds the ones behind it. 0: the same storage
-// split in one half per macro, each popped on its own.
 // N > 0: a dual whose weight FIFO holds at most N sections of the macro whose kernel is
 // being written books the outer port for its kernel feed before any dual's input feed; the
 // other duals, and every dual otherwise, book input then kernel. 0: always input then kernel.
-// 1: a macro's kernel is fetched ahead of its own fill program also for batched jobs (the
-// program fetches that run's partial sums and feature first), as for jobs of one vector.
-#ifndef DIMC_KB_AHEAD_BATCHED
-#define DIMC_KB_AHEAD_BATCHED 1
-#endif
 #ifndef DIMC_KB_FEED_FIRST
 #define DIMC_KB_FEED_FIRST 2
 #endif
@@ -123,9 +74,6 @@
 // a vector it may start within N rows (the macro waits, or is about to wait, for its inputs).
 #ifndef DIMC_KB_FEED_YIELD
 #define DIMC_KB_FEED_YIELD 6
-#endif
-#ifndef DIMC_INP_FIFO_SHARED
-#define DIMC_INP_FIFO_SHARED 1
 #endif
 // Shared input FIFO: rows a feature section may be fetched ahead of the triggers it waits for.
 #ifndef DIMC_INP_FETCH_LEAD
@@ -265,8 +213,7 @@ class Dimc_Macro {
         // Rows pushed into this macro's pipe. Per macro, not per block, so a
         // macro that finished filling does not wait for its sibling.
         uint32_t rows_issued = 0;
-        // Cycle of the last row trigger. No section is written into the macro in that
-        // cycle, except a feature section with DIMC_FB_WRITE_ON_LAST_ROW 1.
+        // Cycle of the last row trigger. No section is written into the macro in that cycle.
         int64_t  last_trigger_cycle = -1;
         // Cycle of the last kernel or feature section written into the macro.
         int64_t  last_write_cycle = -1;

@@ -191,21 +191,18 @@ class Dimc_InnerBlock {
         };
         std::deque<FeedEntry> wgt_fifo;
         bool kb_fed_first = false;   // DIMC_KB_FEED_FIRST: this cycle's kernel feed already ran
-        // Per macro, half the dual's storage; with DIMC_INP_FIFO_SHARED only inp_fifo[0] is
-        // used, as the dual's one input FIFO (inp_queue).
+        // The dual's one input FIFO: inp_fifo[0], both macros' sections in fetch order (inp_queue).
         std::vector<std::deque<FeedEntry>> inp_fifo;
         std::deque<FeedEntry> &inp_queue(uint32_t macro)
         {
-            return this->inp_fifo[DIMC_INP_FIFO_SHARED ? 0 : macro];
+            return this->inp_fifo[0];
         }
         // Per-macro out_fifo: results in push order. A port word leaves from the head
         // entries; out_results counts the running job's results that have left.
         struct OutEntry { int32_t psout; uint16_t row; uint16_t run; uint16_t macro; };
         std::vector<std::deque<OutEntry>> out_fifo;
-        // DIMC_OUT_FIFO_SHARED: the dual's one out_fifo, both macros' results in push order.
-        std::deque<OutEntry> out_shared;
         std::vector<uint32_t> out_results;
-        // DIMC_NEXT_JOB_SINK: the next job's results that already left, per macro, its
+        // The next job's results that already left, per macro, its
         // beats, and their acknowledgements; taken over when that job starts.
         std::vector<uint32_t> out_results_next;
         uint32_t store_next_beats = 0;
@@ -216,25 +213,6 @@ class Dimc_InnerBlock {
         std::deque<RunDone> run_pending;
         struct Retired { int64_t job = -1; uint32_t runs = 0; };
         std::vector<Retired> retired;    // per macro
-        // DIMC_JOB_LOOKAHEAD > 1. Per macro, in the order it triggers its jobs: the jobs
-        // with rows still in its pipe, and the jobs with results still to write back
-        // (out_results counts for the front one). pipe_done / stored: the last job whose
-        // rows have all left the pipe / whose results have all left the out_fifo.
-        struct JobLeft { uint32_t job, slot, left; };
-        std::vector<std::deque<JobLeft>> in_pipe;
-        std::vector<std::deque<JobLeft>> to_store;
-        std::vector<uint32_t> pipe_done, stored;
-        // Write-back beats not yet acknowledged, with their job.
-        struct StoreAck { uint64_t due; uint32_t job; };
-        std::deque<StoreAck> store_acks;
-        void reset_progress()
-        {
-            this->in_pipe.assign(this->macros.size(), {});
-            this->to_store.assign(this->macros.size(), {});
-            this->pipe_done.assign(this->macros.size(), 0xFFFFFFFFu);
-            this->stored.assign(this->macros.size(), 0xFFFFFFFFu);
-            this->store_acks.clear();
-        }
 
         uint32_t rows_issued;                    // compute: rows pushed into pipes
 
@@ -250,7 +228,7 @@ class Dimc_InnerBlock {
         // keep_fill leaves the fill cursor and the in-flight beats alone: the
         // fill runs ahead into the next job, so a job boundary must not reset it.
         // keep_wgt leaves the weight FIFO alone: it may hold a held job's kernel
-        // (DIMC_HELD_KB_TO_FIFO) that the macro takes once the job runs.
+        // that the macro takes once the job runs.
         void reset_job_state(bool keep_fill = false, bool keep_store = false, bool keep_wgt = false)
         {
             if (!keep_fill) {
@@ -261,7 +239,6 @@ class Dimc_InnerBlock {
                 while (!this->kb_pending.empty()) this->kb_pending.pop();
                 while (!this->in_pending.empty()) this->in_pending.pop();
             }
-            // The write-back follows each macro across job boundaries (DIMC_JOB_LOOKAHEAD > 1).
             if (!keep_store) {
                 while (!this->store_pending.empty()) this->store_pending.pop();
                 this->store.reset(this->macros.size());
@@ -376,12 +353,7 @@ class Dimc_HWPE : public vp::Component {
         // shape survives until the engine reaches it.
         struct JobGeom {
             uint32_t num_active, row_count, row_base, compute_cyc;
-            bool     skip_kb;
             uint32_t psin_dep;    // PSIN_DEP: jobs back to the partial sums' producer
-            uint32_t psin_chain;  // PSIN_CHAIN: producer is the same macro (0) or the run before (1)
-            // Slot addressing: ADDR_MODE and the per-macro / per-block strides of each operand.
-            uint32_t addr_mode;
-            uint32_t kb_ms, kb_bs, fb_ms, fb_bs, ps_ms, ps_bs, out_ms, out_bs;
             uint32_t psin_rows;
             uint32_t beats_per_macro, kb_beats_per_row;
             uint32_t fb_beats_per_macro, psin_beats_per_macro, out_beats;
@@ -454,8 +426,6 @@ class Dimc_HWPE : public vp::Component {
 
         // Common tail of a preload or store beat: charge the access latency,
         // advance the cursor, publish it.
-        void beat_issued(Dimc_InnerBlock &blk, Dimc_InnerBlock::Cursor &cursor,
-                         int lat);
 
         void preload_block(Dimc_InnerBlock &blk, uint32_t blk_id,
                            Dimc_InnerBlock::Cursor &cursor);
@@ -476,13 +446,6 @@ class Dimc_HWPE : public vp::Component {
         void compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id);
         void store_block(Dimc_InnerBlock &blk, uint32_t blk_id);
         void store_next_job(Dimc_InnerBlock &blk, uint32_t blk_id);
-        // DIMC_JOB_LOOKAHEAD > 1
-        int      slot_of_job(uint32_t job) const;
-        void     advance_fill_ahead();
-        void     store_block_ahead(Dimc_InnerBlock &blk, uint32_t blk_id);
-        void     retire_store_acks(Dimc_InnerBlock &blk);
-        bool     rows_done_ahead(const Dimc_InnerBlock &blk) const;
-        bool     store_done_ahead() const;
         // Move every row a macro has finished into that macro's out_fifo.
         // compute_indep needs this both at the top of a cycle and once more
         // when the last row retires, so it lives in one place.
@@ -519,7 +482,7 @@ class Dimc_HWPE : public vp::Component {
         vp::ClockEvent *fsm_start_event;
         vp::ClockEvent *fsm_event;
         vp::ClockEvent *fsm_end_event;
-        vp::ClockEvent *held_event;   // DIMC_HELD_KB_PRELOAD: one cycle of the idle preload
+        vp::ClockEvent *held_event;   // one cycle of the idle kernel preload
 };
 
 #endif

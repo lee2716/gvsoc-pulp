@@ -54,7 +54,6 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
         blk.out_fifo.resize(this->num_macros);
         blk.out_results.assign(this->num_macros, 0);
         blk.out_results_next.assign(this->num_macros, 0);
-        blk.reset_progress();
         for (uint32_t m = 0; m < this->num_macros; m++) {
             blk.weight_stream.emplace_back(this, false);
             blk.input_stream .emplace_back(this, false);
@@ -194,8 +193,6 @@ void Dimc_HWPE::reset(bool active)
             }
         for (Dimc_InnerBlock &blk : this->inner_blocks) {
             for (auto &q : blk.out_fifo) q.clear();
-            blk.out_shared.clear();
-            blk.reset_progress();
             for (uint32_t &n : blk.out_results) n = 0;
             for (uint32_t &n : blk.out_results_next) n = 0;
             blk.store_next_beats = 0;
@@ -312,7 +309,7 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
 
                 // Modes 0 and 2 release the queue; mode 1 only commits.
                 if (mode != 0x1) _this->start_next_job();
-                else if (DIMC_HELD_KB_PRELOAD && !_this->job_running
+                else if (!_this->job_running
                          && !_this->held_event->is_enqueued())
                     _this->event_enqueue(_this->held_event, 1);
                 break;

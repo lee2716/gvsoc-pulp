@@ -266,7 +266,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
     // is in order. Landed: beat_writable refused it. Empty: this cycle's kernel-feed refusal.
     if (mac.write_job != Dimc_Macro::JOB_NONE && !mac.stamped) {
         const Dimc_HWPE::JobGeom &wg = this->dimc.job_geom[mac.write_slot];
-        const uint32_t kb_all = wg.skip_kb ? 0 : wg.row_count * wg.kb_beats_per_row;
+        const uint32_t kb_all = wg.row_count * wg.kb_beats_per_row;
         if (mac.kw > 0 && mac.kw < kb_all) {
             const uint64_t now = this->dimc.fsm_timestamp;
             const bool port_late = tb.kernel_port_refused != ~0ull && now - tb.kernel_port_refused <= 3;
@@ -296,7 +296,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
         const Dimc_InnerBlock::Cursor &f = blk.fill;
         if (m < f.macro_beat_index.size() && f.macro_beat_index[m] < f.macro_beat_total[m]
             && this->dimc.beat_pos(this->dimc.job_geom[mac.fill_slot], f.macro_beat_index[m]).kind != DIMC_LOAD_KB) {
-            const std::deque<Dimc_InnerBlock::FeedEntry> &q = blk.inp_fifo[DIMC_INP_FIFO_SHARED ? 0 : m];
+            const std::deque<Dimc_InnerBlock::FeedEntry> &q = blk.inp_fifo[0];
             for (size_t i = 0; i < q.size(); i++) {
                 if (q[i].macro != m) continue;
                 if (q[i].ready > this->dimc.fsm_timestamp) return DIMC_WHY_WAIT_FILL_ACK;
@@ -359,11 +359,11 @@ void Dimc_Tracer::job_closed(uint64_t now_cycle)
         for (uint32_t m = 0; m < num_active; m++) {
             const Macro &mac = tb.macros[m];
             this->text->msg(vp::TraceLevel::WARNING,
-                "macro[%u]: fill=[%u..%u] comp=[%u..%u] beats=%u skip_kb=%d "
+                "macro[%u]: fill=[%u..%u] comp=[%u..%u] beats=%u "
                 "load_done=%u compute=%u OUT=%u finish=%lu\n",
                 b * num_active + m,
                 mac.fill_start, mac.fill_done, mac.compute_start, mac.compute_end,
-                blk.fill.macro_beat_total[m], (int)g.skip_kb,
+                blk.fill.macro_beat_total[m],
                 mac.load_done, g.compute_cyc, tb.out_beat_lat_est, finish);
         }
         if (blk.out_accum.enable) {
@@ -385,10 +385,10 @@ void Dimc_Tracer::job_closed(uint64_t now_cycle)
     this->jobs_measured++;
     this->text->msg(vp::TraceLevel::WARNING,
         "DIMC double-buffer: num_active=%u row_count=%u l1bw=%u "
-        "reuse=%u | %lu ---> %lu cyc | period = %lu cyc | ideal = %lu | "
+        "nb_vec=%u | %lu ---> %lu cyc | period = %lu cyc | ideal = %lu | "
         "uti = %.3f | totals: jobs=%u busy=%lu gap=%lu uti=%.3f\n",
         num_active, g.row_count, this->dimc.inner_port_bytes,
-        (unsigned)g.skip_kb,
+        (unsigned)g.nb_vec,
         (unsigned long)this->job_entry_cycle, (unsigned long)now_cycle,
         (unsigned long)job_busy, (unsigned long)ideal,
         job_busy ? (1.0 * ideal) / (1.0 * job_busy) : 0.0,
