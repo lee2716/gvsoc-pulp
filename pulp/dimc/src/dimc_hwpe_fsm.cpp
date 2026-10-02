@@ -422,6 +422,7 @@ void Dimc_HWPE::handover_step()
         this->block_cycle(blk, b);
     }
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) this->tracer.end_cycle(b);
+    this->tracer.port_cycle();
     this->fsm_timestamp++;
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
         this->retire_block(blk);
@@ -749,6 +750,7 @@ bool Dimc_HWPE::preload_iter(int *latency)
             }
             this->kernel_prefetch(blk, b);
         }
+    this->tracer.port_cycle();
     this->fsm_timestamp++;
 
     this->advance_fill();
@@ -1220,7 +1222,7 @@ bool Dimc_HWPE::kernel_prefetch(Dimc_InnerBlock &blk, uint32_t blk_id)
     blk.wgt_fifo.push_back(e);
     fm.kfetched++;
     this->outer_port_in.request((int64_t)this->fsm_timestamp, e.bytes);
-    this->tracer.outer_port_booked(blk_id, false);
+    this->tracer.outer_port_booked(blk_id, DIMC_LOAD_KB);
     blk.kb_pending.push(this->fsm_timestamp + (uint64_t)lat);
     blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
     return true;
@@ -1257,6 +1259,7 @@ void Dimc_HWPE::held_handler(vp::Block *__this, vp::ClockEvent *event)
         }
     }
     for (uint32_t b = 0; b < _this->inner_blocks.size(); b++) _this->tracer.end_cycle(b);
+    _this->tracer.port_cycle();
     // A call with nothing to do (the one after the last write) only records the idle
     // cycle, so the trace does not keep the last load until the job starts.
     if (!more && !did) return;
@@ -1306,6 +1309,7 @@ bool Dimc_HWPE::held_kernel_step(Dimc_InnerBlock &blk, uint32_t blk_id, int ctx)
     blk.wgt_fifo.push_back(e);
     fm.kfetched++;
     this->outer_port_in.request((int64_t)this->fsm_timestamp, e.bytes);
+    this->tracer.outer_port_booked(blk_id, DIMC_LOAD_KB);
     blk.kb_pending.push(this->fsm_timestamp + (uint64_t)lat);
     blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
     return true;
@@ -1363,7 +1367,7 @@ void Dimc_HWPE::fill_beat(Dimc_InnerBlock &blk, uint32_t blk_id,
 
     cursor.macro_beat_index[macro]++;
     this->outer_port_in.request((int64_t)this->fsm_timestamp, e.bytes);
-    this->tracer.outer_port_booked(blk_id, false);
+    this->tracer.outer_port_booked(blk_id, kind);
     feed_pending.push(this->fsm_timestamp + (uint64_t)lat);
     this->beat_issued(blk, cursor, lat);
 }
@@ -1618,6 +1622,7 @@ bool Dimc_HWPE::store_iter(int *latency)
         else if (!blk.phase_done)   this->store_block(blk, b);
     }
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) this->tracer.end_cycle(b);
+    this->tracer.port_cycle();
 
     this->fsm_timestamp++;
     this->advance_fill();
@@ -1712,7 +1717,7 @@ void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
         blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
         blk.store_pending.push(this->fsm_timestamp + (uint64_t)lat);
         this->outer_port_out.request((int64_t)this->fsm_timestamp, w);
-        this->tracer.outer_port_booked(blk_id, true);
+        this->tracer.outer_port_booked(blk_id, DIMC_PORT_WB);
         if (r + n == rows)
             blk.run_pending.push_back({this->fsm_timestamp + (uint64_t)lat, this->running_job, m, vec});
         fifo.erase(fifo.begin(), fifo.begin() + n);
@@ -1769,7 +1774,7 @@ void Dimc_HWPE::store_next_job(Dimc_InnerBlock &blk, uint32_t blk_id)
         blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
         blk.store_next_pending.push(this->fsm_timestamp + (uint64_t)lat);
         this->outer_port_out.request((int64_t)this->fsm_timestamp, w);
-        this->tracer.outer_port_booked(blk_id, true);
+        this->tracer.outer_port_booked(blk_id, DIMC_PORT_WB);
         if (r + n == rows)
             blk.run_pending.push_back({this->fsm_timestamp + (uint64_t)lat, next, m, vec});
         fifo.erase(fifo.begin(), fifo.begin() + n);
@@ -1904,7 +1909,7 @@ void Dimc_HWPE::store_block_ahead(Dimc_InnerBlock &blk, uint32_t blk_id)
     blk.port_pending.push(this->fsm_timestamp + (uint64_t)lat);
     blk.store_acks.push_back({this->fsm_timestamp + (uint64_t)lat, f.job});
     this->outer_port_out.request((int64_t)this->fsm_timestamp, w);
-    this->tracer.outer_port_booked(blk_id, true);
+    this->tracer.outer_port_booked(blk_id, DIMC_PORT_WB);
     if (r + n == rows)
         blk.run_pending.push_back({this->fsm_timestamp + (uint64_t)lat, f.job, pick, vec});
     fifo.erase(fifo.begin(), fifo.begin() + n);

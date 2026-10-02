@@ -37,6 +37,7 @@ void Dimc_Tracer::build(vp::Component &owner, vp::Trace &text,
     owner.traces.new_trace_event("busy", &this->busy_event, 1);
     owner.traces.new_trace_event("job_id", &this->job_event, 32);
     owner.traces.new_trace_event("outer_port/next_free", &this->next_free_event, 32);
+    owner.traces.new_trace_event("outer_port/use", &this->port_use_event, 8);
     for (uint32_t b = 0; b < nb_blocks; b++) {
         Block &blk = this->blocks[b];
         std::string pfx = "block_" + std::to_string(b) + "/";
@@ -184,8 +185,11 @@ void Dimc_Tracer::store_skip(uint32_t b, uint8_t why)
     this->blocks[b].store_skip = why;
 }
 
-void Dimc_Tracer::outer_port_booked(uint32_t who, bool is_store)
+void Dimc_Tracer::outer_port_booked(uint32_t who, uint8_t kind)
 {
+    const bool is_store = kind == DIMC_PORT_WB;
+    const uint32_t shift = is_store ? 6u : kind == DIMC_LOAD_FB ? 2u : kind == DIMC_LOAD_PSIN ? 4u : 0u;
+    this->port_use = (uint8_t)(this->port_use + (1u << shift));
     // Stores are offset by 16 so one track shows both: 0,1 = block 0,1 filling;
     // 16,17 = block 0,1 writing back.
     this->outer_grant = (uint8_t)(who + (is_store ? 16u : 0u));
@@ -229,6 +233,12 @@ void Dimc_Tracer::end_cycle(uint32_t b)
         this->outer_grant_event.event(&this->outer_grant);
         this->outer_grant = DIMC_GRANT_NONE;
     }
+}
+
+void Dimc_Tracer::port_cycle()
+{
+    this->port_use_event.event(&this->port_use);
+    this->port_use = 0;
 }
 
 uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const

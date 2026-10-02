@@ -62,6 +62,9 @@ enum dimc_load_kind_t : uint8_t {
     DIMC_LOAD_KB_FB   = 4,
     DIMC_LOAD_KB_PSIN = 5
 };
+// outer_port/use: a write-back beat, and the packing of one cycle's beats. Two bits per kind
+// (0..2 beats of 32 B): kernel in bits 1:0, feature 3:2, partial sums 5:4, write-back 7:6.
+#define DIMC_PORT_WB 6
 
 // Why the engine has no job, traced as idle_why.
 enum dimc_idle_why_t : uint8_t {
@@ -106,11 +109,14 @@ class Dimc_Tracer {
                         uint32_t row_count);
         void store_beat(uint32_t blk, uint32_t macro, int lat, uint32_t out_beats);
         void store_skip(uint32_t blk, uint8_t why);
-        // `who` is the inner block that got the outer port this cycle; `is_store` marks a
-        // write-back beat rather than a fill beat.
-        void outer_port_booked(uint32_t who, bool is_store);
+        // `who` is the inner block that got the outer port this cycle; `kind` is what the
+        // beat carries: DIMC_LOAD_KB / _FB / _PSIN for a fetch, DIMC_PORT_WB for a write-back.
+        void outer_port_booked(uint32_t who, uint8_t kind);
         // Publish one block's levels and wait causes for this cycle, then clear.
         void end_cycle(uint32_t blk);
+        // Publish what the outer port carried this cycle, then clear: after the cycle's
+        // last booking, the next jobs' kernel prefetch included.
+        void port_cycle();
         void job_closed(uint64_t now_cycle);      // the per-job report
         void job_end();                           // busy falls
 
@@ -158,6 +164,8 @@ class Dimc_Tracer {
         vp::Trace outer_grant_event; // which inner block booked the outer port this cycle, 255 = none
         uint8_t   outer_grant = DIMC_GRANT_NONE;
         vp::Trace next_free_event;   // outer port: first free cycle after a booking
+        vp::Trace port_use_event;    // what the outer port carried this cycle (DIMC_PORT_WB)
+        uint8_t   port_use = 0;
 
         // ---- accounting ----
         // fsm_timestamp counts engine cycles and cannot see the gaps between
