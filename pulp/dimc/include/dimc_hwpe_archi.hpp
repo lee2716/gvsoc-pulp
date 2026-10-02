@@ -73,7 +73,7 @@
  * changes. A queue slot is not addressable: ACQUIRE returns a job id, never a
  * slot index (hwpe_ctrl_target.sv).
  */
-#define DIMC_NB_CONTEXT              8
+#define DIMC_NB_CONTEXT              2
 #define DIMC_HWPE_JOB_BASE           (DIMC_HWPE_BASE + 0x40)
 #define DIMC_HWPE_NB_JOB_REGS        35   /* 0x40 .. 0xC8 inclusive; 0x8C/0x90 are
                                           * intercepted as ACC_VAL and leave holes */

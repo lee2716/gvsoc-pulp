@@ -58,7 +58,8 @@ enum dimc_load_kind_t : uint8_t {
     DIMC_LOAD_KB   = 1,               // weights
     DIMC_LOAD_FB   = 2,               // inputs
     DIMC_LOAD_PSIN = 3,
-    // The weight FIFO and the input FIFO each wrote a section into the macro that cycle.
+    // A kernel section went into the macro that cycle together with a feature section
+    // (DIMC_ONE_WRITE_PER_CYCLE 0 only) or with partial sums into its ADDIN sets.
     DIMC_LOAD_KB_FB   = 4,
     DIMC_LOAD_KB_PSIN = 5
 };

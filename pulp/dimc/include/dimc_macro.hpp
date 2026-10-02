@@ -71,7 +71,7 @@
 // every macro has written it back. 7 = every context behind the running one. Logic only:
 // same contexts, address generators and FIFOs as 1.
 #ifndef DIMC_JOB_LOOKAHEAD
-#define DIMC_JOB_LOOKAHEAD 7
+#define DIMC_JOB_LOOKAHEAD 1
 #endif
 #if DIMC_OUT_FIFO_SHARED && DIMC_JOB_LOOKAHEAD <= 1
 #error "DIMC_OUT_FIFO_SHARED is modelled for the write-back of DIMC_JOB_LOOKAHEAD > 1 only"
