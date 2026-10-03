@@ -40,21 +40,18 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     // Streamers: the input ones follow the fill (plan_macro_fill), the output ones the
     // sink (configure_out_stream at each run's first result).
 
-    // Latch the per-job compute configuration once at commit, then broadcast it
-    // to every macro (ci, sign_8b, compute_mask, sel_dimc).
+    // Broadcast the job-independent compute configuration to every macro (compe,
+    // sel_dimc). ci, sign_8b and compute_mask follow the job (write_feed).
     uint8_t  compe     = (uint8_t) (_this->register_file[DIMC_HWPE_COMPE        >> 2] & 0x1);
-    uint8_t  ci        = (uint8_t) (_this->register_file[DIMC_HWPE_CFG_CI       >> 2] & 0x3);
-    uint8_t  sign_8b   = (uint8_t) (_this->register_file[DIMC_HWPE_SIGN_8B      >> 2] & 0x3);
-    uint16_t cmask     = (uint16_t)(_this->register_file[DIMC_HWPE_COMPUTE_MASK >> 2] & 0x3FF);
     _this->sel_dimc   = (uint8_t)(_this->register_file[DIMC_HWPE_SEL_DIMC  >> 2] & 0xFF);
     for (Dimc_InnerBlock &blk : _this->inner_blocks)
     for (auto &m : blk.macros) {
         // `compe` (memory-vs-compute mode) is latched but never read: compute_PP
         // always performs the dot product, and COMPE=0 memory mode is not
         // implemented.
-        // psin_rows is per job and latched with the macro's fill (preload_block),
-        // since a macro may compute the next job before that job starts here.
-        m.compe = compe; m.ci = ci; m.sign_8b = sign_8b; m.compute_mask = cmask;
+        // psin_rows, ci, sign_8b and compute_mask are per job and latched with the macro's
+        // fill (write_feed), since a macro may compute the next job before that job starts here.
+        m.compe = compe;
     }
     // `sel_dimc` is stored but never consulted: macro selection goes through
     // NUM_MACROS (num_active). It exists for register-map fidelity.
@@ -1321,6 +1318,9 @@ void Dimc_HWPE::write_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
         mc.job_rows     = g.row_count;
         mc.job_row_base = g.row_base;
         mc.psin_rows    = (uint8_t)g.psin_rows;
+        mc.ci           = this->ctx_ci[mc.write_slot];
+        mc.sign_8b      = this->ctx_sign_8b[mc.write_slot];
+        mc.compute_mask = this->ctx_compute_mask[mc.write_slot];
     }
     this->tracer.fill_beat(blk_id, macro, within, macro_filled, feature_done, 1);
 }

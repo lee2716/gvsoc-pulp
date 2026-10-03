@@ -332,6 +332,12 @@ class Dimc_HWPE : public vp::Component {
         uint32_t ctx_regs[DIMC_NB_CONTEXT][DIMC_HWPE_NB_JOB_REGS];
         bool     ctx_busy[DIMC_NB_CONTEXT];    // acquired or committed, not yet retired
         uint32_t ctx_job_id[DIMC_NB_CONTEXT];  // job id stamped at commit
+        // CFG_CI, SIGN_8B and COMPUTE_MASK as they stood at commit. A macro takes them with
+        // the job's operands, since it may trigger that job's rows while an earlier job
+        // still runs.
+        uint8_t  ctx_ci[DIMC_NB_CONTEXT];
+        uint8_t  ctx_sign_8b[DIMC_NB_CONTEXT];
+        uint16_t ctx_compute_mask[DIMC_NB_CONTEXT];
         int      acquired_ctx;                 // context SW is currently filling (-1 none)
         int      running_ctx;                  // context the engine executes (-1 none)
         // Committed-but-not-yet-running contexts, in commit order. A FIFO and

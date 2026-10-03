@@ -301,6 +301,12 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                     // bundle, so a committed job carries a complete descriptor.
                     std::memcpy(_this->ctx_regs[ctx], _this->live_regs,
                                 sizeof(_this->live_regs));
+                    _this->ctx_ci[ctx] =
+                        (uint8_t)(_this->register_file[DIMC_HWPE_CFG_CI >> 2] & 0x3);
+                    _this->ctx_sign_8b[ctx] =
+                        (uint8_t)(_this->register_file[DIMC_HWPE_SIGN_8B >> 2] & 0x3);
+                    _this->ctx_compute_mask[ctx] =
+                        (uint16_t)(_this->register_file[DIMC_HWPE_COMPUTE_MASK >> 2] & 0x3FF);
                     _this->acquired_ctx  = -1;               // SW must ACQUIRE again
                     // Queue it. A job already waiting keeps its place: the queue is
                     // FIFO over the contexts; the head is what runs next.

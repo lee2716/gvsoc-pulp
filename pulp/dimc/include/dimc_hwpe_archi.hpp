@@ -40,8 +40,10 @@
 #define DIMC_HWPE_CHK_STATE          (DIMC_HWPE_BASE + 0x18)  /* reserved + boundary */
 
 /* ============ Generic / job-INDEPENDENT registers @ 0x20 ============
- * Compute configuration shared by every queued job. Latched at commit and
- * broadcast to all macros; NOT part of a per-job context.
+ * Compute configuration, not part of the per-job register bundle. CFG_CI,
+ * SIGN_8B and COMPUTE_MASK are snapshotted at commit and travel with the job, so
+ * consecutive jobs may differ in them; the others are read when a job starts and
+ * apply to every macro.
  */
 #define DIMC_HWPE_CFG_CI             (DIMC_HWPE_BASE + 0x20)  /* INT1/2/4/8      */
 #define DIMC_HWPE_SIGN_8B            (DIMC_HWPE_BASE + 0x24)  /* INT8 sign combo */
