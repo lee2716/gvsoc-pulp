@@ -284,7 +284,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
     if (this->cur_state == DIMC_STARTING && !blk.wgt_fifo.empty() && blk.wgt_fifo.front().macro != m) {
         bool own = false;
         for (const Dimc_InnerBlock::FeedEntry &q : blk.wgt_fifo) if (q.macro == m) { own = true; break; }
-        const Dimc_InnerBlock::Cursor &f = blk.fill;
+        const Dimc_InnerBlock::FillCursor &f = blk.fill;
         if (!own && m < f.macro_beat_index.size() && f.macro_beat_index[m] < f.macro_beat_total[m])
             own = this->dimc.beat_pos(this->dimc.job_geom[mac.fill_slot], f.macro_beat_index[m]).kind == DIMC_LOAD_KB;
         if (own) return DIMC_WHY_WAIT_WGT_FIFO;
@@ -294,7 +294,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
     // FIFO is in order. At the head: beat_writable refused it. Not fetched: this cycle's
     // input-feed refusal, else the heuristic below.
     if (this->cur_state == DIMC_STARTING) {
-        const Dimc_InnerBlock::Cursor &f = blk.fill;
+        const Dimc_InnerBlock::FillCursor &f = blk.fill;
         if (m < f.macro_beat_index.size() && f.macro_beat_index[m] < f.macro_beat_total[m]
             && this->dimc.beat_pos(this->dimc.job_geom[mac.fill_slot], f.macro_beat_index[m]).kind != DIMC_LOAD_KB) {
             const std::deque<Dimc_InnerBlock::FeedEntry> &q = blk.inp_fifo;
@@ -309,7 +309,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
     // Still owes fill sections. A heuristic: fill_feed picks a macro per feed, not by
     // index, but a lower macro still owing is reported as holding the port.
     if (this->cur_state == DIMC_STARTING) {
-        const Dimc_InnerBlock::Cursor &f = blk.fill;
+        const Dimc_InnerBlock::FillCursor &f = blk.fill;
         if (f.macro_beat_index[m] < f.macro_beat_total[m]) {
             // A lower macro that still owes sections, or was written one this cycle.
             for (uint32_t k = 0; k < m; k++)
@@ -323,19 +323,20 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
                                                                    : DIMC_WHY_UNKNOWN;
     }
 
-    // Write-back, read as if the block stored its macros in index order (m * out_beats).
+    // Write-back: each cycle the lowest-index macro holding its next whole word goes
+    // (store_block); out_results counts this macro's results of the running job that have left.
     // Retired rows are checked before the port refusal.
-    const uint32_t first = m * g.out_beats, last = first + g.out_beats;
-    const uint32_t cur   = blk.store.beat_index;
-    if (cur < first)
-        return mac.pipe.empty() ? DIMC_WHY_WAIT_STORE_ORDER : DIMC_WHY_PIPE_DRAIN;
-    if (cur < last) {
-        const uint32_t per = this->dimc.inner_port_bytes / DIMC_OUT_SLOT_BYTES;
-        uint32_t need = (cur - first + 1) * per;   // rows retired through this beat, cumulative
-        if (need > g.row_count) need = g.row_count;
+    const uint32_t total = g.row_count * g.nb_vec;
+    const uint32_t k     = blk.out_results[m];
+    if (k < total) {
+        const uint32_t per  = this->dimc.inner_port_bytes / DIMC_OUT_SLOT_BYTES;
+        const uint32_t left = g.row_count - k % g.row_count;
+        const uint32_t need = k + (left < per ? left : per);   // results through its next word
         const uint32_t s = this->dimc.running_job & 1;
         if (mac.set_job[s] != this->dimc.running_job || mac.rows_retired_set[s] < need)
             return DIMC_WHY_PIPE_DRAIN;
+        for (uint32_t j = 0; j < m; j++)
+            if (tb.macros[j].wrote_back) return DIMC_WHY_WAIT_STORE_ORDER;
         return tb.store_skip ? tb.store_skip : DIMC_WHY_UNKNOWN;
     }
 
@@ -406,6 +407,13 @@ void Dimc_Tracer::job_closed(uint64_t now_cycle)
 
 void Dimc_Tracer::job_end()
 {
+    this->idle();
+    this->text->msg(vp::TraceLevel::WARNING,
+        "DIMC job done, STATUS=1, finished_jobs=%u\n", this->dimc.finished_jobs);
+}
+
+void Dimc_Tracer::idle()
+{
     uint8_t zero = 0, st = DIMC_IDLE, why = DIMC_IDLE_WHY_WAIT_COMMIT;
     this->cur_state = DIMC_IDLE;
     this->busy_event.event(&zero);
@@ -426,6 +434,4 @@ void Dimc_Tracer::job_end()
             mac.load_kind_event.event(&zero);
         }
     }
-    this->text->msg(vp::TraceLevel::WARNING,
-        "DIMC job done, STATUS=1, finished_jobs=%u\n", this->dimc.finished_jobs);
 }

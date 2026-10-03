@@ -30,7 +30,6 @@ void Dimc_Macro::reset()
     for (int c = 0; c < DIMC_MACRO_FB_EW; c++)
         this->FB[c] = 0;
 
-    this->compe     = DIMC_COMPE_COMPUTE;
     this->ci        = DIMC_CI_8BIT;
     this->sign_8b   = DIMC_SIGN_UU;
     this->compute_mask = 0;

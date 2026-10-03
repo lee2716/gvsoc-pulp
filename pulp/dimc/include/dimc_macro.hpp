@@ -129,7 +129,6 @@ class Dimc_Macro {
         DimcPipeEntry drain();
 
         // Runtime configuration
-        uint8_t  compe        = DIMC_COMPE_COMPUTE;  // never read: compute_PP always computes
         uint8_t  ci           = DIMC_CI_8BIT;
         uint8_t  sign_8b      = DIMC_SIGN_UU;
         uint16_t compute_mask = 0;   // bits masked off the 1024-bit row
@@ -137,7 +136,8 @@ class Dimc_Macro {
         // psin_scalar is the per-job constant compute_PP adds while psin_rows is 0.
         int32_t  psin_scalar = 0;
         uint8_t  psin_rows   = 0;                        // 1 = take the row's psin from psin_buf_set
-        // Two partial-sum sets, alternating per run: set (job * NB_VEC + run) & 1.
+        // Two partial-sum sets, alternating per run across jobs: set (run_base + run) & 1, run_base
+        // counting the runs of every job committed before.
         // They stand for what arrives on ADDIN from outside the macro, so the next
         // run's can be queued while this run's rows still use theirs; psin_sel picks
         // the set of the row being issued.
@@ -162,6 +162,7 @@ class Dimc_Macro {
         // macro can issue it before the engine has made it the running job.
         uint32_t job_rows = 0, job_row_base = 0;
         uint32_t job_nb_vec = 1;     // vectors (runs) of the job in filled_job
+        uint32_t job_run_base = 0;   // runs of the jobs committed before filled_job
         // Runs of issue_job whose rows are all triggered; rows_issued counts inside the
         // current run.
         uint32_t runs_issued = 0;
@@ -179,8 +180,7 @@ class Dimc_Macro {
         // dual's FIFOs into this macro, and its context.
         uint32_t write_job = JOB_NONE;
         uint32_t write_slot = 0;
-        // Context of filled_job; stored, never read. written: sections written for write_job.
-        uint32_t filled_slot = 0;
+        // Sections written for write_job.
         uint32_t written = 0;
         // Kernel being fetched into the weight FIFO, by the program or ahead of it: job kpf_job,
         // kfetched sections so far. For write_job: kw kernel sections written, f0 = vector 0's

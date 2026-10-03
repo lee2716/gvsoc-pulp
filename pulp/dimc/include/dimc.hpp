@@ -149,12 +149,9 @@ class Dimc_InnerBlock {
         std::vector<Dimc_HWPE_Streamer> psin_stream;   // per-row psums, when PSIN_EN
         std::vector<Dimc_Macro> macros;
 
-        // Fill and store run concurrently, each with its own cursor. The store counts the
-        // block's port words in beat_index/beat_total; the fill keeps each macro's position in
-        // its own program in macro_beat_index/macro_beat_total.
-        struct Cursor {
-            uint32_t beat_index = 0;
-            uint32_t beat_total = 0;
+        // Fill and store run concurrently, each with its own cursor. The fill keeps each
+        // macro's position in its own program; the store counts the block's port words.
+        struct FillCursor {
             std::vector<uint32_t> macro_beat_index;
             std::vector<uint32_t> macro_beat_total;
             // Some macro's program still owes sections.
@@ -166,14 +163,21 @@ class Dimc_InnerBlock {
             }
             void reset(uint32_t nb_macros)
             {
-                this->beat_index = 0;
-                this->beat_total = 0;
                 this->macro_beat_index.assign(nb_macros, 0);
                 this->macro_beat_total.assign(nb_macros, 0);
             }
         };
-        Cursor fill;        // each macro's fill program, possibly for a later job
-        Cursor store;       // the running job's results
+        struct StoreCursor {
+            uint32_t beat_index = 0;
+            uint32_t beat_total = 0;
+            void reset()
+            {
+                this->beat_index = 0;
+                this->beat_total = 0;
+            }
+        };
+        FillCursor  fill;   // each macro's fill program, possibly for a later job
+        StoreCursor store;  // the running job's results
 
         // Every outstanding L1 request of the block, fill and store; only the tracer reads it.
         std::queue<uint64_t> port_pending;
@@ -196,8 +200,7 @@ class Dimc_InnerBlock {
         std::deque<FeedEntry> inp_fifo;
         // Per-macro out_fifo: results in push order. A port word leaves from the head
         // entries; out_results counts the running job's results that have left.
-        // OutEntry::macro is always 0, never read.
-        struct OutEntry { int32_t psout; uint16_t row; uint16_t run; uint16_t macro; };
+        struct OutEntry { int32_t psout; uint16_t row; uint16_t run; };
         std::vector<std::deque<OutEntry>> out_fifo;
         std::vector<uint32_t> out_results;
         // Write-back position per macro: a macro's runs leave in vector order, and a run
@@ -227,7 +230,7 @@ class Dimc_InnerBlock {
                 while (!this->in_pending.empty()) this->in_pending.pop();
             }
             while (!this->store_pending.empty()) this->store_pending.pop();
-            this->store.reset(this->macros.size());
+            this->store.reset();
             for (uint32_t &n : this->out_results) n = 0;
             this->phase_done = false;
         }
@@ -295,6 +298,10 @@ class Dimc_HWPE : public vp::Component {
         uint32_t ctx_regs[DIMC_NB_CONTEXT][DIMC_HWPE_NB_JOB_REGS];
         bool     ctx_busy[DIMC_NB_CONTEXT];    // acquired or committed, not yet retired
         uint32_t ctx_job_id[DIMC_NB_CONTEXT];  // job id stamped at commit
+        // Runs (vectors) of every job committed before the context's job, stamped at commit;
+        // next_run_base advances by each committed job's NB_VEC (0 counts as 1).
+        uint32_t ctx_run_base[DIMC_NB_CONTEXT];
+        uint32_t next_run_base;
         // CFG_CI, SIGN_8B and COMPUTE_MASK as they stood at commit. A macro takes them with
         // the job's operands, since it may trigger that job's rows while an earlier job
         // still runs.
@@ -309,6 +316,8 @@ class Dimc_HWPE : public vp::Component {
         int      ctx_alloc();                  // reserve a free context, -1 if none
         uint32_t job_reg(uint32_t addr) const; // read a job-dep reg of the RUNNING ctx
         void     start_next_job();             // launch the pending context, if any
+        // The engine as a reset leaves it (reset, and soft_clear scopes 0 and 1).
+        void     clear_engine();
 
         // One cycle of fill, compute and write-back on every block; `phase` is the FSM
         // state it runs for (DIMC_IDLE: the job-end cycle).
@@ -330,6 +339,8 @@ class Dimc_HWPE : public vp::Component {
             uint32_t fb_beats_per_macro, psin_beats_per_macro, out_beats;
             // Batched descriptor: vectors per job and their strides (1 / 0 = one vector).
             uint32_t nb_vec, fb_vec_stride, ps_vec_stride, out_vec_stride;
+            // Runs of the jobs committed before this one: run r uses ADDIN set (run_base + r) & 1.
+            uint32_t run_base;
             uint32_t kb_sections() const { return row_count * kb_beats_per_row; }
         };
         // The job id whose geometry job_geom[ctx] holds, so a job is latched once

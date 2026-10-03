@@ -75,6 +75,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     // Initial state of the controller FSM + standard HWPE offload bookkeeping
     this->running_job   = 0;
     this->next_job_id   = 0;
+    this->next_run_base = 0;
     this->finished_jobs = 0;
     this->job_running   = false;
     this->acquired_ctx  = -1;
@@ -84,6 +85,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
         this->ctx_busy[ctx]   = false;
         this->ctx_job_id[ctx] = 0;
+        this->ctx_run_base[ctx] = 0;
         this->geom_job[ctx]   = Dimc_Macro::JOB_NONE;
         for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
     }
@@ -125,68 +127,75 @@ void Dimc_HWPE::reset(bool active)
                     this->outer_port_bytes, this->nb_inner_blocks);
             this->trace.fatal("DIMC systree incomplete\n");
         }
-        this->outer_port_in.reset();
-    this->outer_port_out.reset();
+        this->clear_engine();
         for (uint32_t i = 0; i < N_CFG_REGS; i++) {
             this->register_file[i] = 0x0;
         }
-        for (Dimc_InnerBlock &blk : this->inner_blocks) {
-            for (auto &m : blk.macros) m.reset();
-            blk.out_accum.clear();
-            blk.out_accum.enable = 0;
-        }
-        for (Dimc_InnerBlock &blk : this->inner_blocks) {
-            blk.run_pending.clear();
-            for (Dimc_InnerBlock::Retired &r : blk.retired) r = Dimc_InnerBlock::Retired();
-        }
+        for (Dimc_InnerBlock &blk : this->inner_blocks) blk.out_accum.enable = 0;
         this->running_job   = 0;
         this->next_job_id   = 0;
+        this->next_run_base = 0;
         this->finished_jobs = 0;
-        this->job_running   = false;
-        this->acquired_ctx  = -1;
-        this->running_ctx   = -1;
-        this->ctx_queue.clear();
-    std::memset(this->live_regs, 0, sizeof(this->live_regs));
+        std::memset(this->live_regs, 0, sizeof(this->live_regs));
         for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
-            this->ctx_busy[ctx]   = false;
             this->ctx_job_id[ctx] = 0;
+            this->ctx_run_base[ctx] = 0;
             for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
         }
         this->outstanding_depth = 4;    // max in-flight requests per feed (kernel, input, store) per block
         this->fsm_timestamp     = 0;
         this->job_start_cycle   = 0;
-        this->job_geom[0].kb_beats_per_row  = 1;
-        this->job_geom[0].fb_beats_per_macro= 1;
-        this->job_geom[0].beats_per_macro   = 1;
-            this->fill_active = false;
-        this->job_geom[0].psin_beats_per_macro = 0;
-        this->job_geom[0].psin_rows        = 0;
-        for (Dimc_InnerBlock &blk : this->inner_blocks) blk.reset_all();
-        for (Dimc_InnerBlock &blk : this->inner_blocks)
-            for (Dimc_Macro &mc : blk.macros) {
-                mc.filled_job  = Dimc_Macro::JOB_NONE;
-                // Job ids restart at 0 after a reset; a stale id could match one.
-                mc.issue_job   = Dimc_Macro::JOB_NONE;
-                mc.fill_job    = Dimc_Macro::JOB_NONE;
-                mc.owed        = 0;
-                mc.write_job   = Dimc_Macro::JOB_NONE;
-                mc.written     = 0;
-                mc.kpf_job     = Dimc_Macro::JOB_NONE;
-                mc.kfetched    = 0;
-                mc.kw = 0; mc.f0 = false; mc.stamped = false;
-                mc.runs_issued = 0;
-                mc.set_job[0]  = mc.set_job[1] = Dimc_Macro::JOB_NONE;
-            }
-        for (Dimc_InnerBlock &blk : this->inner_blocks) {
-            for (auto &q : blk.out_fifo) q.clear();
-            for (uint32_t &n : blk.out_results) n = 0;
-        }
-        for (uint32_t c = 0; c < DIMC_NB_CONTEXT; c++) this->geom_job[c] = Dimc_Macro::JOB_NONE;
-        this->out_dropped = 0;
-        this->state.set(DIMC_IDLE);
 
         this->tracer.reset();
     }
+}
+
+// The engine as a reset leaves it: no FSM event pending, no job running or queued, every
+// context free, every FIFO, cursor and pending queue empty, no macro holding or owing a job.
+// Job ids, run numbering, the cycle count and the register file are left to the caller.
+void Dimc_HWPE::clear_engine()
+{
+    for (vp::ClockEvent *ev : {this->fsm_start_event, this->fsm_event, this->fsm_end_event,
+                               this->held_event})
+        if (ev->is_enqueued()) this->event_cancel(ev);
+    this->outer_port_in.reset();
+    this->outer_port_out.reset();
+    for (Dimc_InnerBlock &blk : this->inner_blocks) {
+        for (Dimc_Macro &mc : blk.macros) {
+            mc.reset();
+            mc.filled_job  = Dimc_Macro::JOB_NONE;
+            // Job ids restart at 0 after a reset; a stale id could match one.
+            mc.issue_job   = Dimc_Macro::JOB_NONE;
+            mc.fill_job    = Dimc_Macro::JOB_NONE;
+            mc.owed        = 0;
+            mc.write_job   = Dimc_Macro::JOB_NONE;
+            mc.written     = 0;
+            mc.kpf_job     = Dimc_Macro::JOB_NONE;
+            mc.kfetched    = 0;
+            mc.kw = 0; mc.f0 = false; mc.stamped = false;
+            mc.runs_issued = 0;
+            mc.set_job[0]  = mc.set_job[1] = Dimc_Macro::JOB_NONE;
+        }
+        blk.out_accum.clear();      // accumulator.sv clear_i
+        blk.run_pending.clear();
+        for (Dimc_InnerBlock::Retired &r : blk.retired) r = Dimc_InnerBlock::Retired();
+        blk.reset_all();
+        for (auto &q : blk.out_fifo) q.clear();
+    }
+    this->job_running   = false;
+    this->acquired_ctx  = -1;
+    this->running_ctx   = -1;
+    this->ctx_queue.clear();
+    for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) this->ctx_busy[ctx] = false;
+    for (uint32_t c = 0; c < DIMC_NB_CONTEXT; c++) this->geom_job[c] = Dimc_Macro::JOB_NONE;
+    this->job_geom[0].kb_beats_per_row     = 1;
+    this->job_geom[0].fb_beats_per_macro   = 1;
+    this->job_geom[0].beats_per_macro      = 1;
+    this->job_geom[0].psin_beats_per_macro = 0;
+    this->job_geom[0].psin_rows            = 0;
+    this->fill_active = false;
+    this->out_dropped = 0;
+    this->state.set(DIMC_IDLE);
 }
 
 // Reserve a free job context; -1 when every context is occupied.
@@ -279,6 +288,11 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                     // bundle, so a committed job carries a complete descriptor.
                     std::memcpy(_this->ctx_regs[ctx], _this->live_regs,
                                 sizeof(_this->live_regs));
+                    // Runs are numbered across jobs: this job's first run follows the
+                    // last run of the job committed before it.
+                    const uint32_t nb_vec = _this->job_reg_ctx(ctx, DIMC_HWPE_NB_VEC);
+                    _this->ctx_run_base[ctx] = _this->next_run_base;
+                    _this->next_run_base += nb_vec ? nb_vec : 1;
                     _this->ctx_ci[ctx] =
                         (uint8_t)(_this->register_file[DIMC_HWPE_CFG_CI >> 2] & 0x3);
                     _this->ctx_sign_8b[ctx] =
@@ -308,17 +322,12 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                 uint32_t scope = data & 0x3;
 
                 if (scope != 0x2) {                 // scopes 0 and 1 clear IP state
-                    for (Dimc_InnerBlock &blk : _this->inner_blocks) {
-                        for (auto &m : blk.macros) m.reset();
-                        blk.out_accum.clear();      // accumulator.sv clear_i
-                    }
-                    // Aborts any in-flight job: release every context, otherwise
-                    // ACQUIRE would report busy forever and dimc_hwpe_acquire_block() hangs.
-                    _this->job_running  = false;
-                    _this->acquired_ctx = -1;
-                    _this->running_ctx  = -1;
-                    _this->ctx_queue.clear();
-                    for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) _this->ctx_busy[ctx] = false;
+                    // Aborts any job in flight: its FSM events are dropped and every context
+                    // released, otherwise ACQUIRE would report busy forever and
+                    // dimc_hwpe_acquire_block() hangs.
+                    const bool active = _this->job_running || _this->state.get() != DIMC_IDLE;
+                    _this->clear_engine();
+                    if (active) _this->tracer.idle();
                 }
                 if (scope != 0x1) {                 // scopes 0 and 2 clear the regfile
                     for (uint32_t i = 0; i < N_CFG_REGS; i++)
@@ -327,7 +336,6 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                         for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++)
                             _this->ctx_regs[ctx][i] = 0x0;
                 }
-                if (scope != 0x2) _this->state.set(DIMC_IDLE);
                 // Re-publish the monotonic counters the register_file wipe cleared.
                 _this->register_file[DIMC_HWPE_FIN_JOBS >> 2] = _this->finished_jobs;
                 _this->register_file[DIMC_HWPE_RUN_TASK >> 2] = _this->running_job;

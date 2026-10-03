@@ -121,6 +121,7 @@ class Dimc_Tracer {
         void port_cycle();
         void job_closed(uint64_t now_cycle);      // the per-job report
         void job_end();                           // busy falls
+        void idle();                              // busy falls, no report: a job ended or was cleared
 
     private:
         uint8_t macro_why(uint32_t blk, uint32_t m) const;

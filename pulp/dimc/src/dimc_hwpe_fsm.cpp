@@ -142,6 +142,7 @@ void Dimc_HWPE::latch_geom(int ctx)
     g.ps_vec_stride  = this->job_reg_ctx(ctx, DIMC_HWPE_PSIN_VEC_STRIDE);
     g.out_vec_stride = this->job_reg_ctx(ctx, DIMC_HWPE_OUT_VEC_STRIDE);
     g.psin_dep       = this->job_reg_ctx(ctx, DIMC_HWPE_PSIN_DEP);
+    g.run_base       = this->ctx_run_base[ctx];
     this->geom_job[ctx] = this->ctx_job_id[ctx];
 }
 
@@ -172,7 +173,7 @@ void Dimc_HWPE::plan_macro_fill(uint32_t blk_id, uint32_t m, int ctx)
 {
     const JobGeom &g = this->job_geom[ctx];
     Dimc_InnerBlock &blk = this->inner_blocks[blk_id];
-    Dimc_InnerBlock::Cursor &cur = blk.fill;
+    Dimc_InnerBlock::FillCursor &cur = blk.fill;
     if (m >= g.num_active) return;
     if (cur.macro_beat_index.size() < blk.macros.size())
         cur.reset((uint32_t)blk.macros.size());
@@ -432,9 +433,10 @@ void Dimc_HWPE::fetch_kernels_first()
     }
 }
 
-// The ADDIN set run `run` of `job` opens is free: the run two before it, or the previous job's
-// run of that parity, which read it last, has every row triggered. Nothing triggered yet: runs
-// 0 and 1 open unused sets; run r >= 2 reuses run r - 2's. Two or more jobs ahead: not free.
+// The ADDIN set run `run` of `job` opens is free: the run two before it, counted across jobs
+// (runs 0 and 1 follow the previous job's last two), has every row triggered. Nothing
+// triggered yet: runs 0 and 1 open unused sets; run r >= 2 reuses run r - 2's. Two or more
+// jobs ahead: not free.
 bool Dimc_HWPE::psin_set_free(const Dimc_Macro &mc, uint32_t job, uint32_t run) const
 {
     if (mc.issue_job == Dimc_Macro::JOB_NONE) return run < 2u;
@@ -453,9 +455,9 @@ bool Dimc_HWPE::beat_writable(const Dimc_Macro &mc, uint32_t job, const BeatPos 
         // A later job's section would open the macro's write program for that job and drop
         // the one not yet handed to compute (its kernel may still be streaming in).
         if (mc.write_job != Dimc_Macro::JOB_NONE && mc.write_job != job && !mc.stamped) return false;
-        // The two ADDIN sets alternate between runs. A run's first section opens its set,
-        // which the run two before it (or the previous job's run of that parity) read last:
-        // every row of that run has to be triggered first.
+        // The two ADDIN sets alternate between consecutive runs, across jobs too. A run's first
+        // section opens its set, which the run two before it read last: every row of that run
+        // has to be triggered first.
         return pos.sub != 0 || this->psin_set_free(mc, job, pos.run);
     }
     if (mc.filled_job != job && this->holds_unissued(mc)) return false;
@@ -488,7 +490,7 @@ bool Dimc_HWPE::beat_writable(const Dimc_Macro &mc, uint32_t job, const BeatPos 
 // The next section of macro m's fill program; false when it has none.
 bool Dimc_HWPE::program_next(const Dimc_InnerBlock &blk, uint32_t m, BeatPos &pos) const
 {
-    const Dimc_InnerBlock::Cursor &c = blk.fill;
+    const Dimc_InnerBlock::FillCursor &c = blk.fill;
     if (m >= c.macro_beat_index.size() || c.macro_beat_index[m] >= c.macro_beat_total[m]) return false;
     pos = this->beat_pos(this->job_geom[blk.macros[m].fill_slot], c.macro_beat_index[m]);
     return true;
@@ -561,7 +563,7 @@ uint32_t Dimc_HWPE::pick_input(const Dimc_InnerBlock &blk, uint8_t &why) const
 // section of a port word needs neither.
 void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id, bool kernel_feed)
 {
-    Dimc_InnerBlock::Cursor &cursor = blk.fill;
+    Dimc_InnerBlock::FillCursor &cursor = blk.fill;
     if (kernel_feed) {
         // Program kernel sections already fetched ahead are consumed without a fetch.
         for (uint32_t m = 0; m < blk.macros.size() && m < cursor.macro_beat_index.size(); m++) {
@@ -620,7 +622,7 @@ uint32_t Dimc_HWPE::kernel_in_progress(const Dimc_InnerBlock &blk) const
 // the one in progress, else the lowest-index one with a kernel left to fetch.
 bool Dimc_HWPE::kernel_prefetch(Dimc_InnerBlock &blk, uint32_t blk_id)
 {
-    Dimc_InnerBlock::Cursor &cur = blk.fill;
+    Dimc_InnerBlock::FillCursor &cur = blk.fill;
     const uint32_t nb = (uint32_t)blk.macros.size();
     const uint32_t ip = this->kernel_in_progress(blk);
     // Macros whose program has not reached the kernel sections of its job: that kernel, not
@@ -771,13 +773,13 @@ bool Dimc_HWPE::held_kernel_step(Dimc_InnerBlock &blk, uint32_t blk_id, int ctx)
 // Fetch one section of macro `macro`'s program from L1 into the dual's FIFO.
 void Dimc_HWPE::fill_beat(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro)
 {
-    Dimc_InnerBlock::Cursor &cursor = blk.fill;
+    Dimc_InnerBlock::FillCursor &cursor = blk.fill;
     const uint32_t port_bytes = this->inner_port_bytes;
     const uint32_t within = cursor.macro_beat_index[macro];
     Dimc_Macro &fm = blk.macros[macro];
     const JobGeom &fg = this->job_geom[fm.fill_slot];
     const BeatPos  pos = this->beat_pos(fg, within);
-    const uint32_t pset    = (fm.fill_job * fg.nb_vec + pos.run) & 1;
+    const uint32_t pset    = (fg.run_base + pos.run) & 1;
     const uint8_t  kind    = pos.kind;
 
     // First section of a run: mark its partial sums outstanding, in the run's set, which
@@ -836,7 +838,7 @@ void Dimc_HWPE::write_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
         mc.written = 0; mc.kw = 0; mc.f0 = false; mc.stamped = false;
     }
     const uint32_t port_bytes = this->inner_port_bytes;
-    const uint32_t pset       = (e.job * g.nb_vec + pos.run) & 1;
+    const uint32_t pset       = (g.run_base + pos.run) & 1;
     bool feature_done = false;
 
     if (pos.kind == DIMC_LOAD_KB) {
@@ -884,8 +886,8 @@ void Dimc_HWPE::write_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
         mc.stamped = true;
         mc.fill_done_cycle = this->fsm_timestamp + 1;
         mc.filled_job   = mc.write_job;
-        mc.filled_slot  = mc.write_slot;
         mc.job_nb_vec   = g.nb_vec;
+        mc.job_run_base = g.run_base;
         mc.job_rows     = g.row_count;
         mc.job_row_base = g.row_base;
         mc.psin_rows    = (uint8_t)g.psin_rows;
@@ -942,7 +944,7 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
                 && this->fsm_timestamp >= mac.fill_done_cycle && mac.can_accept()) {
                 if (mac.rows_issued >= mac.job_rows) mac.rows_issued = 0;   // next run
                 const uint32_t row_idx = (mac.job_row_base + mac.rows_issued) % DIMC_MACRO_KB_LEN;
-                const uint32_t pset = (jj * mac.job_nb_vec + b) & 1;
+                const uint32_t pset = (mac.job_run_base + b) & 1;
                 if (!mac.psin_rows || this->fsm_timestamp >= mac.psin_row_ready[pset][row_idx]) {
                     mac.psin_sel = (uint8_t)pset;
                     mac.issue((int)row_idx, (int)mac.rows_issued, (int)(jj & 1), (int)b);
