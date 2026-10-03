@@ -41,7 +41,6 @@ void Dimc_Tracer::build(vp::Component &owner, vp::Trace &text,
     for (uint32_t b = 0; b < nb_blocks; b++) {
         Block &blk = this->blocks[b];
         std::string pfx = "block_" + std::to_string(b) + "/";
-        owner.traces.new_trace_event(pfx + "beat_index",  &blk.beat_event, 32);
         owner.traces.new_trace_event(pfx + "rows_issued", &blk.rows_event, 32);
         owner.traces.new_trace_event(pfx + "load_active", &blk.load_event, 1);
         owner.traces.new_trace_event(pfx + "fill_grant",  &blk.fill_grant_event, 8);
@@ -71,7 +70,6 @@ void Dimc_Tracer::reset()
     this->busy_event.event(&zero8);
     this->job_event.event((uint8_t *)&zero32);
     for (Block &blk : this->blocks) {
-        blk.beat_event.event((uint8_t *)&zero32);
         blk.rows_event.event((uint8_t *)&zero32);
     }
 }
@@ -129,16 +127,14 @@ void Dimc_Tracer::fill_beat(uint32_t b, uint32_t macro, uint32_t within,
     blk.loaded = true;
     mac.loaded = 1;
     blk.fill_grant = (uint8_t)macro;   // a FIFO section was written into this macro
-    // Beat kind from the engine's own beat_kind.
+    // Beat kind from the engine's own beat_pos.
     {
         const uint32_t slot = this->dimc.inner_blocks[b].macros[macro].write_slot;
         const Dimc_HWPE::JobGeom &fg = this->dimc.job_geom[slot];
-        const uint8_t k = this->dimc.beat_kind(fg, within), prev = mac.load_kind;
+        const uint8_t k = this->dimc.beat_pos(fg, within).kind, prev = mac.load_kind;
         const bool kb_psin = (prev == DIMC_LOAD_KB && k == DIMC_LOAD_PSIN) || (prev == DIMC_LOAD_PSIN && k == DIMC_LOAD_KB);
         mac.load_kind = kb_psin ? DIMC_LOAD_KB_PSIN : k;
     }
-    uint32_t idx = this->dimc.inner_blocks[b].fill.beat_index;
-    blk.beat_event.event((uint8_t *)&idx);
 }
 
 void Dimc_Tracer::fill_skip(uint32_t b, uint8_t why)
@@ -156,6 +152,13 @@ void Dimc_Tracer::kernel_skip(uint32_t b, uint8_t why)
 void Dimc_Tracer::input_skip(uint32_t b, uint8_t why)
 {
     this->blocks[b].input_skip = why;
+}
+
+void Dimc_Tracer::feed_skip(uint32_t b, bool kernel, uint8_t why)
+{
+    if (kernel) this->kernel_skip(b, why);
+    else        this->input_skip(b, why);
+    this->fill_skip(b, why);
 }
 
 void Dimc_Tracer::row_issued(uint32_t b, uint32_t m, uint32_t rows_issued,
@@ -294,7 +297,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
         const Dimc_InnerBlock::Cursor &f = blk.fill;
         if (m < f.macro_beat_index.size() && f.macro_beat_index[m] < f.macro_beat_total[m]
             && this->dimc.beat_pos(this->dimc.job_geom[mac.fill_slot], f.macro_beat_index[m]).kind != DIMC_LOAD_KB) {
-            const std::deque<Dimc_InnerBlock::FeedEntry> &q = blk.inp_fifo[0];
+            const std::deque<Dimc_InnerBlock::FeedEntry> &q = blk.inp_fifo;
             for (size_t i = 0; i < q.size(); i++) {
                 if (q[i].macro != m) continue;
                 if (q[i].ready > this->dimc.fsm_timestamp) return DIMC_WHY_WAIT_FILL_ACK;
@@ -320,9 +323,8 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
                                                                    : DIMC_WHY_UNKNOWN;
     }
 
-    // Every row issued. Rows are checked before the port: store_block tests the
-    // port first, which would blame the port for a beat whose rows had not
-    // retired anyway.
+    // Write-back, read as if the block stored its macros in index order (m * out_beats).
+    // Retired rows are checked before the port refusal.
     const uint32_t first = m * g.out_beats, last = first + g.out_beats;
     const uint32_t cur   = blk.store.beat_index;
     if (cur < first)

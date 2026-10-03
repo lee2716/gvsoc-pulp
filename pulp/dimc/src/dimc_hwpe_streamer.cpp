@@ -78,10 +78,8 @@ void Dimc_HWPE_Streamer::configure(
     );
 }
 
-// tot_len is a BYTE count. The engine issues beat widths that sum to exactly
-// this span -- each is clamped to what is left of the buffer -- so this turns
-// true on the same beat that exhausts the engine's own beat_total. It is the
-// streamer's own guard, not the bound that ends a phase.
+// tot_len is a byte count. The engine's beats sum to exactly it, so this is only
+// the streamer's guard; the engine's own section counts end a program or a store.
 bool Dimc_HWPE_Streamer::is_done() { return this->pos >= this->tot_len; }
 
 bool Dimc_HWPE_Streamer::pair_ready() const {
@@ -89,18 +87,12 @@ bool Dimc_HWPE_Streamer::pair_ready() const {
 }
 
 // Where the next beat reads or writes. `pos` counts bytes consumed, which is
-// also the address offset while the walk is linear.
-//
-// A non-zero d0_len selects a strided walk instead: d0_len bytes are
-// contiguous, the address then jumps by d0_stride to the next run, and after
-// d1_len runs it jumps by d1_stride. This is what DIMC_HWPE_KB_D0_LENGTH
-// .. _D1_STRIDE address. `pos` still counts bytes, so tot_len ends the phase
-// unchanged, and d0_len == 0 keeps the linear walk.
-//
-// ⚠ The RTL does not do this. dual_DIMC/rtl/dimc_ctrl.sv wires all three of its
-// streams to HWPE_STREAM_ADDRESSGEN_1D with constant strides, and
-// dimc_package.sv has no stride field to configure. Do not use the strided walk
-// from a test meant to represent the current hardware.
+// also the address offset while the walk is linear (d0_len == 0).
+// A non-zero d0_len selects a strided walk: d0_len contiguous bytes, then a jump
+// by d0_stride to the next run, and after d1_len runs a jump by d1_stride; the
+// *_D0_* / *_D1_* job registers set it. Not the RTL's addressing:
+// dual_DIMC/rtl/dimc_streamer.sv derives its strides from the matrix shape in
+// dimc_config_t and has no stride registers.
 uint32_t Dimc_HWPE_Streamer::walk_addr() const {
     if (this->d0_len == 0) {
         return this->base_addr + this->pos;
@@ -184,4 +176,84 @@ int Dimc_HWPE_Streamer::issue_beat(int width, void* buf) {
     this->tot_iters++;
 
     return (int)latency;
+}
+
+// ---- Stream address setup, per macro ----
+uint32_t Dimc_HWPE::slot_offset(const JobGeom &g, uint32_t blk_id, uint32_t m, uint8_t kind) const
+{
+    // Slot slicing: one kernel block and one output block per slot, one feature block for all.
+    const uint32_t slot = blk_id * g.num_active + m;
+    switch (kind) {
+    case DIMC_LOAD_KB: return slot * g.row_count * DIMC_MACRO_KB_EW;
+    case DIMC_LOAD_FB: return 0;
+    default:           return slot * g.row_count * DIMC_OUT_SLOT_BYTES;
+    }
+}
+
+// Point macro m's input streamers at the operands of vector `run` of the job in context ctx,
+// which is the job being filled, not necessarily the running one.
+void Dimc_HWPE::configure_macro_streams(uint32_t blk_id, uint32_t m, int ctx, uint32_t run,
+                                        bool kernel, bool feature, bool psum)
+{
+    const JobGeom &g = this->job_geom[ctx];
+    Dimc_InnerBlock &blk = this->inner_blocks[blk_id];
+    const uint32_t kb_one  = g.row_count * DIMC_MACRO_KB_EW;
+    const uint32_t fb_one  = DIMC_MACRO_FB_EW;
+    const uint32_t out_one = g.row_count * DIMC_OUT_SLOT_BYTES;   // psin reads output slots
+    if (kernel)
+        blk.weight_stream[m].configure(
+            this->job_reg_ctx(ctx, DIMC_HWPE_JOB_KB_SRC_ADDR)
+                + this->slot_offset(g, blk_id, m, DIMC_LOAD_KB), kb_one,
+            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D0_LENGTH),
+            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D0_STRIDE),
+            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D1_LENGTH),
+            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D1_STRIDE), 0, 0, 0);
+    if (feature)
+        blk.input_stream[m].configure(
+            this->job_reg_ctx(ctx, DIMC_HWPE_JOB_FB_SRC_ADDR) + run * g.fb_vec_stride
+                + this->slot_offset(g, blk_id, m, DIMC_LOAD_FB), fb_one,
+            this->job_reg_ctx(ctx, DIMC_HWPE_FB_D0_LENGTH),
+            this->job_reg_ctx(ctx, DIMC_HWPE_FB_D0_STRIDE), 0, 0, 0, 0, 0);
+    // Per-row partial sums, laid out like the outputs they came from.
+    if (psum)
+        blk.psin_stream[m].configure(
+            this->job_reg_ctx(ctx, DIMC_HWPE_JOB_PSIN_SRC_ADDR) + run * g.ps_vec_stride
+                + this->slot_offset(g, blk_id, m, DIMC_LOAD_PSIN), out_one, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// Point macro m's output streamer at vector `run` of the job in context ctx.
+void Dimc_HWPE::configure_out_stream(uint32_t blk_id, uint32_t m, uint32_t run, uint32_t ctx)
+{
+    const JobGeom &g = this->job_geom[ctx];
+    const uint32_t out_one = g.row_count * DIMC_OUT_SLOT_BYTES;
+    this->inner_blocks[blk_id].out_stream[m].configure(
+        this->job_reg_ctx((int)ctx, DIMC_HWPE_JOB_DST_ADDR) + run * g.out_vec_stride
+            + this->slot_offset(g, blk_id, m, DIMC_LOAD_NONE),
+        out_one, this->job_reg_ctx((int)ctx, DIMC_HWPE_OUT_D0_LENGTH),
+        this->job_reg_ctx((int)ctx, DIMC_HWPE_OUT_D0_STRIDE), 0, 0, 0, 0, 0);
+}
+
+void Dimc_OuterPort::configure(uint32_t bandwidth)
+{
+    this->bandwidth_bytes = bandwidth ? bandwidth : 1;
+    this->cursor_bytes    = 0;
+}
+
+void Dimc_OuterPort::reset()
+{
+    this->cursor_bytes = 0;
+}
+
+int64_t Dimc_OuterPort::busy_until() const
+{
+    return this->cursor_bytes / (int64_t)this->bandwidth_bytes;
+}
+
+void Dimc_OuterPort::request(int64_t now, uint64_t bytes)
+{
+    // Reserve in bytes, report in cycles: a beat narrower than the port takes a
+    // fraction of a cycle, so several of them can share one.
+    int64_t start = now * (int64_t)this->bandwidth_bytes;
+    if (this->cursor_bytes > start) start = this->cursor_bytes;
+    this->cursor_bytes = start + (int64_t)bytes;
 }

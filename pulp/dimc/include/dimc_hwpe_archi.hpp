@@ -41,9 +41,9 @@
 
 /* ============ Generic / job-INDEPENDENT registers @ 0x20 ============
  * Compute configuration, not part of the per-job register bundle. CFG_CI,
- * SIGN_8B and COMPUTE_MASK are snapshotted at commit and travel with the job, so
- * consecutive jobs may differ in them; the others are read when a job starts and
- * apply to every macro.
+ * SIGN_8B and COMPUTE_MASK are snapshotted at commit and travel with the job.
+ * NUM_MACROS is read when a job's shape is latched; COMPE and SEL_DIMC are
+ * stored, never read.
  */
 #define DIMC_HWPE_CFG_CI             (DIMC_HWPE_BASE + 0x20)  /* INT1/2/4/8      */
 #define DIMC_HWPE_SIGN_8B            (DIMC_HWPE_BASE + 0x24)  /* INT8 sign combo */
@@ -110,9 +110,7 @@
 
 /* Per-row partial-sum input, the model of the RTL's ADDIN. With PSIN_EN set the
  * engine streams one 32-bit psum per kernel row from PSIN_SRC_ADDR and adds it to
- * that row's dot product; with it clear the per-job PSIN scalar is used instead
- * and nothing extra is loaded. This is what lets a K-chain keep several partial
- * sums alive at once, one per kernel row. */
+ * that row's dot product; with it clear the per-job PSIN scalar is added instead. */
 #define DIMC_HWPE_PSIN_EN            (DIMC_HWPE_BASE + 0x94)
 #define DIMC_HWPE_JOB_PSIN_SRC_ADDR  (DIMC_HWPE_BASE + 0x98)
 

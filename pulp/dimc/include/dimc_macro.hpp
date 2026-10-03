@@ -34,26 +34,21 @@
 // read back. 4: packed, 8 results per 32 B port word (output packer, not in the RTL).
 // 32: one sign-extended result per port word, as in the RTL. Result r sits at dst + SLOT * r.
 #define DIMC_OUT_SLOT_BYTES 4
-// The dual's out_fifo storage (64 x 32 b), used as one FIFO per macro of half that depth;
-// a port word leaves straight from the head entries. Not in the RTL, which has one push
-// through `sel` and one pop; same storage.
+// The dual's out_fifo storage (64 x 32 b), split evenly into one FIFO per macro; a port
+// word leaves straight from the head entries. The RTL has one FIFO, pushed from the macro
+// `sel` picks, and one pop.
 #define DIMC_OUT_FIFO_DEPTH 64
-// One out_fifo per macro of half that depth.
-// A macro's next-job kernel is fetched into the dual's weight FIFO as soon as no macro of
-// the dual still owes kernel sections of its current program; the program then skips the
-// sections already fetched. This holds for batched jobs too: the program fetches vector 0's
-// partial sums and feature first, the kernel is fetched ahead of them.
-// A macro that holds the next job's operands issues that job's rows before the running
-// job closes. Their results wait in its out_fifo until the write-back reaches that job;
-// issue stops while the out_fifo has no free entry, since a full out_fifo drops results.
-// A macro is at most one job ahead of the running one. A macro that has written back every
-// result of the running job writes its next job's results to that job's destination at
-// once (a second address generator per macro, the next job's context), instead of holding
-// them in its out_fifo until the running job closes.
-// While the engine is idle and jobs are committed but held (commit-only), the kernel of the
-// first held job is fetched into each dual's weight FIFO for its first macro; it is written
-// into the macro, one section per cycle, once the job runs. Kernels do not depend on the
-// job's inputs; features and partial sums are still fetched when the job starts.
+// Kernel sections are also fetched ahead of a macro's program (kernel_prefetch) on outer-port
+// cycles the programs leave free: the kernel under way first, else the lowest-index macro's
+// kernel of its current job (program not yet at the kernel) or of its next job. One macro's
+// kernel is fetched at a time; the program then skips the sections already fetched.
+// A macro holding the next job's operands issues that job's rows before the running job
+// closes. Their results wait in its out_fifo until the write-back reaches that job, and it
+// issues only while out_fifo plus pipe stay below its out_fifo's depth, since a full out_fifo
+// drops results. A macro is at most one job ahead of the running one.
+// While the engine is idle with committed jobs held (commit-only), each dual fetches the first
+// held job's kernel for its first macro into the weight FIFO; it is written into the macro
+// once the job runs. Features and partial sums are fetched once the job starts.
 // Macro write rules: no section is written into a macro in a cycle in which it computes
 // (each waits for the cycle after the row trigger it depends on), and a macro takes one
 // kernel or feature section per cycle, the feature section first. Partial sums go to the
@@ -125,8 +120,8 @@ class Dimc_Macro {
         int32_t compute_PP(int row_sel);
         void    final_compute();
 
-        // Pipelined scheduling: issue is non-blocking unless pipeline is full;
-        // tick advances the pipeline; has_ready/drain pop the front entry
+        // issue pushes a row into the pipe (ignored unless can_accept); tick advances
+        // the pipe; has_ready tests and drain pops the front entry.
         void issue(int row, int job_row, int set = 0, int run = 0);
         void tick();
         bool can_accept() const;
@@ -134,17 +129,14 @@ class Dimc_Macro {
         DimcPipeEntry drain();
 
         // Runtime configuration
-        uint8_t  compe        = DIMC_COMPE_COMPUTE;  // latched, never acted on
+        uint8_t  compe        = DIMC_COMPE_COMPUTE;  // never read: compute_PP always computes
         uint8_t  ci           = DIMC_CI_8BIT;
         uint8_t  sign_8b      = DIMC_SIGN_UU;
         uint16_t compute_mask = 0;   // bits masked off the 1024-bit row
-        // Per-row partial-sum input, mirroring the RTL's ADDIN, which is
-        // sampled together with the row address on every compute trigger
-        // (spatz_dimc.sv) and is a port there, not a stored array. psin_scalar
-        // is the per-job constant, and is what compute_PP uses while psin_rows
-        // is off.
+        // ADDIN, which spatz_dimc.sv samples with the row address on each trigger.
+        // psin_scalar is the per-job constant compute_PP adds while psin_rows is 0.
         int32_t  psin_scalar = 0;
-        uint8_t  psin_rows   = 0;                        // 1 = take psin from psin_buf
+        uint8_t  psin_rows   = 0;                        // 1 = take the row's psin from psin_buf_set
         // Two partial-sum sets, alternating per run: set (job * NB_VEC + run) & 1.
         // They stand for what arrives on ADDIN from outside the macro, so the next
         // run's can be queued while this run's rows still use theirs; psin_sel picks
@@ -160,13 +152,8 @@ class Dimc_Macro {
         int32_t  psout = 0;
         uint8_t  sout  = 0;   // computed by final_compute, never wired out
 
-        // Set when the operands for the job this macro is executing have
-        // landed. A flag of its own rather than a comparison on the fill
-        // cursor's beat counters, which belong to the block and are reset per
-        // phase.
-        bool     exec_ready = false;
-        // Job whose operands KB/FB hold, as the monotonic job id stamped at commit, not
-        // the context slot: slot indices repeat, and a match on one would skip the fill.
+        // Job whose operands KB/FB hold, set once its kernel and vector 0's feature are written
+        // (JOB_NONE before). The job id stamped at commit, not the context slot: slots repeat.
         static constexpr uint32_t JOB_NONE = 0xFFFFFFFFu;
         uint32_t filled_job = JOB_NONE;
         // The job whose rows this macro is issuing; rows_issued counts for it.
@@ -178,26 +165,26 @@ class Dimc_Macro {
         // Runs of issue_job whose rows are all triggered; rows_issued counts inside the
         // current run.
         uint32_t runs_issued = 0;
-        // The run whose feature is in the feature buffer, and when it landed.
+        // The run whose feature is in the feature buffer, and the first cycle a row may use it.
         uint32_t fb_run = 0;
         uint64_t fb_ready_cycle = 0;
         // This macro's own fill program: the job it is filling and that job's context.
-        // Per macro, so a macro that has finished all its runs can load the next job
-        // while its sibling still runs the current one.
+        // Per macro, so a macro whose program is spent can start the next job's while
+        // its sibling still fills or runs the current one.
         uint32_t fill_job = JOB_NONE;
         uint32_t fill_slot = 0;
         // Fill programs started for this macro whose job it has not finished triggering.
         uint32_t owed = 0;
         // The write side of that program: the job whose sections are being popped from the
-        // dual's FIFOs into this macro, its context, and how many have been written.
+        // dual's FIFOs into this macro, and its context.
         uint32_t write_job = JOB_NONE;
         uint32_t write_slot = 0;
-        // Contexts of filled_job and issue_job.
-        uint32_t filled_slot = 0, issue_slot = 0;
+        // Context of filled_job; stored, never read. written: sections written for write_job.
+        uint32_t filled_slot = 0;
         uint32_t written = 0;
-        // Kernel of job kpf_job being streamed into the weight FIFO: kfetched sections so
-        // far, by the program or ahead of it; kw of them written into the macro, and
-        // f0 = vector 0's feature written, for the job being written (write_job).
+        // Kernel being fetched into the weight FIFO, by the program or ahead of it: job kpf_job,
+        // kfetched sections so far. For write_job: kw kernel sections written, f0 = vector 0's
+        // feature written, stamped = handed to compute as filled_job.
         uint32_t kpf_job  = JOB_NONE;
         uint32_t kpf_slot = 0;
         uint32_t kfetched = 0;
@@ -210,21 +197,19 @@ class Dimc_Macro {
         // Cycle after the kernel rows and vector 0's feature are written. No row issues
         // before it; the partial sums are gated per row (psin_row_ready).
         uint64_t fill_done_cycle = 0;
-        // Rows pushed into this macro's pipe. Per macro, not per block, so a
-        // macro that finished filling does not wait for its sibling.
+        // Rows of the current run of issue_job pushed into this macro's pipe.
         uint32_t rows_issued = 0;
         // Cycle of the last row trigger. No section is written into the macro in that cycle.
         int64_t  last_trigger_cycle = -1;
         // Cycle of the last kernel or feature section written into the macro.
         int64_t  last_write_cycle = -1;
-        // Rows retired from the pipe per result set, with the set's job: two jobs can be
-        // in flight on one macro. Store watermark: beat k may go once the count covers its rows.
+        // Rows retired from the pipe per result set (job id & 1), with the set's job: two jobs
+        // can be in flight on one macro. rows_done() closes the job on these counts.
         uint32_t rows_retired_set[2] = {0, 0};
         uint32_t set_job[2]          = {0xFFFFFFFFu, 0xFFFFFFFFu};
 
-        // Staging for a feature vector assembled from its sections. Per macro, not
-        // per block: once two macros fill concurrently a shared buffer would let one
-        // overwrite the other's half-assembled vector.
+        // Staging for a feature vector assembled from its sections. Per macro: the dual's
+        // input FIFO interleaves both macros' sections.
         uint8_t  row_buffer[DIMC_MACRO_KB_EW] = {0};
         // Kernel rows are assembled apart from features: the two FIFOs pop independently,
         // so a feature's sections can arrive between a kernel row's.
@@ -233,10 +218,8 @@ class Dimc_Macro {
                       "row_buffer holds a feature vector; FB_EW must fit KB_EW");
 
         std::deque<DimcPipeEntry> pipe;
-        // kb_ready and fb_ready are both raised when the FEATURE vector lands,
-        // which is the last thing a macro waits for; on a reuse job no kernel
-        // moves at all. The pair means "this macro has what it needs", not
-        // "the kernel arrived".
+        // Both set when a feature vector is written, cleared at job start for a macro not
+        // on the new job; can_accept needs both. Neither tracks the kernel.
         bool     kb_ready         = false;
         bool     fb_ready         = false;
 };
