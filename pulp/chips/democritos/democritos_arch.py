@@ -120,7 +120,9 @@ class DemocritosArch:
     #   d d v v           4  5  6  7
     #   a a t t           8  9 10 11
     #   a a t t          12 13 14 15
-    TILE_TYPES          = list('ddvvddvvaattaatt')
+    # Tile class at each mesh position, overridden by DEMOCRITOS_TILE_TYPES (e.g. 'ttvvttvvaaddaadd'
+    # swaps DIMC and RedMulE). The software's DEMOCRITOS_TILE_ROLES_STR must name the same kinds.
+    TILE_TYPES          = list(os.environ.get('DEMOCRITOS_TILE_TYPES', 'ddvvddvvaattaatt'))
 
 class DemocritosTree(Tree):
     def __init__(self, parent, name):
@@ -146,10 +148,8 @@ class DemocritosDSE:
     # between front and mid end (idma_axi_obi_transfer_ch.sv).
     TILE_IDMA0_JOBFIFO_SIZE     = 16
     TILE_IDMA1_JOBFIFO_SIZE     = 16
-    # AXI transactions the iDMA keeps in flight, standing in for
-    # iDMA_NumAxInFlight = 16 (magia_tile_pkg.sv). magia_v2/arch.py sets its own
-    # burst_queue_size to 2; this platform runs 8.
-    TILE_IDMA0_BQUEUE_SIZE      = 8
+    # AXI transactions the iDMA keeps in flight; the RTL's iDMA_NumAxInFlight.
+    TILE_IDMA0_BQUEUE_SIZE      = 16
     TILE_IDMA0_B_SIZE           = 32
-    TILE_IDMA1_BQUEUE_SIZE      = 8
+    TILE_IDMA1_BQUEUE_SIZE      = 16
     TILE_IDMA1_B_SIZE           = 32
