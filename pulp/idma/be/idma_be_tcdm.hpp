@@ -24,12 +24,29 @@
 #include <vp/itf/io.hpp>
 #include "../idma.hpp"
 #include "idma_be.hpp"
+#include <queue>
+
+// 1: TCDM write lines are pipelined, one per cycle, responses retired as they return, as in
+// the RTL's OBI write manager; 0: one line at a time, each waiting for its response.
+#ifndef IDMA_TCDM_PIPELINED_WRITES
+#define IDMA_TCDM_PIPELINED_WRITES 0
+#endif
+// 1: TCDM read lines are pipelined, one request per cycle, each line handed to the destination
+// back-end when its response is due, aligned with the RTL; 0: one line in flight at a time.
+#ifndef IDMA_TCDM_PIPELINED_READS
+#define IDMA_TCDM_PIPELINED_READS 1
+#endif
+// Lines read but not yet taken by the destination; the RTL's iDMA_BufferDepth.
+#ifndef IDMA_TCDM_READ_DEPTH
+#define IDMA_TCDM_READ_DEPTH 3
+#endif
 
 /**
  * @brief TCDM back-end
  *
  * This back-end can be used to interface directly with a local memory.
- * It can only send one request and is blocked until the request is done.
+ * Without the IDMA_TCDM_PIPELINED_* switches it can only send one request and is blocked
+ * until the request is done.
  */
 class IDmaBeTcdm : public vp::Block, public IdmaBeConsumer
 {
@@ -63,8 +80,10 @@ private:
     uint64_t get_line_size(uint64_t base, uint64_t size);
     // Write a line to TCDM
     void write_line();
+    void write_line_pipelined();
     // Read a line from TCDM
     void read_line();
+    void read_line_pipelined();
     // Handle the end of a write request
     void write_handle_req_ack();
     // Remove a chunk of data from current burst. This is used to track when a burst is done
@@ -142,4 +161,11 @@ private:
     int64_t last_line_timestamp;
     // Current transfer for which data to be written are push
     IdmaTransfer *write_current_transfer;
+    // Pipelined writes: each issued line's response, with its due cycle, in order.
+    struct PendingAck { int64_t time; uint64_t size; IdmaTransfer *transfer; uint8_t *data_start;
+                        uint64_t ack_size; bool last; };
+    std::queue<PendingAck> write_acks;
+    struct PendingRead { int64_t time; uint64_t size; uint8_t *data; IdmaTransfer *transfer; };
+    std::queue<PendingRead> read_lines;   // issued, not yet handed to the destination
+    int64_t last_read_timestamp;
 };

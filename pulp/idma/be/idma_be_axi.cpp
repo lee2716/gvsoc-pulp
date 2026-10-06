@@ -21,6 +21,11 @@
 #include <algorithm>
 #include <vp/vp.hpp>
 #include "idma_be_axi.hpp"
+// 1: a read burst that finds the AR channel idle goes out in the cycle it is enqueued,
+// aligned with the RTL; 0: it goes out the next cycle.
+#ifndef IDMA_AXI_ISSUE_SAME_CYCLE
+#define IDMA_AXI_ISSUE_SAME_CYCLE 1
+#endif
 
 
 // Maximum AXI burst size, also used for page crossing
@@ -166,8 +171,12 @@ void IDmaBeAxi::enqueue_burst(uint64_t base, uint64_t size, bool is_write, IdmaT
         this->current_burst_size = this->pending_bursts.front()->get_size();
     }
 
-    // And trigger the FSM in case it needs to be processed now
-    this->update();
+    // A read burst that finds the channel idle goes out in this cycle (see
+    // IDMA_AXI_ISSUE_SAME_CYCLE above); otherwise the FSM takes it next cycle.
+    if (IDMA_AXI_ISSUE_SAME_CYCLE && !is_write && this->pending_bursts.size() == 1)
+        this->send_read_burst_to_axi();
+    else
+        this->update();
 }
 
 

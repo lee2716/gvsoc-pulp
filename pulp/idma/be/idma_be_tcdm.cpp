@@ -117,6 +117,7 @@ bool IDmaBeTcdm::can_accept_burst()
 bool IDmaBeTcdm::can_accept_data()
 {
     // Accept data if we don't have already a chunk of data being written
+    if (IDMA_TCDM_PIPELINED_WRITES) return this->write_current_chunk_size == 0;
     return this->write_current_chunk_size == 0 && this->write_ack_timestamp == -1;
 }
 
@@ -151,8 +152,11 @@ void IDmaBeTcdm::reset(bool active)
 
         this->write_current_chunk_size = 0;
         this->write_ack_timestamp = -1;
+        while (!this->write_acks.empty()) this->write_acks.pop();
 
         this->last_line_timestamp = -1;
+        this->last_read_timestamp = -1;
+        while (!this->read_lines.empty()) this->read_lines.pop();
     }
 }
 
@@ -164,6 +168,11 @@ void IDmaBeTcdm::write_line()
     // soon as we receive a request, this may happen
     if (this->last_line_timestamp == -1 || this->last_line_timestamp < this->clock.get_cycles())
     {
+        if (IDMA_TCDM_PIPELINED_WRITES)
+        {
+            this->write_line_pipelined();
+            return;
+        }
         this->last_line_timestamp = this->clock.get_cycles();
 
         // Extract one line from current data chunk
@@ -223,6 +232,39 @@ void IDmaBeTcdm::write_line()
 }
 
 
+
+// Pipelined: issue the line, advance the burst now, queue its response; the next line goes
+// next cycle whatever the response does.
+void IDmaBeTcdm::write_line_pipelined()
+{
+    this->last_line_timestamp = this->clock.get_cycles();
+    uint64_t base = this->write_current_chunk_base;
+    uint64_t size = this->get_line_size(base, this->write_current_chunk_size);
+    vp::IoReq *req = &this->req;
+    req->prepare();
+    req->set_is_write(true);
+    req->set_addr(base - this->tcdm_base);
+    req->set_size(size);
+    req->set_data(this->write_current_chunk_data);
+    this->write_current_chunk_base += size;
+    this->write_current_chunk_size -= size;
+    this->write_current_chunk_data += size;
+    vp::IoReqStatus status = this->ico_itf.req(req);
+    if (status == vp::IoReqStatus::IO_REQ_INVALID)
+        trace.force_warning("Invalid access during TCDM write line (base: 0x%lx, size: 0x%lx)\n", base, size);
+    else if (status != vp::IoReqStatus::IO_REQ_OK)
+        trace.fatal("Asynchronous response is not supported on TCDM backend\n");
+    this->remove_chunk_from_current_burst(size);
+    const bool last = this->write_current_chunk_size == 0;
+    PendingAck a = { (int64_t)(this->clock.get_cycles() + req->get_latency()), size,
+                     this->write_current_transfer, this->write_current_chunk_data_start,
+                     this->write_current_chunk_ack_size, last };
+    this->write_acks.push(a);
+    // The rest of the chunk next cycle; the response when due; the middle-end may hand
+    // over the next chunk as soon as this one is fully issued.
+    this->fsm_event.enqueue(1);
+    if (last) this->be->update();
+}
 
 void IDmaBeTcdm::write_handle_req_ack()
 {
@@ -337,6 +379,31 @@ void IDmaBeTcdm::read_line()
 
 
 
+// Pipelined: issue one line, advance the burst now, queue the data with the cycle its
+// response is due; the next line goes next cycle.
+void IDmaBeTcdm::read_line_pipelined()
+{
+    vp::IoReq *req = &this->req;
+    uint64_t base = this->current_burst_base;
+    uint64_t size = this->get_line_size(base, this->current_burst_size);
+    IdmaTransfer *transfer = this->burst_queue_transfer.front();
+    this->last_read_timestamp = this->clock.get_cycles();
+    req->prepare();
+    req->set_is_write(false);
+    req->set_addr(base - this->tcdm_base);
+    req->set_size(size);
+    req->set_data(new uint8_t[size]);
+    vp::IoReqStatus status = this->ico_itf.req(req);
+    if (status == vp::IoReqStatus::IO_REQ_INVALID)
+        trace.force_warning("Invalid access during TCDM read line (base: 0x%lx, size: 0x%lx)\n", base, size);
+    else if (status != vp::IoReqStatus::IO_REQ_OK)
+        trace.fatal("Asynchronous response is not supported on TCDM backend\n");
+    PendingRead r = { (int64_t)(this->clock.get_cycles() + req->get_latency()), size, req->get_data(), transfer };
+    this->read_lines.push(r);
+    this->remove_chunk_from_current_burst(size);
+    this->fsm_event.enqueue(1);
+}
+
 // Called by destination backend to ack the data we sent for writing
 void IDmaBeTcdm::write_data_ack(uint8_t *data)
 {
@@ -353,6 +420,23 @@ void IDmaBeTcdm::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
 {
     IDmaBeTcdm *_this = (IDmaBeTcdm *)__this;
 
+    // Pipelined: retire the responses that are due, in order; a chunk's last one hands the
+    // chunk back to the middle-end.
+    while (IDMA_TCDM_PIPELINED_WRITES && !_this->write_acks.empty())
+    {
+        PendingAck a = _this->write_acks.front();
+        if (a.time > (int64_t)_this->clock.get_cycles())
+        {
+            _this->fsm_event.enqueue(a.time - _this->clock.get_cycles());
+            break;
+        }
+        _this->write_acks.pop();
+        if (a.last)
+        {
+            _this->be->update();
+            _this->be->ack_data(a.transfer, a.data_start, a.ack_size);
+        }
+    }
     // Check if we should acknowledge the previous line, this can happen when the write request
     // got a latency
     if (_this->write_ack_timestamp != -1)
@@ -377,7 +461,30 @@ void IDmaBeTcdm::fsm_handler(vp::Block *__this, vp::ClockEvent *event)
         _this->write_line();
     }
 
-    if (_this->burst_queue_is_write.size() > 0 && !_this->burst_queue_is_write.front())
+    // Pipelined reads: hand over the lines whose response is due, in order, as long as the
+    // destination takes them; then issue the next line if the buffer has room.
+    if (IDMA_TCDM_PIPELINED_READS)
+    {
+        while (!_this->read_lines.empty())
+        {
+            PendingRead r = _this->read_lines.front();
+            if (r.time > (int64_t)_this->clock.get_cycles())
+            {
+                _this->fsm_event.enqueue(r.time - _this->clock.get_cycles());
+                break;
+            }
+            if (!_this->be->is_ready_to_accept_data(r.transfer)) break;
+            _this->read_lines.pop();
+            _this->be->write_data(r.transfer, r.data, r.size);
+        }
+        if (_this->burst_queue_is_write.size() > 0 && !_this->burst_queue_is_write.front()
+            && _this->current_burst_size > 0 && _this->read_lines.size() < IDMA_TCDM_READ_DEPTH
+            && _this->last_read_timestamp < (int64_t)_this->clock.get_cycles())
+        {
+            _this->read_line_pipelined();
+        }
+    }
+    else if (_this->burst_queue_is_write.size() > 0 && !_this->burst_queue_is_write.front())
     {
         // If a read burst is pending, only read new line fi previous one has been sent
         if (_this->current_burst_size > 0 && _this->read_pending_line_size == 0)
@@ -418,5 +525,5 @@ void IDmaBeTcdm::update()
 
 bool IDmaBeTcdm::is_empty()
 {
-    return this->burst_queue_base.empty();
+    return this->burst_queue_base.empty() && this->read_lines.empty();
 }
