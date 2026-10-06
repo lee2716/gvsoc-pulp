@@ -62,9 +62,7 @@ class DemocritosSoc(gvsoc.systree.Component):
         clock.o_CLOCK(self.i_CLOCK())
 
         # Create Tiles. Every tile class exposes the same SoC-facing ports, so
-        # the wiring below does not branch on the type -- with one exception,
-        # the wide NoC port, which the A-tile does not have and which is
-        # therefore wired behind a hasattr guard.
+        # the wiring below does not branch on the type.
         types = DemocritosArch.TILE_TYPES
         if len(types) != DemocritosArch.NB_CLUSTERS:
             raise RuntimeError(
@@ -217,12 +215,9 @@ class DemocritosSoc(gvsoc.systree.Component):
                     print(f"[NoC] Adding cluster {id} at position x={x} y={y}")
                     cluster[id].o_NARROW_OUTPUT(noc.i_NARROW_INPUT(x,y))
                     noc.o_NARROW_MAP(cluster[id].i_NARROW_INPUT(),name=f'tile-{id}-l1-mem',base=DemocritosArch.L1_ADDR_START+(id*DemocritosArch.L1_TILE_OFFSET),size=DemocritosArch.L1_SIZE,x=x,y=y,rm_base=False)
-                    # Wide channel carries the iDMA traffic. Only the tile types
-                    # that expose the port get wired; the tile list is
-                    # heterogeneous and the A-tile has no wide port.
-                    if hasattr(cluster[id], 'o_WIDE_OUTPUT'):
-                        cluster[id].o_WIDE_OUTPUT(noc.i_WIDE_INPUT(x,y))
-                        noc.o_WIDE_MAP(cluster[id].i_WIDE_INPUT(),name=f'wide-tile-{id}-l1-mem',base=DemocritosArch.L1_ADDR_START+(id*DemocritosArch.L1_TILE_OFFSET),size=DemocritosArch.L1_SIZE,x=x,y=y,rm_base=False)
+                    # Wide channel carries the iDMA traffic.
+                    cluster[id].o_WIDE_OUTPUT(noc.i_WIDE_INPUT(x,y))
+                    noc.o_WIDE_MAP(cluster[id].i_WIDE_INPUT(),name=f'wide-tile-{id}-l1-mem',base=DemocritosArch.L1_ADDR_START+(id*DemocritosArch.L1_TILE_OFFSET),size=DemocritosArch.L1_SIZE,x=x,y=y,rm_base=False)
                     id += 1
 
             # Bind memory to noc

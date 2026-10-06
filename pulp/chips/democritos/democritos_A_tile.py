@@ -51,8 +51,8 @@ class Democritos_A_TileTcdm(gvsoc.systree.Component):
         L1_masters = 3
         interleaver = L1_interleaver(self, 'interleaver', nb_slaves=nb_banks, nb_masters=L1_masters, interleaving_bits=2)
 
-        # 3 masters: OBI
-        dma_masters = 1
+        # 4 masters: OBI, iDMA0, iDMA1, wide NoC input
+        dma_masters = 4
         dma_interleaver = DmaInterleaver(self, 'dma_interleaver', nb_master_ports=dma_masters, nb_banks=nb_banks, bank_width=4)
 
         # 1 master: PCM HWPE
@@ -62,7 +62,7 @@ class Democritos_A_TileTcdm(gvsoc.systree.Component):
         banks = []
         for i in range(nb_banks):
             # Instantiate a new memory bank
-            bank = memory.Memory(self, f'bank_{i}', size=bank_size, latency=1)
+            bank = memory.Memory(self, f'bank_{i}', size=bank_size, latency=1, truncate_size=bank_size)
             banks.append(bank)
 
             # Bind the new bank (slave) to the interleaver (master)
@@ -112,8 +112,8 @@ class Democritos_A_Tile(gvsoc.systree.Component):
         idma_mm_ctrl= iDMA_mm_ctrl(self,f'tile-{tid}-idma-ctrl-mm')
 
         # iDMA
-        idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
-        idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=(tid*DemocritosArch.L1_TILE_OFFSET),loc_size=DemocritosArch.L1_SIZE,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
+        idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=DemocritosArch.L1_ADDR_START,loc_size=DemocritosArch.L1_SIZE,tcdm_base=0,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
+        idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=DemocritosArch.L1_ADDR_START,loc_size=DemocritosArch.L1_SIZE,tcdm_base=0,tcdm_width=32,transfer_queue_size=1,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
 
         # PCM HWPE
         mvm_latency_ns = 300 # MVM latency in ns
@@ -185,6 +185,11 @@ class Democritos_A_Tile(gvsoc.systree.Component):
                        base=DemocritosArch.L1_ADDR_START,
                        size=DemocritosArch.L1_SIZE, rm_base=False, remove_offset=(tid*DemocritosArch.L1_TILE_OFFSET))
 
+        # The same L1 at this tile's global window, reached from the NoC through the tile Xbar.
+        obi_xbar.o_MAP(l1_tcdm.i_DMA_INPUT(0), name='global-l1-mem',
+                       base=DemocritosArch.L1_ADDR_START + (tid*DemocritosArch.L1_TILE_OFFSET),
+                       size=DemocritosArch.L1_SIZE, rm_base=False, remove_offset=(tid*DemocritosArch.L1_TILE_OFFSET))
+
         # Bind OBI Xbar so that it can communicate with the tile Xbar to get access to remote tiles L1
         for tile_id in range(DemocritosArch.NB_CLUSTERS):
             if tile_id != tid: # skip yourself
@@ -192,9 +197,16 @@ class Democritos_A_Tile(gvsoc.systree.Component):
                                base=DemocritosArch.L1_ADDR_START + (tile_id*DemocritosArch.L1_TILE_OFFSET),
                                size=DemocritosArch.L1_SIZE, rm_base=False)
         
+        # Bind tile Xbar so that it can reach the remote tiles' L1 over the NoC
+        for tile_id in range(DemocritosArch.NB_CLUSTERS):
+            if tile_id != tid: # skip yourself
+                tile_xbar.o_MAP(self.__i_NARROW_OUTPUT(), name=f'axi-to-off-tile-{tile_id}-l1-mem',
+                                base=DemocritosArch.L1_ADDR_START + (tile_id*DemocritosArch.L1_TILE_OFFSET),
+                                size=DemocritosArch.L1_SIZE, rm_base=False)
+
         # Bind tile Xbar so that it can communicate with OBI Xbar L1 mem
         tile_xbar.o_MAP(obi_xbar.i_INPUT(), name='axi2obi-l1-mem',
-                        base=DemocritosArch.L1_ADDR_START + (tile_id*DemocritosArch.L1_TILE_OFFSET),
+                        base=DemocritosArch.L1_ADDR_START + (tid*DemocritosArch.L1_TILE_OFFSET),
                         size=DemocritosArch.L1_SIZE, rm_base=False)
 
         # Bind tile Xbar so that it can communicate with OBI Xbar reserved mem
@@ -230,6 +242,9 @@ class Democritos_A_Tile(gvsoc.systree.Component):
 
         self.__o_NARROW_INPUT(tile_xbar.i_INPUT())
 
+        # Wide channel inbound: a remote DMA writing this tile's L1 lands on the DmaInterleaver.
+        self.__o_WIDE_INPUT(l1_tcdm.i_DMA_INPUT(3))
+
         # Bind CV32 core enable prots -> matching composite ports
         self.__o_ENTRY(core_cv32.i_ENTRY())
         self.__o_FETCHEN(core_cv32.i_FETCHEN())
@@ -257,14 +272,15 @@ class Democritos_A_Tile(gvsoc.systree.Component):
         self.bind(idma_mm_ctrl, 'idma1_done_irq', event_unit, 'in_event_3_pe_0')
 
         # Bind iDMA0
-        idma0.o_AXI(tile_xbar.i_INPUT())
-        idma0.o_TCDM(l1_tcdm.i_INPUT(1)) # here we don't use the iDMA interleaver because here iDMA is directly connected to TCDM and iDMA has it's own interleaver for TCDM access (in iDMA-BE)
+        # Both iDMAs leave through the wide port.
+        idma0.o_AXI(self.__i_WIDE_OUTPUT())
+        idma0.o_TCDM(l1_tcdm.i_DMA_INPUT(1))
         idma_mm_ctrl.o_OFFLOAD_iDMA0_AXI2OBI(idma0.i_OFFLOAD())
         idma0.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA0_AXI2OBI())
 
         # Bind iDMA1
-        idma1.o_AXI(tile_xbar.i_INPUT())
-        idma1.o_TCDM(l1_tcdm.i_INPUT(2)) # here we don't use the iDMA interleaver because here iDMA is directly connected to TCDM and iDMA has it's own interleaver for TCDM access (in iDMA-BE)
+        idma1.o_AXI(self.__i_WIDE_OUTPUT())
+        idma1.o_TCDM(l1_tcdm.i_DMA_INPUT(2))
         idma_mm_ctrl.o_OFFLOAD_iDMA1_OBI2AXI(idma1.i_OFFLOAD())
         idma1.o_OFFLOAD_GRANT(idma_mm_ctrl.i_OFFLOAD_GRANT_iDMA1_OBI2AXI())
 
@@ -370,6 +386,19 @@ class Democritos_A_Tile(gvsoc.systree.Component):
 
     def __o_ENTRY(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('entry', itf, signature='wire<uint64_t>', composite_bind=True)
+
+    # Wide port to the NoC. Carries DMA traffic only; core accesses keep using the narrow port.
+    def o_WIDE_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('wide_output', itf, signature='io')
+
+    def __i_WIDE_OUTPUT(self) -> gvsoc.systree.SlaveItf:
+        return gvsoc.systree.SlaveItf(self, 'wide_output', signature='io')
+
+    def i_WIDE_INPUT(self) -> gvsoc.systree.SlaveItf:
+        return gvsoc.systree.SlaveItf(self, 'wide_input', signature='io')
+
+    def __o_WIDE_INPUT(self, itf: gvsoc.systree.SlaveItf):
+        self.itf_bind('wide_input', itf, signature='io', composite_bind=True)
 
     # Killer port
     def o_KILLER_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
