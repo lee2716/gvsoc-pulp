@@ -52,6 +52,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
         blk.retired.resize(this->num_macros);
         blk.out_fifo.resize(this->num_macros);
         blk.out_results.assign(this->num_macros, 0);
+        blk.out_results_next.assign(this->num_macros, 0);
         for (uint32_t m = 0; m < this->num_macros; m++) {
             blk.weight_stream.emplace_back(this, false);
             blk.input_stream .emplace_back(this, false);
@@ -181,6 +182,9 @@ void Dimc_HWPE::clear_engine()
         for (Dimc_InnerBlock::Retired &r : blk.retired) r = Dimc_InnerBlock::Retired();
         blk.reset_all();
         for (auto &q : blk.out_fifo) q.clear();
+        for (uint32_t &n : blk.out_results_next) n = 0;
+        blk.store_next_beats = 0;
+        while (!blk.store_next_pending.empty()) blk.store_next_pending.pop();
     }
     this->job_running   = false;
     this->acquired_ctx  = -1;

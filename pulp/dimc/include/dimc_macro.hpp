@@ -45,7 +45,10 @@
 // A macro holding the next job's operands issues that job's rows before the running job
 // closes. Their results wait in its out_fifo until the write-back reaches that job, and it
 // issues only while out_fifo plus pipe stay below its out_fifo's depth, since a full out_fifo
-// drops results. A macro is at most one job ahead of the running one.
+// drops results. A macro is at most one job ahead of the running one. A macro that has written
+// back every result of the running job writes its next job's results to that job's destination
+// at once (a second address generator per macro, on the next job's context), so its out_fifo
+// drains before the running job closes.
 // While the engine is idle with committed jobs held (commit-only), each dual fetches the first
 // held job's kernel for its first macro into the weight FIFO; it is written into the macro
 // once the job runs. Features and partial sums are fetched once the job starts.
@@ -73,6 +76,12 @@
 // Shared input FIFO: rows a feature section may be fetched ahead of the triggers it waits for.
 #ifndef DIMC_INP_FETCH_LEAD
 #define DIMC_INP_FETCH_LEAD 32
+#endif
+// 1: one macro of a dual computes at a time, as in the RTL (one out_fifo behind the `sel` mux).
+// A macro starts a job once the dual's other macros have triggered every row of the earlier
+// jobs and of a job they have started, and their pipes are empty. 0: no such wait.
+#ifndef DIMC_ONE_COMPUTE_PER_BLOCK
+#define DIMC_ONE_COMPUTE_PER_BLOCK 0
 #endif
 // Kernel and feature storage is single-banked, as in the macro: spatz_dimc.sv
 // declares one kernel_mem [31:0] and one feature_buf, and the two low bits of
@@ -180,6 +189,8 @@ class Dimc_Macro {
         // dual's FIFOs into this macro, and its context.
         uint32_t write_job = JOB_NONE;
         uint32_t write_slot = 0;
+        // Contexts of filled_job and issue_job.
+        uint32_t filled_slot = 0, issue_slot = 0;
         // Sections written for write_job.
         uint32_t written = 0;
         // Kernel being fetched into the weight FIFO, by the program or ahead of it: job kpf_job,

@@ -203,6 +203,11 @@ class Dimc_InnerBlock {
         struct OutEntry { int32_t psout; uint16_t row; uint16_t run; };
         std::vector<std::deque<OutEntry>> out_fifo;
         std::vector<uint32_t> out_results;
+        // The next job's results that already left, per macro, their port words and their
+        // acknowledgements; taken over when that job starts.
+        std::vector<uint32_t> out_results_next;
+        uint32_t store_next_beats = 0;
+        std::queue<uint64_t> store_next_pending;
         // Write-back position per macro: a macro's runs leave in vector order, and a run
         // counts once its last beat is acknowledged.
         struct RunDone { uint64_t due; uint32_t job, macro, run; };
@@ -387,19 +392,21 @@ class Dimc_HWPE : public vp::Component {
                               std::deque<Dimc_InnerBlock::FeedEntry> &fifo,
                               std::queue<uint64_t> &pending, uint8_t kind);
         uint32_t kernel_in_progress(const Dimc_InnerBlock &blk) const;
+        bool     kernels_fetched_before(Dimc_InnerBlock &blk, uint32_t job);
         void     fill_beat(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro);
 
         void fetch_kernels_first();
         uint32_t rows_before_feature(const Dimc_Macro &mc, uint32_t job, uint32_t run) const;
+        uint32_t rows_before_turn(const Dimc_InnerBlock &blk, uint32_t m, uint32_t job) const;
         bool input_urgent() const;
         // Latch one context's job shape into its geometry slot.
         void latch_geom(int ctx);
         void ensure_geom(int ctx);
         uint32_t job_reg_ctx(int ctx, uint32_t addr) const;
-        // Move retired rows into the out_fifos, then trigger every macro whose operands have landed.
+        // Move retired rows into the out_fifos, then trigger the macros whose operands have landed.
         void compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id);
         void store_block(Dimc_InnerBlock &blk, uint32_t blk_id);
-        int  store_word(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m);
+        int  store_word(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, bool next);
 
         // One cycle per fsm_event. An L1 access records when its response is due; each cycle
         // retires the ones that came back. outstanding_depth caps the requests in flight.
