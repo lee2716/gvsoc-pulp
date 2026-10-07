@@ -283,8 +283,7 @@ bool Dimc_HWPE::tile_computed(const Dimc_InnerBlock &blk) const
     const JobGeom &g = this->job_geom[this->exec_slot];
     const uint32_t s = this->running_job & 1;
     const Dimc_Macro &mac = blk.macros[this->job_macro(this->running_job)];
-    return mac.set_job[s] == this->running_job
-        && mac.rows_retired_set[s] >= g.nb_vec * g.row_count && blk.out_fifo.empty();
+    return mac.set_job[s] == this->running_job && blk.acc_results[s] >= g.nb_vec * g.row_count;
 }
 
 bool Dimc_HWPE::rows_done() const
@@ -568,7 +567,7 @@ uint32_t Dimc_HWPE::rows_before_turn(const Dimc_InnerBlock &blk, uint32_t m, uin
 {
     const Dimc_Macro &mc = blk.macros[m];
     if (mc.issue_job == job && (mc.rows_issued || mc.runs_issued)) return 0;
-    uint32_t rows = (uint32_t)blk.out_fifo.size();
+    uint32_t rows = DIMC_SWITCH_GAP ? (uint32_t)blk.out_fifo.size() : 0;
     for (uint32_t s = 0; s < blk.macros.size(); s++) {
         if (s == m) continue;
         const Dimc_Macro &sc = blk.macros[s];
@@ -590,7 +589,9 @@ uint32_t Dimc_HWPE::rows_before_turn(const Dimc_InnerBlock &blk, uint32_t m, uin
         } else if (owed > 0) {
             return 0xFFFFFFFFu;
         }
-        rows += (uint32_t)sc.pipe.size();
+        if (DIMC_SWITCH_GAP) rows += (uint32_t)sc.pipe.size();
+        // One trigger per dual per cycle.
+        else if (sc.last_trigger_cycle == (int64_t)this->fsm_timestamp) rows++;
     }
     return rows;
 }
@@ -603,6 +604,7 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
     if (!blk.out_fifo.empty()) {
         const Dimc_InnerBlock::OutEntry &e = blk.out_fifo.front();
         blk.acc[e.run * DIMC_MACRO_KB_LEN + e.row] += e.psout;
+        blk.acc_results[e.set]++;
         blk.out_fifo.pop_front();
         blk.last_acc_cycle = (int64_t)this->fsm_timestamp;
     }
@@ -618,7 +620,7 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
                                           m, e.job_row);
             continue;
         }
-        blk.out_fifo.push_back({e.psout, (uint16_t)e.job_row, (uint16_t)e.run});
+        blk.out_fifo.push_back({e.psout, (uint16_t)e.job_row, (uint16_t)e.run, (uint8_t)e.set});
     }
 
     // A macro holding the next job's operands starts it when its turn comes, before the
@@ -637,13 +639,15 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
                 mac.runs_issued = 0;
                 mac.set_job[s] = jj;
                 mac.rows_retired_set[s] = 0;
+                blk.acc_results[s] = 0;
             }
             const uint32_t b = mac.runs_issued;   // the vector it issues next
             // A job starts once all its vectors are fetched and the macros have switched.
             const bool starting = !mac.rows_issued && !mac.runs_issued;
             const bool loaded = !(mac.fill_job == jj && blk.fill.macro_beat_index[m] < blk.fill.macro_beat_total[m]);
             if (b < mac.job_nb_vec && mac.fb_run == b
-                && (!starting || (loaded && (int64_t)this->fsm_timestamp >= blk.last_acc_cycle + DIMC_SWITCH_CYCLES
+                && (!starting || (loaded && (!DIMC_SWITCH_GAP
+                                             || (int64_t)this->fsm_timestamp >= blk.last_acc_cycle + DIMC_SWITCH_CYCLES)
                                   && (int64_t)this->fsm_timestamp >= blk.present_ack_cycle + DIMC_PRESENT_END_CYCLES))
                 && !this->rows_before_turn(blk, m, jj)
                 && this->fsm_timestamp >= mac.fb_ready_cycle

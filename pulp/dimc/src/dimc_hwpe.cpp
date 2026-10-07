@@ -150,6 +150,7 @@ void Dimc_HWPE::clear_engine()
         blk.reset_all();
         blk.out_fifo.clear();
         blk.last_acc_cycle = -1000;
+        blk.acc_results[0] = blk.acc_results[1] = 0;
         blk.present_ack_cycle = -1000;
         for (int32_t &a : blk.acc) a = 0;
     }

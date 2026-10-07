@@ -67,6 +67,12 @@
 // Cycles the dual takes to switch macros after the last result of a job is accumulated: the
 // result count is compared a cycle later, then one cycle swaps the macros (dimc_datapath.sv).
 #define DIMC_SWITCH_CYCLES 2
+// 1: the macros switch as in dimc_datapath.sv, after the last result of a tile product is
+// accumulated. 0: the other macro triggers the cycle after the last trigger, and the out_fifo
+// takes each macro's results as they leave its pipe (`sel` follows the pipeline).
+#ifndef DIMC_SWITCH_GAP
+#define DIMC_SWITCH_GAP 1
+#endif
 // Kernel and feature storage is single-banked, as in the macro: spatz_dimc.sv
 // declares one kernel_mem [31:0] and one feature_buf, and the two low bits of
 // RA/WA/FA select one of a row's four 256-bit sections rather than a bank. A

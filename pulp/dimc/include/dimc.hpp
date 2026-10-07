@@ -163,10 +163,11 @@ class Dimc_InnerBlock {
         std::deque<FeedEntry> inp_fifo;
         // The dual's out_fifo: results of the computing macro in push order, one popped per
         // cycle into acc[run * DIMC_MACRO_KB_LEN + row].
-        struct OutEntry { int32_t psout; uint16_t row; uint16_t run; };
+        struct OutEntry { int32_t psout; uint16_t row; uint16_t run; uint8_t set; };
         std::deque<OutEntry> out_fifo;
         int32_t  acc[DIMC_ACC_VECTORS * DIMC_MACRO_KB_LEN] = {0};
         int64_t  last_acc_cycle = -1000;   // cycle of the last result accumulated
+        uint32_t acc_results[2] = {0, 0};  // results accumulated per result set (job id & 1)
         int64_t  present_ack_cycle = -1000; // cycle the last output word was acknowledged
         // The input tile being read: 128 rows of 8 bytes, one row per port beat, which the
         // streamer transposes into the job's 8 vectors (dimc_streamer.sv, input_tile_q).
