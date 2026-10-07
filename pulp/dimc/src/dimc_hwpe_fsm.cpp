@@ -181,8 +181,8 @@ void Dimc_HWPE::plan_macro_fill(uint32_t blk_id, uint32_t m, int ctx)
     this->configure_macro_streams(blk_id, m, ctx, 0, !kernel_ahead, true);
 }
 
-// Why a new request is refused now: the outstanding depth, else the outer port; 0 if neither.
-uint8_t Dimc_HWPE::refusal(const std::queue<uint64_t> &pending, const Dimc_OuterPort &port) const
+// Why a new request is refused now: the outstanding depth, else the port; 0 if neither.
+uint8_t Dimc_HWPE::refusal(const std::queue<uint64_t> &pending, const Dimc_Port &port) const
 {
     if (pending.size() >= this->outstanding_depth) return DIMC_WHY_WAIT_DEPTH;
     if (port.busy_until() > (int64_t)this->fsm_timestamp) return DIMC_WHY_WAIT_OUTER_PORT;
@@ -199,12 +199,6 @@ static inline void retire_due(std::queue<uint64_t> &q, uint64_t now)
 static inline bool block_stored(const Dimc_InnerBlock &blk)
 {
     return blk.store.beat_index >= blk.store.beat_total && blk.store_pending.empty();
-}
-
-// Blocks book the shared outer port in turn: the first one served rotates every cycle.
-uint32_t Dimc_HWPE::block_order(uint32_t i) const
-{
-    return (uint32_t)((i + this->fsm_timestamp) % this->inner_blocks.size());
 }
 
 // Drop the responses that are due, fill and store.
@@ -286,21 +280,13 @@ void Dimc_HWPE::engine_cycle(uint32_t phase)
     const bool job_open = phase != DIMC_IDLE;
     const bool storing  = phase == DIMC_STORING;
 
-    // Each macro follows its own fill program, which may be for the job after the running
-    // one. Every request books a whole outer-port word, so at most one fetch request per cycle
-    // goes out across all blocks; block_order rotates which block asks first.
-    this->fetch_kernels_first();
-    for (uint32_t i = 0; i < this->inner_blocks.size(); i++) {
-        const uint32_t b = this->block_order(i);
+    for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         Dimc_InnerBlock &blk = this->inner_blocks[b];
-        // One fetch per feed into the dual's FIFOs, which see the FIFOs before this cycle's
-        // pops; one pop per FIFO into the macros, before the triggers, so no section enters a
-        // macro in a cycle in which it computes; the macros' rows; then the write-back.
-        if (blk.fill.owed())
-            this->fill_feed(blk, b, false);   // feature vectors
-        if (!blk.kb_fed_first)
-            this->fill_feed(blk, b, true);    // kernel rows
-        blk.kb_fed_first = false;
+        // One fetch per feed, seeing the FIFOs before this cycle's pops; one pop per FIFO
+        // into the macros, before the triggers, so no section enters a macro in a cycle in
+        // which it computes; the macros' rows; then the write-back.
+        this->fill_feed(blk, b, false);   // feature vectors
+        this->fill_feed(blk, b, true);    // kernel rows
         this->write_feed(blk, b, blk.inp_fifo);
         this->write_feed(blk, b, blk.wgt_fifo);
         this->compute_indep(blk, b);
@@ -349,45 +335,6 @@ uint32_t Dimc_HWPE::rows_before_feature(const Dimc_Macro &mc, uint32_t job, uint
     if (mc.runs_issued >= target) return 0;
     const uint32_t cur = mc.rows_issued < mc.job_rows ? mc.rows_issued : 0;
     return (target - mc.runs_issued) * mc.job_rows - cur;
-}
-
-// DIMC_KB_FEED_YIELD: a macro whose next feature section is for a vector it may start within
-// that many rows.
-bool Dimc_HWPE::input_urgent() const
-{
-    for (const Dimc_InnerBlock &blk : this->inner_blocks) {
-        for (uint32_t m = 0; m < blk.macros.size(); m++) {
-            BeatPos pos;
-            if (!this->program_next(blk, m, pos) || pos.kind == DIMC_LOAD_KB) continue;
-            const Dimc_Macro &t = blk.macros[m];
-            if (this->rows_before_feature(t, t.fill_job, pos.run) <= DIMC_KB_FEED_YIELD) return true;
-        }
-    }
-    return false;
-}
-
-// DIMC_KB_FEED_FIRST: the kernel feed of each dual about to run out of the kernel being
-// written, before the block loop books any input; with DIMC_KB_FEED_YIELD, not while a
-// macro is about to wait for its inputs.
-void Dimc_HWPE::fetch_kernels_first()
-{
-    if (!DIMC_KB_FEED_FIRST) return;
-    if (DIMC_KB_FEED_YIELD && this->input_urgent()) return;
-    for (uint32_t i = 0; i < this->inner_blocks.size(); i++) {
-        const uint32_t b = this->block_order(i);
-        Dimc_InnerBlock &blk = this->inner_blocks[b];
-        for (uint32_t m = 0; m < blk.macros.size(); m++) {
-            const Dimc_Macro &t = blk.macros[m];
-            if (t.write_job == Dimc_Macro::JOB_NONE || t.stamped) continue;
-            if (t.kw == 0 || t.kw >= this->job_geom[t.write_slot].kb_sections()) continue;
-            uint32_t n = 0;
-            for (const Dimc_InnerBlock::FeedEntry &q : blk.wgt_fifo) if (q.macro == m) n++;
-            if (n > DIMC_KB_FEED_FIRST) continue;
-            this->fill_feed(blk, b, true);
-            blk.kb_fed_first = true;
-            break;
-        }
-    }
 }
 
 // May this section be written into the macro now? Triggering shuts the kernel write port, and
@@ -481,9 +428,8 @@ uint32_t Dimc_HWPE::pick_input(const Dimc_InnerBlock &blk, uint8_t &why) const
     return pick;
 }
 
-// One section of a feed per cycle, from L1 into the dual's FIFO, for the macro the feed's
-// picker selects. A request needs the outstanding depth and the outer port; the kept second
-// section of a port word needs neither.
+// One section of a feed, from L1 into the dual's FIFO, for the macro the feed's picker selects.
+// A request needs the outstanding depth and the feed's port.
 void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id, bool kernel_feed)
 {
     Dimc_InnerBlock::FillCursor &cursor = blk.fill;
@@ -512,11 +458,8 @@ void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id, bool kernel_fee
         if (why) this->tracer.fill_skip(blk_id, why);
         return;
     }
-    BeatPos pos;
-    this->program_next(blk, macro, pos);
-    const Dimc_HWPE_Streamer &st = pos.kind == DIMC_LOAD_KB ? blk.weight_stream[macro] : blk.input_stream[macro];
-    why = st.pair_ready() ? 0 : this->refusal(kernel_feed ? blk.kb_pending : blk.in_pending,
-                                              this->outer_port_in);
+    why = kernel_feed ? this->refusal(blk.kb_pending, blk.kernel_port)
+                      : this->refusal(blk.in_pending, blk.input_port);
     if (why) {
         this->tracer.feed_skip(blk_id, kernel_feed, why);
         return;
@@ -540,7 +483,7 @@ uint32_t Dimc_HWPE::kernel_in_progress(const Dimc_InnerBlock &blk) const
 }
 
 // Fetch the next kernel section of the held job in context ctx for macro m, before its fill
-// program starts. False when the outstanding depth or the outer port refuses the request.
+// program starts. False when the outstanding depth or the kernel port refuses the request.
 bool Dimc_HWPE::fetch_kernel_ahead(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, int ctx)
 {
     Dimc_Macro &fm = blk.macros[m];
@@ -549,8 +492,7 @@ bool Dimc_HWPE::fetch_kernel_ahead(Dimc_InnerBlock &blk, uint32_t blk_id, uint32
         fm.kpf_job = job; fm.kpf_slot = (uint32_t)ctx; fm.kfetched = 0;
         this->configure_macro_streams(blk_id, m, ctx, 0, true, false);
     }
-    if (!blk.weight_stream[m].pair_ready() && this->refusal(blk.kb_pending, this->outer_port_in))
-        return false;
+    if (this->refusal(blk.kb_pending, blk.kernel_port)) return false;
     this->fetch_kernel_section(blk, blk_id, m, ctx, job, fm.kfetched);
     return true;
 }
@@ -570,21 +512,21 @@ void Dimc_HWPE::fetch_kernel_section(Dimc_InnerBlock &blk, uint32_t blk_id, uint
     blk.macros[m].kfetched++;
 }
 
-// Issue section e from streamer st and queue it in fifo, landed the cycle after its
-// response (fifo_v3, not fall-through). A request books the outer port and `pending`.
+// Issue section e from streamer st on its feed's port and queue it in fifo, landed the cycle
+// after its last byte's response (fifo_v3, not fall-through).
 void Dimc_HWPE::push_section(Dimc_InnerBlock &blk, uint32_t blk_id, Dimc_HWPE_Streamer &st,
                              Dimc_InnerBlock::FeedEntry &e,
                              std::deque<Dimc_InnerBlock::FeedEntry> &fifo,
                              std::queue<uint64_t> &pending, uint8_t kind)
 {
+    Dimc_Port &port = kind == DIMC_LOAD_KB ? blk.kernel_port : blk.input_port;
     int lat = st.issue_beat((int)e.bytes, e.data);
-    const bool requested = lat != Dimc_HWPE_Streamer::NO_REQUEST;
-    if (lat < 1) lat = requested ? 1 : 0;
-    e.ready = this->fsm_timestamp + (uint64_t)lat + 1;
+    if (lat < 1) lat = 1;
+    port.request((int64_t)this->fsm_timestamp, this->inner_port_bytes);
+    // The section has crossed the port when the port is free again.
+    const uint64_t due = (uint64_t)port.busy_until() - 1 + (uint64_t)lat;
+    e.ready = due + 1;
     fifo.push_back(e);
-    if (!requested) return;
-    const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
-    this->outer_port_in.request((int64_t)this->fsm_timestamp, this->outer_port_bytes);
     this->tracer.outer_port_booked(blk_id, kind);
     pending.push(due);
     blk.port_pending.push(due);
@@ -837,14 +779,14 @@ void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
 }
 
 // Write the next row of the dual's accumulators, one result per vector in one port word. 0: the
-// outstanding depth or the outer port refused it; 1: written. The accumulators clear with
+// outstanding depth or the output port refused it; 1: written. The accumulators clear with
 // the last row.
 int Dimc_HWPE::store_word(Dimc_InnerBlock &blk, uint32_t blk_id)
 {
     const uint32_t ctx = this->exec_slot;
     const JobGeom &g   = this->job_geom[ctx];
     uint32_t &row      = blk.out_written;
-    if (const uint8_t why = this->refusal(blk.store_pending, this->outer_port_out)) {
+    if (const uint8_t why = this->refusal(blk.store_pending, blk.output_port)) {
         this->tracer.store_skip(blk_id, why);
         return 0;
     }
@@ -858,7 +800,7 @@ int Dimc_HWPE::store_word(Dimc_InnerBlock &blk, uint32_t blk_id)
     const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
     blk.port_pending.push(due);
     blk.store_pending.push(due);
-    this->outer_port_out.request((int64_t)this->fsm_timestamp, this->outer_port_bytes);
+    blk.output_port.request((int64_t)this->fsm_timestamp, DIMC_OUTPUT_PORT_BYTES);
     this->tracer.outer_port_booked(blk_id, DIMC_PORT_WB);
     row++;
     blk.store.beat_index++;

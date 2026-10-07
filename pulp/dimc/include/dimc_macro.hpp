@@ -30,7 +30,7 @@
 // The dual's out_fifo is not fall-through: a result pushed in the cycle READYN goes low
 // can be popped one cycle later.
 #define DIMC_OUT_FIFO_DELAY 1
-// Bytes one 32-bit result occupies in L1: packed, 8 results per 32 B port word.
+// Bytes one 32-bit result occupies in L1: packed, 8 results per 256-bit port word.
 #define DIMC_OUT_SLOT_BYTES 4
 // The dual's out_fifo (64 x 32 b): results of the macro that computes, popped one per cycle
 // into the dual's accumulators.
@@ -54,17 +54,11 @@
 // macro cannot take yet holds the ones behind it.
 #define DIMC_WGT_FIFO_DEPTH 128
 #define DIMC_INP_FIFO_DEPTH 8
-// N > 0: a dual whose weight FIFO holds at most N sections of the macro whose kernel is
-// being written books the outer port for its kernel feed before any dual's input feed; the
-// other duals, and every dual otherwise, book input then kernel. 0: always input then kernel.
-#ifndef DIMC_KB_FEED_FIRST
-#define DIMC_KB_FEED_FIRST 2
-#endif
-// N > 0: DIMC_KB_FEED_FIRST yields in a cycle where some macro's next input section is for
-// a vector it may start within N rows (the macro waits, or is about to wait, for its inputs).
-#ifndef DIMC_KB_FEED_YIELD
-#define DIMC_KB_FEED_YIELD 6
-#endif
+// Each dual's three ports to L1, bytes per cycle, as dimc_top.sv: features, kernel, results.
+// A feature section is one L1 request that holds the input port for 4 cycles.
+#define DIMC_INPUT_PORT_BYTES  8
+#define DIMC_KERNEL_PORT_BYTES 32
+#define DIMC_OUTPUT_PORT_BYTES 32
 // Shared input FIFO: rows a feature section may be fetched ahead of the triggers it waits for.
 #ifndef DIMC_INP_FETCH_LEAD
 #define DIMC_INP_FETCH_LEAD 32

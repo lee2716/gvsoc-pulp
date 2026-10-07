@@ -130,20 +130,13 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=DemocritosArch.L1_ADDR_START,loc_size=DemocritosArch.L1_SIZE,tcdm_base=0,tcdm_width=32,transfer_queue_size=DemocritosDSE.TILE_IDMA0_JOBFIFO_SIZE,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
         idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=DemocritosArch.L1_ADDR_START,loc_size=DemocritosArch.L1_SIZE,tcdm_base=0,tcdm_width=32,transfer_queue_size=DemocritosDSE.TILE_IDMA1_JOBFIFO_SIZE,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
 
-        # DIMC HWPE. One outer block = 2 inner blocks x 2 macros = 4 macros.
-        # The macros of a block share one inner port and double-buffer against
-        # each other; the rest of the architecture is fixed in Dimc().
+        # DIMC HWPE: 2 inner blocks x 2 macros. Each inner block has its own ports to L1
+        # (features 64 bit, kernel 256 bit, results 256 bit); the banks above serialise
+        # same-cycle accesses to one bank.
         dimc = Dimc(self, 'dimc',
-                    macros_per_block  = 2,    # macros sharing one inner port
-                    nb_inner_blocks   = 2,    # 2 blocks x 2 macros = 4 macros
-                    # Two port widths, and every STARTING and STORING beat count
-                    # is derived from them: an inner block reaches memory at
-                    # 32 B/cycle (256 bit), and both blocks' beats pass through one
-                    # shared 512-bit outer port per direction, the D-tile's DIMC-to-L1
-                    # port, one 64 B address per cycle. The banks above serialise
-                    # same-cycle accesses to one bank.
-                    inner_port_bytes  = 32,
-                    outer_port_bytes  = 64)
+                    macros_per_block  = 2,
+                    nb_inner_blocks   = 2,
+                    inner_port_bytes  = 32)   # one 256-bit section
         self.dimc = dimc
 
         # Event unit (mirrors pulp/chips/magia_v2/tile.py). The address window is

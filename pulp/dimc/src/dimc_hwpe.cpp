@@ -32,7 +32,6 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     // Architecture, from the systree. Dimc() in dimc.py writes every property.
     this->num_macros        = (uint32_t)this->get_js_config()->get_child_int("num_macros");
     this->inner_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("inner_port_bytes");
-    this->outer_port_bytes  = (uint32_t)this->get_js_config()->get_child_int("outer_port_bytes");
     this->nb_inner_blocks   = (uint32_t)this->get_js_config()->get_child_int("nb_inner_blocks");
     // HWPE slave port
     this->hwpe_slv.set_req_meth(&Dimc_HWPE::hwpe_slave);
@@ -54,6 +53,9 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
             blk.input_stream .emplace_back(this, false);
         }
         blk.out_stream.emplace_back(this, true);
+        blk.input_port.configure(DIMC_INPUT_PORT_BYTES);
+        blk.kernel_port.configure(DIMC_KERNEL_PORT_BYTES);
+        blk.output_port.configure(DIMC_OUTPUT_PORT_BYTES);
         blk.reset_all();
     }
 
@@ -92,12 +94,10 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     this->fill_active = false;
     this->state.set(DIMC_IDLE);
 
-    this->outer_port_in.configure(this->outer_port_bytes);
-    this->outer_port_out.configure(this->outer_port_bytes);
 
     this->trace.msg(vp::TraceLevel::WARNING,
-        "DIMC systree config: num_macros=%u inner_bw=%u outer_bw=%u nb_blocks=%u blocks=%u\n",
-        this->num_macros, this->inner_port_bytes, this->outer_port_bytes,
+        "DIMC systree config: num_macros=%u section_bytes=%u nb_blocks=%u blocks=%u\n",
+        this->num_macros, this->inner_port_bytes,
         this->nb_inner_blocks, (uint32_t)this->inner_blocks.size());
 }
 
@@ -108,15 +108,13 @@ void Dimc_HWPE::reset(bool active)
         // substitute a default, which would run a different machine silently.
         // trace_file is only valid once the trace engine has started, so this
         // check cannot live in the constructor.
-        if (this->num_macros == 0 || this->inner_port_bytes == 0 ||
-            this->outer_port_bytes == 0 || this->nb_inner_blocks == 0) {
+        if (this->num_macros == 0 || this->inner_port_bytes == 0 || this->nb_inner_blocks == 0) {
             // trace.fatal ends in abort(), which does not flush stdio, so its message
             // is lost when the trace goes to a pipe; stderr is unbuffered.
             fprintf(stderr,
                     "DIMC systree incomplete: num_macros=%u inner_port_bytes=%u "
-                    "outer_port_bytes=%u nb_inner_blocks=%u (all must be non-zero)\n",
-                    this->num_macros, this->inner_port_bytes,
-                    this->outer_port_bytes, this->nb_inner_blocks);
+                    "nb_inner_blocks=%u (all must be non-zero)\n",
+                    this->num_macros, this->inner_port_bytes, this->nb_inner_blocks);
             this->trace.fatal("DIMC systree incomplete\n");
         }
         this->clear_engine();
@@ -148,8 +146,11 @@ void Dimc_HWPE::clear_engine()
     for (vp::ClockEvent *ev : {this->fsm_start_event, this->fsm_event, this->fsm_end_event,
                                this->held_event})
         if (ev->is_enqueued()) this->event_cancel(ev);
-    this->outer_port_in.reset();
-    this->outer_port_out.reset();
+    for (Dimc_InnerBlock &blk : this->inner_blocks) {
+        blk.input_port.reset();
+        blk.kernel_port.reset();
+        blk.output_port.reset();
+    }
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
         for (Dimc_Macro &mc : blk.macros) {
             mc.reset();

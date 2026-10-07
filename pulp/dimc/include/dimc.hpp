@@ -62,13 +62,7 @@ class Dimc_HWPE_Streamer {
         bool is_done();
         // Issue one beat of at most inner_port_bytes and return the cycles until its
         // response; the caller queues the due cycle, so several beats can be in flight.
-        // A read at a 64 B-aligned address fetches the whole 64 B word: the second
-        // section is kept in `pair`, and the next beat, if it is that section, returns
-        // NO_REQUEST without touching the memory.
-        static const int NO_REQUEST = -1;
         int issue_beat(int width, void* buf);
-        // The next beat is the kept second section: no request, no port.
-        bool pair_ready() const;
         // Address of the next beat, linear or strided; see the .cpp.
         uint32_t walk_addr() const;
 
@@ -89,18 +83,11 @@ class Dimc_HWPE_Streamer {
         uint32_t    d2_stride;
         uint32_t    d3_stride;
         bool        is_write;
-        uint8_t     pair[32];
-        uint32_t    pair_addr;
-        bool        pair_valid;
 };
 
 
-// ---- Outer port: the tile's shared port towards memory ----
-// A bandwidth limiter in the same idiom as interco/router's: the port remembers
-// when it is free again, so a client arriving before that waits. Accounting is
-// byte-granular; every request books the whole port word, so a port carries one
-// request (one address) per cycle.
-class Dimc_OuterPort {
+// ---- One port of a dual towards L1: a bandwidth limiter that remembers when it is free ----
+class Dimc_Port {
     public:
         void    configure(uint32_t bandwidth);
         void    reset();
@@ -145,6 +132,7 @@ class Dimc_InnerBlock {
         std::vector<Dimc_HWPE_Streamer> weight_stream;
         std::vector<Dimc_HWPE_Streamer> input_stream;
         std::vector<Dimc_HWPE_Streamer> out_stream;
+        Dimc_Port input_port, kernel_port, output_port;
         std::vector<Dimc_Macro> macros;
 
         // Fill and store run concurrently, each with its own cursor. The fill keeps each
@@ -193,7 +181,6 @@ class Dimc_InnerBlock {
             uint8_t  data[32];
         };
         std::deque<FeedEntry> wgt_fifo;
-        bool kb_fed_first = false;   // DIMC_KB_FEED_FIRST: this cycle's kernel feed already ran
         // The dual's one input FIFO: both macros' sections in fetch order.
         std::deque<FeedEntry> inp_fifo;
         // The dual's out_fifo: results of the computing macro in push order, one popped per
@@ -258,15 +245,8 @@ class Dimc_HWPE : public vp::Component {
 
         // Configuration
         uint32_t num_macros;
-        // Port bandwidths, fixed hardware properties from the systree.
-        uint32_t inner_port_bytes;    // one inner block's port, bytes/cycle
-        uint32_t outer_port_bytes;    // the tile's shared outer port, bytes/cycle
-        // One outer-port budget per direction, each shared by all inner blocks: stream-in
-        // (the three source streams) and stream-out (the sink) never block one another.
-        Dimc_OuterPort outer_port_in;   // fills: feature vectors, kernel rows
-        Dimc_OuterPort outer_port_out;  // write-back
-        // An outer block is nb_inner_blocks inner blocks whose beats all pass through the shared
-        // outer port. An access costs what L1 returns, plus the wait for that port.
+        uint32_t inner_port_bytes;    // one 256-bit section, bytes
+        // An access costs what L1 returns, plus the wait for the inner block's port.
         uint32_t nb_inner_blocks;     // inner blocks in the outer block (2 on the D-tile)
 
         // Text trace, for diagnostics and the tracer's reports.
@@ -352,14 +332,13 @@ class Dimc_HWPE : public vp::Component {
         void     write_feed(Dimc_InnerBlock &blk, uint32_t blk_id, std::deque<Dimc_InnerBlock::FeedEntry> &fifo);
         bool     beat_writable(const Dimc_Macro &mc, uint32_t job, const BeatPos &pos) const;
         void     advance_fill();
-        uint32_t block_order(uint32_t i) const;
         void     retire_block(Dimc_InnerBlock &blk);
         uint64_t out_dropped = 0;   // results the out_fifo lost (as the RTL would)
         void     fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id, bool kernel_feed);
         bool     program_next(const Dimc_InnerBlock &blk, uint32_t m, BeatPos &pos) const;
         uint32_t pick_kernel(const Dimc_InnerBlock &blk, uint8_t &why) const;
         uint32_t pick_input(const Dimc_InnerBlock &blk, uint8_t &why) const;
-        uint8_t  refusal(const std::queue<uint64_t> &pending, const Dimc_OuterPort &port) const;
+        uint8_t  refusal(const std::queue<uint64_t> &pending, const Dimc_Port &port) const;
         bool     fetch_kernel_ahead(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, int ctx);
         void     fetch_kernel_section(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, int ctx,
                                       uint32_t job, uint32_t sub);
@@ -370,13 +349,11 @@ class Dimc_HWPE : public vp::Component {
         uint32_t kernel_in_progress(const Dimc_InnerBlock &blk) const;
         void     fill_beat(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro);
 
-        void fetch_kernels_first();
         uint32_t rows_before_feature(const Dimc_Macro &mc, uint32_t job, uint32_t run) const;
         uint32_t rows_before_turn(const Dimc_InnerBlock &blk, uint32_t m, uint32_t job) const;
         // The macro of a dual that runs `job`: the two take turns.
         uint32_t job_macro(uint32_t job) const { return job % this->num_macros; }
         bool     tile_computed(const Dimc_InnerBlock &blk) const;
-        bool input_urgent() const;
         // Latch one context's job shape into its geometry slot.
         void latch_geom(int ctx);
         void ensure_geom(int ctx);

@@ -193,11 +193,9 @@ void Dimc_Tracer::outer_port_booked(uint32_t who, uint8_t kind)
     // Stores are offset by 16 so one track shows both: 0,1 = block 0,1 filling;
     // 16,17 = block 0,1 writing back.
     this->outer_grant = (uint8_t)(who + (is_store ? 16u : 0u));
-    // The two directions have their own budget; report the one this beat booked.
-    const Dimc_OuterPort &port = is_store ? this->dimc.outer_port_out
-                                          : this->dimc.outer_port_in;
-    uint32_t nf = (uint32_t)((port.cursor_bytes + port.bandwidth_bytes - 1)
-                             / port.bandwidth_bytes);
+    const Dimc_InnerBlock &blk = this->dimc.inner_blocks[who];
+    const Dimc_Port &port = is_store ? blk.output_port : kind == DIMC_LOAD_FB ? blk.input_port : blk.kernel_port;
+    uint32_t nf = (uint32_t)((port.cursor_bytes + port.bandwidth_bytes - 1) / port.bandwidth_bytes);
     this->next_free_event.event((uint8_t *)&nf);
 }
 
@@ -228,7 +226,7 @@ void Dimc_Tracer::end_cycle(uint32_t b)
     blk.loaded = blk.computed = blk.wrote_back = false;
     blk.fill_skip = blk.store_skip = blk.kernel_skip = blk.input_skip = 0;
     blk.fill_grant = DIMC_GRANT_NONE;
-    // The outer port is shared: flush it with the last block, after every block has booked.
+    // One track for all ports: flush it with the last block, after every block has booked.
     if (b + 1 == this->blocks.size()) {
         this->outer_grant_event.event(&this->outer_grant);
         this->outer_grant = DIMC_GRANT_NONE;
@@ -260,7 +258,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
         return mac.filled_job == this->dimc.running_job + 1 ? DIMC_WHY_WAIT_COMPUTE : DIMC_WHY_IDLE;
 
     // Inside a kernel window (sections written, not all): the weight FIFO's head says why no
-    // section went in. In flight: late because the kernel feed lost the outer port within the
+    // section went in. In flight: late because the kernel port was busy within the
     // fetch latency, else the response is still out. Another macro's section: the dual's FIFO
     // is in order. Landed: beat_writable refused it. Empty: this cycle's kernel-feed refusal.
     if (mac.write_job != Dimc_Macro::JOB_NONE && !mac.stamped) {
@@ -362,10 +360,7 @@ void Dimc_Tracer::job_closed(uint64_t now_cycle)
     }
 
     const uint64_t job_busy = now_cycle - this->job_entry_cycle;
-    // Analytic minimum: every beat the fill must move through the inner port,
-    // one per cycle, plus the macro pipeline's drain. One block's beats set the
-    // floor, which holds while the blocks' combined demand still fits the
-    // outer port.
+    // Analytic minimum: one section of the job's fill per cycle, plus the pipeline's drain.
     const uint64_t ideal = (uint64_t)g.beats_per_macro + DIMC_MACRO_LATENCY;
     this->acc_busy_cycles  += job_busy;
     this->acc_ideal_cycles += ideal;

@@ -33,7 +33,7 @@ enum dimc_why_t : uint8_t {
     DIMC_WHY_COMPUTE          = 4,
     DIMC_WHY_WRITE_BACK       = 5,
     DIMC_WHY_WAIT_INNER_PORT  = 6,    // behind another macro's input section; heuristic: a lower macro owes sections
-    DIMC_WHY_WAIT_OUTER_PORT  = 7,    // this macro's beat was due, the shared outer port was booked
+    DIMC_WHY_WAIT_OUTER_PORT  = 7,    // this macro's beat was due, its block's port was busy
     DIMC_WHY_WAIT_DEPTH       = 8,    // outstanding_depth beats in flight, or the weight FIFO full
     DIMC_WHY_WAIT_FILL_ACK    = 9,    // a fetched section's response not in yet
     DIMC_WHY_PIPE_DRAIN       = 10,   // rows issued, results still inside the macro pipeline
@@ -47,7 +47,7 @@ enum dimc_why_t : uint8_t {
 };
 
 // fill_grant / outer_grant value when nobody was served this cycle. fill_grant is the macro
-// a FIFO section was written into; outer_grant the block that booked the outer port.
+// a FIFO section was written into; outer_grant the block that booked a port.
 #define DIMC_GRANT_NONE 255
 
 // Which buffer a fill beat went to, traced as block_<b>/macro_<m>/load_kind.
@@ -105,13 +105,12 @@ class Dimc_Tracer {
                         uint32_t row_count);
         void store_beat(uint32_t blk, uint32_t macro, int lat, uint32_t out_beats);
         void store_skip(uint32_t blk, uint8_t why);
-        // `who` is the inner block that got the outer port this cycle; `kind` is what the
+        // `who` is the inner block that booked one of its ports this cycle; `kind` is what the
         // beat carries: DIMC_LOAD_KB / _FB for a fetch, DIMC_PORT_WB for a write-back.
         void outer_port_booked(uint32_t who, uint8_t kind);
         // Publish one block's levels and wait causes for this cycle, then clear.
         void end_cycle(uint32_t blk);
-        // Publish what the outer port carried this cycle, then clear: after the cycle's
-        // last booking.
+        // Publish what the ports carried this cycle, then clear.
         void port_cycle();
         void job_closed(uint64_t now_cycle);      // the per-job report
         void job_end();                           // busy falls
@@ -144,7 +143,7 @@ class Dimc_Tracer {
             uint8_t   fill_skip = 0, store_skip = 0;
             uint8_t   kernel_skip = 0;          // this cycle's kernel-feed refusal
             uint8_t   input_skip = 0;           // this cycle's input-feed refusal
-            uint64_t  kernel_port_refused = ~0ull;   // DIMC cycle the kernel feed last lost the outer port
+            uint64_t  kernel_port_refused = ~0ull;   // DIMC cycle the kernel feed last found its port busy
             // Last store beat's latency times the beat count; report only.
             uint32_t  out_beat_lat_est = 0;
             std::vector<Macro>   macros;
@@ -157,9 +156,9 @@ class Dimc_Tracer {
         vp::Trace job_event;         // id of the running job
         vp::Trace commit_event;      // id of each job as software commits it
         vp::Trace idle_why_event;    // dimc_idle_why_t
-        vp::Trace outer_grant_event; // which inner block booked the outer port this cycle, 255 = none
+        vp::Trace outer_grant_event; // which inner block booked a port this cycle, 255 = none
         uint8_t   outer_grant = DIMC_GRANT_NONE;
-        vp::Trace next_free_event;   // outer port: first free cycle after a booking
+        vp::Trace next_free_event;   // the booked port's first free cycle
         vp::Trace port_use_event;    // bookings per kind this cycle (see DIMC_PORT_WB)
         uint8_t   port_use = 0;
 
