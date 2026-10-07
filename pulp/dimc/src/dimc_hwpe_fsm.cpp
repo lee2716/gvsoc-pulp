@@ -137,7 +137,7 @@ void Dimc_HWPE::latch_geom(int ctx)
     if (g.nb_vec > DIMC_ACC_VECTORS)
         this->trace.fatal("NB_VEC %u: the dual has accumulators for %u vectors\n", g.nb_vec, DIMC_ACC_VECTORS);
     g.fb_vec_stride  = this->job_reg_ctx(ctx, DIMC_HWPE_FB_VEC_STRIDE);
-    g.out_vec_stride = this->job_reg_ctx(ctx, DIMC_HWPE_OUT_VEC_STRIDE);
+    g.out_row_stride = this->job_reg_ctx(ctx, DIMC_HWPE_OUT_ROW_STRIDE);
     this->geom_job[ctx] = this->ctx_job_id[ctx];
 }
 
@@ -272,9 +272,8 @@ void Dimc_HWPE::plan_job()
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++)
         if (this->inner_blocks[b].macros[pm].fill_job != this->running_job)
             this->plan_macro_fill(b, pm, (int)slot);
-    // Port words of one output tile: SLOT-byte results, port_bytes / SLOT a word. Only a
-    // TILE_LAST job writes.
-    g.out_beats = g.nb_vec * ((g.row_count * DIMC_OUT_SLOT_BYTES + port_bytes - 1) / port_bytes);
+    // Port words of one output tile: one per row, NB_VEC results each. Only a TILE_LAST job writes.
+    g.out_beats = g.row_count;
     for (Dimc_InnerBlock &blk : this->inner_blocks)
         blk.store.beat_total = g.tile_last ? g.out_beats : 0;
 }
@@ -832,38 +831,28 @@ bool Dimc_HWPE::store_done() const
 void Dimc_HWPE::store_block(Dimc_InnerBlock &blk, uint32_t blk_id)
 {
     const JobGeom &g = this->job_geom[this->exec_slot];
-    if (!g.tile_last || blk.out_written >= g.row_count * g.nb_vec) return;
+    if (!g.tile_last || blk.out_written >= g.row_count) return;
     if (!this->tile_computed(blk)) return;
     this->store_word(blk, blk_id);
 }
 
-// Write the next port word of the dual's accumulators: rows [r, r + n) of vector vec. 0: the
+// Write the next row of the dual's accumulators, one result per vector in one port word. 0: the
 // outstanding depth or the outer port refused it; 1: written. The accumulators clear with
-// the last word.
+// the last row.
 int Dimc_HWPE::store_word(Dimc_InnerBlock &blk, uint32_t blk_id)
 {
-    const uint32_t port_bytes = this->inner_port_bytes;
-    const uint32_t ctx        = this->exec_slot;
-    const JobGeom &g          = this->job_geom[ctx];
-    const uint32_t rows       = g.row_count;
-    const uint32_t per_word   = port_bytes / DIMC_OUT_SLOT_BYTES;
-    uint32_t &k = blk.out_written;
-    const uint32_t r = k % rows, vec = k / rows;
-    const uint32_t n = rows - r < per_word ? rows - r : per_word;
+    const uint32_t ctx = this->exec_slot;
+    const JobGeom &g   = this->job_geom[ctx];
+    uint32_t &row      = blk.out_written;
     if (const uint8_t why = this->refusal(blk.store_pending, this->outer_port_out)) {
         this->tracer.store_skip(blk_id, why);
         return 0;
     }
-    // First word of a vector: point the output streamer at the vector's block.
-    if (r == 0) this->configure_out_stream(blk_id, vec, ctx);
-    uint8_t word[32];
-    for (uint32_t j = 0; j < n; j++) {
-        const int32_t v = blk.acc[vec * DIMC_MACRO_KB_LEN + r + j];
-        uint8_t *slot = word + j * DIMC_OUT_SLOT_BYTES;
-        std::memset(slot, v < 0 ? 0xFF : 0x00, DIMC_OUT_SLOT_BYTES);
-        std::memcpy(slot, &v, 4);
-    }
-    int lat = blk.out_stream[0].issue_beat((int)(n * DIMC_OUT_SLOT_BYTES), word);
+    this->configure_out_stream(blk_id, row, ctx);
+    uint8_t word[DIMC_ACC_VECTORS * DIMC_OUT_SLOT_BYTES];
+    for (uint32_t v = 0; v < g.nb_vec; v++)
+        std::memcpy(word + v * DIMC_OUT_SLOT_BYTES, &blk.acc[v * DIMC_MACRO_KB_LEN + row], DIMC_OUT_SLOT_BYTES);
+    int lat = blk.out_stream[0].issue_beat((int)(g.nb_vec * DIMC_OUT_SLOT_BYTES), word);
     this->tracer.store_beat(blk_id, this->job_macro(this->running_job), lat, g.out_beats);
     if (lat < 1) lat = 1;
     const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
@@ -871,9 +860,9 @@ int Dimc_HWPE::store_word(Dimc_InnerBlock &blk, uint32_t blk_id)
     blk.store_pending.push(due);
     this->outer_port_out.request((int64_t)this->fsm_timestamp, this->outer_port_bytes);
     this->tracer.outer_port_booked(blk_id, DIMC_PORT_WB);
-    k += n;
+    row++;
     blk.store.beat_index++;
-    if (k >= rows * g.nb_vec)
+    if (row >= g.row_count)
         for (int32_t &a : blk.acc) a = 0;
     return 1;
 }

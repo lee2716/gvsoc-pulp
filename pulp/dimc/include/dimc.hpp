@@ -201,7 +201,7 @@ class Dimc_InnerBlock {
         struct OutEntry { int32_t psout; uint16_t row; uint16_t run; };
         std::deque<OutEntry> out_fifo;
         int32_t  acc[DIMC_ACC_VECTORS * DIMC_MACRO_KB_LEN] = {0};
-        // Results of the running job's tile written to L1 so far.
+        // Rows of the running job's tile written to L1 so far.
         uint32_t out_written = 0;
         // In DIMC_STORING: every result of the running job written and acknowledged, as of
         // the last cycle; the block then stops writing back.
@@ -326,7 +326,7 @@ class Dimc_HWPE : public vp::Component {
             uint32_t beats_per_macro, kb_beats_per_row;
             uint32_t fb_beats_per_macro, out_beats;
             // Batched descriptor: vectors per job and their strides (1 / 0 = one vector).
-            uint32_t nb_vec, fb_vec_stride, out_vec_stride;
+            uint32_t nb_vec, fb_vec_stride, out_row_stride;
             uint32_t kb_sections() const { return row_count * kb_beats_per_row; }
         };
         // The job id whose geometry job_geom[ctx] holds, so a job is latched once
@@ -340,8 +340,8 @@ class Dimc_HWPE : public vp::Component {
         void     plan_macro_fill(uint32_t blk_id, uint32_t m, int ctx);
         void     configure_macro_streams(uint32_t blk_id, uint32_t m, int ctx, uint32_t run,
                                          bool kernel, bool feature);
-        void     configure_out_stream(uint32_t blk_id, uint32_t run, uint32_t ctx);
-        // Byte offset of dual blk_id's block inside one operand.
+        void     configure_out_stream(uint32_t blk_id, uint32_t row, uint32_t ctx);
+        // Byte offset of dual blk_id's block inside the kernel or the feature operand.
         uint32_t slot_offset(const JobGeom &g, uint32_t blk_id, uint8_t kind) const;
         JobGeom job_geom[DIMC_NB_CONTEXT];
         // The running job's context.

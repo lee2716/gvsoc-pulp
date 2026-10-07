@@ -83,8 +83,7 @@
 #define DIMC_HWPE_JOB_FB_SRC_ADDR    (DIMC_HWPE_BASE + 0x44)
 #define DIMC_HWPE_JOB_DST_ADDR       (DIMC_HWPE_BASE + 0x48)
 /* One job carries NB_VEC input vectors of the same chunk, at most 8 (the dual's accumulators).
- * Vector b reads its feature at FB_SRC + b * FB_VEC_STRIDE and, in a TILE_LAST job, is
- * written at DST + b * OUT_VEC_STRIDE. 0 or 1: one vector. */
+ * Vector b reads its feature at FB_SRC + b * FB_VEC_STRIDE. 0 or 1: one vector. */
 #define DIMC_HWPE_NB_VEC             (DIMC_HWPE_BASE + 0x4C)
 
 #define DIMC_HWPE_KB_D0_LENGTH       (DIMC_HWPE_BASE + 0x50)
@@ -106,8 +105,9 @@
 /* The job's constant on ADDIN, added to every row's dot product. */
 #define DIMC_HWPE_PSIN               (DIMC_HWPE_BASE + 0x84)
 
-/* Batched descriptor: output stride per vector (see NB_VEC). */
-#define DIMC_HWPE_OUT_VEC_STRIDE     (DIMC_HWPE_BASE + 0x88)
+/* A TILE_LAST job writes its outputs row-major, one row of NB_VEC results per port word:
+ * row r of dual b, vector v, at DST + (b * row_count + r) * OUT_ROW_STRIDE + 4 * v. */
+#define DIMC_HWPE_OUT_ROW_STRIDE     (DIMC_HWPE_BASE + 0x88)
 
 /* Not read: results accumulate in the dual between jobs (see TILE_LAST), and every job
  * loads its kernel rows. */
@@ -117,9 +117,8 @@
 #define DIMC_HWPE_PSIN_DEP           (DIMC_HWPE_BASE + 0xA0)
 
 /* Where dual b reads and writes: its kernel rows at KB_SRC + b * row_count * 128 B, whichever
- * of its macros runs the job; the one feature block at FB_SRC; its outputs at
- * DST + b * row_count * 4 B. The per-vector strides add on top. ADDR_MODE and the MSTRIDE /
- * BSTRIDE registers are not read. */
+ * of its macros runs the job; the one feature block at FB_SRC; its output rows as
+ * OUT_ROW_STRIDE says. ADDR_MODE and the MSTRIDE / BSTRIDE registers are not read. */
 #define DIMC_HWPE_ADDR_MODE          (DIMC_HWPE_BASE + 0xA4)
 #define DIMC_HWPE_KB_MSTRIDE         (DIMC_HWPE_BASE + 0xA8)
 #define DIMC_HWPE_KB_BSTRIDE         (DIMC_HWPE_BASE + 0xAC)

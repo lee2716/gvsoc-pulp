@@ -30,8 +30,7 @@
 // The dual's out_fifo is not fall-through: a result pushed in the cycle READYN goes low
 // can be popped one cycle later.
 #define DIMC_OUT_FIFO_DELAY 1
-// Bytes one 32-bit result occupies in L1. 4: packed, 8 results per 32 B port word.
-// 32: one sign-extended result per port word. Result r sits at dst + SLOT * r.
+// Bytes one 32-bit result occupies in L1: packed, 8 results per 32 B port word.
 #define DIMC_OUT_SLOT_BYTES 4
 // The dual's out_fifo (64 x 32 b): results of the macro that computes, popped one per cycle
 // into the dual's accumulators.

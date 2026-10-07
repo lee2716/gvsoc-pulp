@@ -322,7 +322,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
     }
 
     // Write-back of a TILE_LAST job: after the last result is accumulated, one word per cycle.
-    if (g.tile_last && blk.out_written < g.row_count * g.nb_vec) {
+    if (g.tile_last && blk.out_written < g.row_count) {
         if (!this->dimc.tile_computed(blk)) return DIMC_WHY_PIPE_DRAIN;
         return tb.store_skip ? tb.store_skip : DIMC_WHY_UNKNOWN;
     }
