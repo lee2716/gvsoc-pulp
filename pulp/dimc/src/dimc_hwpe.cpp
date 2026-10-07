@@ -68,23 +68,13 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     this->fsm_start_event = this->event_new(&Dimc_HWPE::fsm_start_handler);
     this->fsm_event       = this->event_new(&Dimc_HWPE::fsm_handler);
     this->fsm_end_event   = this->event_new(&Dimc_HWPE::fsm_end_handler);
-    this->held_event      = this->event_new(&Dimc_HWPE::held_handler);
 
-    // Initial state of the controller FSM + standard HWPE offload bookkeeping
-    this->running_job   = 0;
-    this->next_job_id   = 0;
+    this->next_gemm_id  = 0;
     this->finished_jobs = 0;
-    this->job_running   = false;
-    this->acquired_ctx  = -1;
-    this->running_ctx   = -1;
-    this->ctx_queue.clear();
-    std::memset(this->live_regs, 0, sizeof(this->live_regs));
-    for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
-        this->ctx_busy[ctx]   = false;
-        this->ctx_job_id[ctx] = 0;
-        this->geom_job[ctx]   = Dimc_Macro::JOB_NONE;
-        for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
-    }
+    this->next_job_id   = 0;
+    std::memset(this->gemm_live, 0, sizeof(this->gemm_live));
+    std::memset(this->register_file, 0, sizeof(this->register_file));
+    this->clear_engine();
     this->outstanding_depth = 4;    // max in-flight requests per feed (kernel, input, store) per block
     this->fsm_timestamp     = 0;
     this->job_start_cycle   = 0;
@@ -118,18 +108,11 @@ void Dimc_HWPE::reset(bool active)
             this->trace.fatal("DIMC systree incomplete\n");
         }
         this->clear_engine();
-        for (uint32_t i = 0; i < N_CFG_REGS; i++) {
-            this->register_file[i] = 0x0;
-        }
-        for (Dimc_InnerBlock &blk : this->inner_blocks) blk.out_accum.enable = 0;
-        this->running_job   = 0;
+        std::memset(this->register_file, 0, sizeof(this->register_file));
+        std::memset(this->gemm_live, 0, sizeof(this->gemm_live));
+        this->next_gemm_id  = 0;
+        this->finished_jobs = 0;
         this->next_job_id   = 0;
-            this->finished_jobs = 0;
-        std::memset(this->live_regs, 0, sizeof(this->live_regs));
-        for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
-            this->ctx_job_id[ctx] = 0;
-            for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
-        }
         this->outstanding_depth = 4;    // max in-flight requests per feed (kernel, input, store) per block
         this->fsm_timestamp     = 0;
         this->job_start_cycle   = 0;
@@ -138,24 +121,20 @@ void Dimc_HWPE::reset(bool active)
     }
 }
 
-// The engine as a reset leaves it: no FSM event pending, no job running or queued, every
-// context free, every FIFO, cursor and pending queue empty, no macro holding or owing a job.
-// Job ids, run numbering, the cycle count and the register file are left to the caller.
+// The engine and the job queue as a reset leaves them: no FSM event pending, no job running or
+// queued, every context free, every FIFO, cursor and pending queue empty, the accumulators
+// zero. Job ids, the cycle count and the registers are left to the caller.
 void Dimc_HWPE::clear_engine()
 {
-    for (vp::ClockEvent *ev : {this->fsm_start_event, this->fsm_event, this->fsm_end_event,
-                               this->held_event})
+    for (vp::ClockEvent *ev : {this->fsm_start_event, this->fsm_event, this->fsm_end_event})
         if (ev->is_enqueued()) this->event_cancel(ev);
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
         blk.input_port.reset();
         blk.kernel_port.reset();
         blk.output_port.reset();
-    }
-    for (Dimc_InnerBlock &blk : this->inner_blocks) {
         for (Dimc_Macro &mc : blk.macros) {
             mc.reset();
             mc.filled_job  = Dimc_Macro::JOB_NONE;
-            // Job ids restart at 0 after a reset; a stale id could match one.
             mc.issue_job   = Dimc_Macro::JOB_NONE;
             mc.fill_job    = Dimc_Macro::JOB_NONE;
             mc.owed        = 0;
@@ -163,31 +142,38 @@ void Dimc_HWPE::clear_engine()
             mc.written     = 0;
             mc.kpf_job     = Dimc_Macro::JOB_NONE;
             mc.kfetched    = 0;
+            mc.ffetched    = 0;
             mc.kw = 0; mc.f0 = false; mc.stamped = false;
             mc.runs_issued = 0;
             mc.set_job[0]  = mc.set_job[1] = Dimc_Macro::JOB_NONE;
         }
-        blk.out_accum.clear();      // accumulator.sv clear_i
         blk.reset_all();
         blk.out_fifo.clear();
         blk.last_acc_cycle = -1000;
+        blk.present_ack_cycle = -1000;
         for (int32_t &a : blk.acc) a = 0;
     }
+    this->gemm_queue.clear();
+    this->gemm_running  = false;
+    this->gemm_acquired = false;
+    this->gemm_error    = false;
     this->job_running   = false;
-    this->acquired_ctx  = -1;
+    this->running_job   = 0;
     this->running_ctx   = -1;
     this->ctx_queue.clear();
-    for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) this->ctx_busy[ctx] = false;
-    for (uint32_t c = 0; c < DIMC_NB_CONTEXT; c++) this->geom_job[c] = Dimc_Macro::JOB_NONE;
-    this->job_geom[0].kb_beats_per_row     = 1;
-    this->job_geom[0].fb_beats_per_macro   = 1;
-    this->job_geom[0].beats_per_macro      = 1;
+    for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
+        this->ctx_busy[ctx] = false;
+        this->geom_job[ctx] = Dimc_Macro::JOB_NONE;
+    }
+    this->job_geom[0].kb_beats_per_row   = 1;
+    this->job_geom[0].fb_beats_per_macro = 1;
+    this->job_geom[0].beats_per_macro    = 1;
     this->fill_active = false;
     this->out_dropped = 0;
     this->state.set(DIMC_IDLE);
 }
 
-// Reserve a free job context; -1 when every context is occupied.
+// A free engine context; -1 when both are taken.
 int Dimc_HWPE::ctx_alloc()
 {
     for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++)
@@ -195,20 +181,12 @@ int Dimc_HWPE::ctx_alloc()
     return -1;
 }
 
-// Read a job-dependent register out of context ctx (context 0 when ctx < 0).
-uint32_t Dimc_HWPE::job_reg_ctx(int ctx, uint32_t addr) const
+uint32_t Dimc_HWPE::job_reg_ctx(int ctx, uint32_t idx) const
 {
-    if (ctx < 0) ctx = 0;
-    return this->ctx_regs[ctx][(addr - DIMC_HWPE_JOB_BASE) >> 2];
+    return this->ctx_regs[ctx < 0 ? 0 : ctx][idx];
 }
 
-uint32_t Dimc_HWPE::job_reg(uint32_t addr) const
-{
-    int ctx = (this->running_ctx >= 0) ? this->running_ctx : 0;
-    return this->ctx_regs[ctx][(addr - DIMC_HWPE_JOB_BASE) >> 2];
-}
-
-// Launch the context at the head of the queue, if the engine is free.
+// Launch the tile product at the head of the engine's queue, if the engine is free.
 void Dimc_HWPE::start_next_job()
 {
     if (this->job_running || this->ctx_queue.empty()) return;
@@ -216,158 +194,165 @@ void Dimc_HWPE::start_next_job()
     this->ctx_queue.pop_front();
     this->job_running = true;
     this->running_job = this->ctx_job_id[this->running_ctx];
-    this->register_file[DIMC_HWPE_RUN_TASK >> 2] = this->running_job;
     this->event_enqueue(this->fsm_start_event, 1);
     this->tracer.job_queued();
+}
+
+// The checks of dimc_ctrl.sv: complete 8-bit tiles, matching inner dimension, aligned
+// addresses, no matrix past the end of the address space.
+bool Dimc_HWPE::gemm_valid(const Gemm &g) const
+{
+    const uint64_t wr = g.reg[DIMC_REG_WEIGHT_ROWS], wc = g.reg[DIMC_REG_WEIGHT_COLS];
+    const uint64_t ir = g.reg[DIMC_REG_INPUT_ROWS], ic = g.reg[DIMC_REG_INPUT_COLS];
+    const uint64_t end = (uint64_t)1 << 32;
+    return wr != 0 && wc != 0 && ic != 0 && wc == ir
+        && wr % DIMC_MACRO_KB_LEN == 0 && wc % DIMC_MACRO_KB_EW == 0 && ic % DIMC_ACC_VECTORS == 0
+        && (g.reg[DIMC_REG_FORMAT] & 0x3) == DIMC_CI_8BIT
+        && g.reg[DIMC_REG_INPUT_ADDR] % 8 == 0 && g.reg[DIMC_REG_KERNEL_ADDR] % 32 == 0
+        && g.reg[DIMC_REG_OUTPUT_ADDR] % 32 == 0
+        && g.reg[DIMC_REG_KERNEL_ADDR] + wr * wc <= end
+        && g.reg[DIMC_REG_INPUT_ADDR] + ir * ic <= end
+        && g.reg[DIMC_REG_OUTPUT_ADDR] + wr * ic * 4 <= end;
+}
+
+// Describe the next tile product of the running job in engine context ctx and queue it:
+// output tiles gemm_k.. (one per inner block), vectors 8 * gemm_q.., columns 128 * gemm_l...
+// The tile products of one output tile run on consecutive l; then the next q, then the next k.
+void Dimc_HWPE::gemm_commit_tile(int ctx)
+{
+    const uint32_t *r = this->gemm.reg;
+    const uint32_t wc = r[DIMC_REG_WEIGHT_COLS], ic = r[DIMC_REG_INPUT_COLS];
+    const uint32_t tiles_k = r[DIMC_REG_WEIGHT_ROWS] / DIMC_MACRO_KB_LEN;
+    const uint32_t tiles_l = wc / DIMC_MACRO_KB_EW, tiles_q = ic / DIMC_ACC_VECTORS;
+    const uint32_t k = this->gemm_k, q = this->gemm_q, l = this->gemm_l;
+    const uint32_t blocks = std::min((uint32_t)this->inner_blocks.size(), tiles_k - k);
+    uint32_t *d = this->ctx_regs[ctx];
+    d[DIMC_TP_KB_SRC]         = r[DIMC_REG_KERNEL_ADDR] + k * DIMC_MACRO_KB_LEN * wc + l * DIMC_MACRO_KB_EW;
+    d[DIMC_TP_KB_ROW_STRIDE]  = wc;
+    d[DIMC_TP_FB_SRC]         = r[DIMC_REG_INPUT_ADDR] + l * DIMC_MACRO_FB_EW * ic + q * DIMC_ACC_VECTORS;
+    d[DIMC_TP_FB_ROW_STRIDE]  = ic;
+    d[DIMC_TP_DST]            = r[DIMC_REG_OUTPUT_ADDR]
+                              + (k * DIMC_MACRO_KB_LEN * ic + q * DIMC_ACC_VECTORS) * DIMC_OUT_SLOT_BYTES;
+    d[DIMC_TP_OUT_ROW_STRIDE] = ic * DIMC_OUT_SLOT_BYTES;
+    d[DIMC_TP_BIAS]           = r[DIMC_REG_BIAS];
+    d[DIMC_TP_TILE_LAST]      = l + 1 == tiles_l;
+    d[DIMC_TP_NB_BLOCKS]      = blocks;
+    this->ctx_ci[ctx]           = (uint8_t)(r[DIMC_REG_FORMAT] & 0x3);
+    this->ctx_sign_8b[ctx]      = (uint8_t)((r[DIMC_REG_FORMAT] >> 2) & 0x3);
+    this->ctx_compute_mask[ctx] = (uint16_t)(r[DIMC_REG_COMPUTE_MASK] & 0x3FF);
+    this->ctx_busy[ctx]   = true;
+    this->ctx_job_id[ctx] = this->next_job_id++;
+    this->tracer.commit(this->ctx_job_id[ctx]);
+    this->ctx_queue.push_back(ctx);
+    this->gemm_issued++;
+    if (++this->gemm_l == tiles_l) {
+        this->gemm_l = 0;
+        if (++this->gemm_q == tiles_q) {
+            this->gemm_q = 0;
+            this->gemm_k += blocks;
+        }
+    }
+}
+
+// The running job has ended, or was rejected: count it and raise done.
+void Dimc_HWPE::gemm_finish(bool error)
+{
+    this->gemm_running = false;
+    this->gemm_error   = error;
+    this->finished_jobs++;
+    this->register_file[DIMC_HWPE_STATUS   >> 2] = 0x1;
+    this->register_file[DIMC_HWPE_FIN_JOBS >> 2] = this->finished_jobs;
+    if (this->irq.is_bound()) {
+        this->irq.sync(true);
+        this->irq.sync(false);
+    }
+}
+
+// The job sequencer: end the running job once its last tile product has, start the next
+// queued one, and keep the engine's two contexts filled with its tile products.
+void Dimc_HWPE::gemm_step()
+{
+    for (;;) {
+        if (this->gemm_running && this->gemm_issued == this->gemm_total
+            && !this->job_running && this->ctx_queue.empty())
+            this->gemm_finish(false);
+        if (this->gemm_running) break;
+        if (this->gemm_queue.empty()) return;
+        this->gemm = this->gemm_queue.front();
+        this->gemm_queue.pop_front();
+        this->register_file[DIMC_HWPE_RUN_TASK >> 2] = this->gemm.id;
+        this->register_file[DIMC_HWPE_STATUS   >> 2] = 0x0;
+        if (!this->gemm_valid(this->gemm)) {
+            this->gemm_finish(true);
+            continue;
+        }
+        const uint32_t *r = this->gemm.reg;
+        const uint32_t nb = (uint32_t)this->inner_blocks.size();
+        this->gemm_running = true;
+        this->gemm_error   = false;
+        this->gemm_k = this->gemm_q = this->gemm_l = 0;
+        this->gemm_issued = 0;
+        this->gemm_total  = ((r[DIMC_REG_WEIGHT_ROWS] / DIMC_MACRO_KB_LEN + nb - 1) / nb)
+                          * (r[DIMC_REG_INPUT_COLS] / DIMC_ACC_VECTORS)
+                          * (r[DIMC_REG_WEIGHT_COLS] / DIMC_MACRO_KB_EW);
+    }
+    while (this->gemm_issued < this->gemm_total) {
+        const int ctx = this->ctx_alloc();
+        if (ctx < 0) break;
+        this->gemm_commit_tile(ctx);
+    }
+    this->start_next_job();
 }
 
 vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
 {
     Dimc_HWPE *_this = (Dimc_HWPE *)__this;
-    uint32_t address = req->get_addr();
+    const uint32_t address = req->get_addr();
+    uint32_t *data = (uint32_t *)req->get_data();
 
-    if (req->get_is_write()) {
-        uint32_t data = *((uint32_t *) (req->get_data()));
+    if (address > DIMC_HWPE_REG_MAX || (address & 0x3)) {
+        _this->trace.fatal("Trying to access invalid address 0x%x\n", address);
+        return vp::IO_REQ_INVALID;
+    }
+    const uint32_t pending = (uint32_t)_this->gemm_queue.size() + (_this->gemm_running ? 1u : 0u);
 
-        _this->trace.msg(vp::TraceLevel::DEBUG, "Write request, address: 0x%x\n", address);
-
-        if (address > DIMC_HWPE_CHK_STATE) {
-            if (address > DIMC_HWPE_REG_MAX) {
-                _this->trace.fatal("Trying to access invalid address 0x%x\n", address);
-                return vp::IO_REQ_INVALID;
-            }
-            // Accumulator registers first: ACC_VAL lies inside the job-register range.
-            if (address == DIMC_HWPE_ACC_CTRL) {
-                for (Dimc_InnerBlock &blk : _this->inner_blocks) {
-                    blk.out_accum.enable = (data & DIMC_HWPE_ACC_CTRL_EN_BIT) ? 1 : 0;
-                    if (data & DIMC_HWPE_ACC_CTRL_CLR_BIT) blk.out_accum.clear();
-                }
-                _this->register_file[address >> 2] = data & DIMC_HWPE_ACC_CTRL_EN_BIT;
-                return vp::IO_REQ_OK;
-            }
-            if (address == DIMC_HWPE_ACC_VAL_0 || address == DIMC_HWPE_ACC_VAL_1) {
-                _this->trace.fatal("ACC_VAL is read-only (address 0x%x)\n", address);
-                return vp::IO_REQ_INVALID;
-            }
-            if (address >= DIMC_HWPE_JOB_BASE) {
-                // Job-dependent write into the live bundle, which the next COMMIT
-                // snapshots; a value written once reaches every later job.
-                _this->live_regs[(address - DIMC_HWPE_JOB_BASE) >> 2] = data;
-            } else {
-                // Mandatory / generic (job-independent) registers stay unbanked.
-                _this->register_file[(address >> 2)] = data;
-            }
-        } else {
-            switch (address) {
-            case DIMC_HWPE_TRIG: {
-                // commit_trigger (hwpe-ctrl): the written value selects the mode.
-                //   0 : commit the acquired job and start it
-                //   1 : commit only; it runs on a later trigger or on an explicit 0x2
-                //   2 : trigger the existing queue, commit nothing new
-                uint32_t mode = data & 0x3;
-
-                if (mode != 0x2) {                           // modes 0 and 1 commit
-                    int ctx = _this->acquired_ctx;
-                    if (ctx < 0) ctx = _this->ctx_alloc();       // commit with no writes
-                    if (ctx < 0) break;                        // all contexts busy: drop
-                    _this->ctx_busy[ctx]   = true;
-                    _this->ctx_job_id[ctx] = _this->next_job_id++;
-                    _this->tracer.commit(_this->ctx_job_id[ctx]);
-                    // The snapshot. i_job_fifo pushes the whole job_dep_regs
-                    // bundle, so a committed job carries a complete descriptor.
-                    std::memcpy(_this->ctx_regs[ctx], _this->live_regs,
-                                sizeof(_this->live_regs));
-                    _this->ctx_ci[ctx] =
-                        (uint8_t)(_this->register_file[DIMC_HWPE_CFG_CI >> 2] & 0x3);
-                    _this->ctx_sign_8b[ctx] =
-                        (uint8_t)(_this->register_file[DIMC_HWPE_SIGN_8B >> 2] & 0x3);
-                    _this->ctx_compute_mask[ctx] =
-                        (uint16_t)(_this->register_file[DIMC_HWPE_COMPUTE_MASK >> 2] & 0x3FF);
-                    _this->acquired_ctx  = -1;               // SW must ACQUIRE again
-                    // Queue it. A job already waiting keeps its place: the queue is
-                    // FIFO over the contexts; the head is what runs next.
-                    _this->ctx_queue.push_back(ctx);
-                }
-
-                // Modes 0 and 2 release the queue; mode 1 only commits.
-                if (mode != 0x1) _this->start_next_job();
-                else if (!_this->job_running
-                         && !_this->held_event->is_enqueued())
-                    _this->event_enqueue(_this->held_event, 1);
-                break;
-            }
-            case DIMC_HWPE_ACQ:    // acquire is observed on the read path; write is a no-op
-                break;
-            case DIMC_HWPE_SOFT_CLEAR: {
-                // soft_clear (hwpe-ctrl): the written value selects the scope.
-                //   0 : clear IP state and the register file
-                //   1 : clear IP state, keep the register file
-                //   2 : clear the register file only
-                uint32_t scope = data & 0x3;
-
-                if (scope != 0x2) {                 // scopes 0 and 1 clear IP state
-                    // Aborts any job in flight: its FSM events are dropped and every context
-                    // released, otherwise ACQUIRE would report busy forever and
-                    // dimc_hwpe_acquire_block() hangs.
-                    const bool active = _this->job_running || _this->state.get() != DIMC_IDLE;
-                    _this->clear_engine();
-                    if (active) _this->tracer.idle();
-                }
-                if (scope != 0x1) {                 // scopes 0 and 2 clear the regfile
-                    for (uint32_t i = 0; i < N_CFG_REGS; i++)
-                        _this->register_file[i] = 0x0;
-                    for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++)
-                        for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++)
-                            _this->ctx_regs[ctx][i] = 0x0;
-                }
-                // Re-publish the monotonic counters the register_file wipe cleared.
-                _this->register_file[DIMC_HWPE_FIN_JOBS >> 2] = _this->finished_jobs;
-                _this->register_file[DIMC_HWPE_RUN_TASK >> 2] = _this->running_job;
-                break;
-            }
-            default:
-                break;
-            }
-        }
-    } else {
-        // ACQUIRE: a read reserves a context, which the next commit_trigger (0x0/0x1)
-        // fills from the live bundle, and returns the next job id.
+    if (!req->get_is_write()) {
         if (address == DIMC_HWPE_ACQ) {
-            // Error codes of hwpe_ctrl_target.sv: -2 while an acquired job is not yet
-            // committed, -1 when every context is busy.
-            if (_this->acquired_ctx >= 0) {
-                *(uint32_t *)req->get_data() = 0xFFFFFFFEu;
-            } else if ((_this->acquired_ctx = _this->ctx_alloc()) < 0) {
-                *(uint32_t *)req->get_data() = 0xFFFFFFFFu;
-            } else {
-                _this->ctx_busy[_this->acquired_ctx] = true;
-                *(uint32_t *)req->get_data() = _this->next_job_id;
-            }
-            return vp::IO_REQ_OK;
+            // -2 while an acquired job is not committed, -1 when the queue is full.
+            if (_this->gemm_acquired)            *data = 0xFFFFFFFEu;
+            else if (pending >= DIMC_NB_CONTEXT) *data = 0xFFFFFFFFu;
+            else { _this->gemm_acquired = true;  *data = _this->next_gemm_id; }
+        } else if (address == DIMC_HWPE_EXT_STATUS) {
+            *data = (_this->gemm_error ? 0x2u : 0x0u) | (pending ? 0x1u : 0x0u);
+        } else if (address >= DIMC_IO_BASE) {
+            *data = _this->gemm_live[(address - DIMC_IO_BASE) >> 2];
+        } else {
+            *data = _this->register_file[address >> 2];
         }
-        if (address > DIMC_HWPE_REG_MAX) {
-            _this->trace.fatal("Trying to access invalid address 0x%x\n", address);
-            return vp::IO_REQ_INVALID;
-        }
-        // acc_o. Read-only; a write faults on the path above.
-        if (address == DIMC_HWPE_ACC_VAL_0 || address == DIMC_HWPE_ACC_VAL_1) {
-            uint32_t blk_id = (address == DIMC_HWPE_ACC_VAL_0) ? 0 : 1;
-            int32_t v = (blk_id < _this->inner_blocks.size())
-                      ? _this->inner_blocks[blk_id].out_accum.acc : 0;
-            *(uint32_t *)req->get_data() = (uint32_t)v;
-            return vp::IO_REQ_OK;
-        }
-        if (address >= DIMC_HWPE_JOB_BASE) {
-            // The live bundle, the same place the writes go. The FIFO holds
-            // committed snapshots and is not addressable; reading a job
-            // register reads back what software last wrote, running job or not.
-            *(uint32_t *)req->get_data() =
-                _this->live_regs[(address - DIMC_HWPE_JOB_BASE) >> 2];
-            return vp::IO_REQ_OK;
-        }
-        *(uint32_t *)req->get_data() = _this->register_file[(address >> 2)];
+        return vp::IO_REQ_OK;
     }
 
+    if (address >= DIMC_IO_BASE) {
+        _this->gemm_live[(address - DIMC_IO_BASE) >> 2] = *data;
+    } else if (address == DIMC_HWPE_TRIG) {
+        // Commit the registers as one job and start it, or queue it behind the running one.
+        if (pending < DIMC_NB_CONTEXT) {
+            Gemm g;
+            g.id = _this->next_gemm_id++;
+            std::memcpy(g.reg, _this->gemm_live, sizeof(g.reg));
+            _this->gemm_queue.push_back(g);
+            _this->gemm_acquired = false;
+            _this->gemm_step();
+        }
+    } else if (address == DIMC_HWPE_SOFT_CLEAR) {
+        const bool active = _this->job_running || _this->state.get() != DIMC_IDLE;
+        _this->clear_engine();
+        if (active) _this->tracer.idle();
+        // The aborted jobs count as finished: job id + 1 stays the FIN_JOBS value it ends at.
+        _this->finished_jobs = _this->next_gemm_id;
+        _this->register_file[DIMC_HWPE_FIN_JOBS >> 2] = _this->finished_jobs;
+        _this->register_file[DIMC_HWPE_STATUS >> 2] = 0x1;
+    }
     return vp::IO_REQ_OK;
 }
 

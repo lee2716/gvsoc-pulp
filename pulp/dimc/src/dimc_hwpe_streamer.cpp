@@ -150,44 +150,23 @@ int Dimc_HWPE_Streamer::issue_beat(int width, void* buf) {
     return (int)latency;
 }
 
-// ---- Stream address setup, per macro ----
-uint32_t Dimc_HWPE::slot_offset(const JobGeom &g, uint32_t blk_id, uint8_t kind) const
-{
-    // One kernel block per dual, whichever macro runs the job; one feature block for all.
-    return kind == DIMC_LOAD_KB ? blk_id * g.row_count * DIMC_MACRO_KB_EW : 0;
-}
-
-// Point macro m's input streamers at the operands of vector `run` of the job in context ctx,
-// which is the job being filled, not necessarily the running one.
-void Dimc_HWPE::configure_macro_streams(uint32_t blk_id, uint32_t m, int ctx, uint32_t run,
-                                        bool kernel, bool feature)
+// Point macro m's kernel streamer at the kernel rows of dual blk_id for the tile product in
+// context ctx: row_count rows of 128 bytes, a row stride apart.
+void Dimc_HWPE::configure_kernel_stream(uint32_t blk_id, uint32_t m, int ctx)
 {
     const JobGeom &g = this->job_geom[ctx];
-    Dimc_InnerBlock &blk = this->inner_blocks[blk_id];
-    if (kernel)
-        blk.weight_stream[m].configure(
-            this->job_reg_ctx(ctx, DIMC_HWPE_JOB_KB_SRC_ADDR)
-                + this->slot_offset(g, blk_id, DIMC_LOAD_KB), g.row_count * DIMC_MACRO_KB_EW,
-            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D0_LENGTH),
-            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D0_STRIDE),
-            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D1_LENGTH),
-            this->job_reg_ctx(ctx, DIMC_HWPE_KB_D1_STRIDE), 0, 0, 0);
-    if (feature)
-        blk.input_stream[m].configure(
-            this->job_reg_ctx(ctx, DIMC_HWPE_JOB_FB_SRC_ADDR) + run * g.fb_vec_stride
-                + this->slot_offset(g, blk_id, DIMC_LOAD_FB), DIMC_MACRO_FB_EW,
-            this->job_reg_ctx(ctx, DIMC_HWPE_FB_D0_LENGTH),
-            this->job_reg_ctx(ctx, DIMC_HWPE_FB_D0_STRIDE), 0, 0, 0, 0, 0);
+    this->inner_blocks[blk_id].weight_stream[m].configure(
+        this->job_reg_ctx(ctx, DIMC_TP_KB_SRC) + blk_id * g.row_count * g.kb_row_stride,
+        g.row_count * DIMC_MACRO_KB_EW, DIMC_MACRO_KB_EW, g.kb_row_stride, g.row_count, 0, 0, 0, 0);
 }
 
-// Point the dual's output streamer at output row `row` of the job in context ctx: NB_VEC
-// results, one per vector.
+// Point the dual's output streamer at output row `row` of the tile product in context ctx:
+// one result per vector.
 void Dimc_HWPE::configure_out_stream(uint32_t blk_id, uint32_t row, uint32_t ctx)
 {
     const JobGeom &g = this->job_geom[ctx];
     this->inner_blocks[blk_id].out_stream[0].configure(
-        this->job_reg_ctx((int)ctx, DIMC_HWPE_JOB_DST_ADDR)
-            + (blk_id * g.row_count + row) * g.out_row_stride,
+        this->job_reg_ctx((int)ctx, DIMC_TP_DST) + (blk_id * g.row_count + row) * g.out_row_stride,
         g.nb_vec * DIMC_OUT_SLOT_BYTES, 0, 0, 0, 0, 0, 0, 0);
 }
 

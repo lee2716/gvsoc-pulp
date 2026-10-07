@@ -63,7 +63,7 @@ enum dimc_load_kind_t : uint8_t {
 // Why the engine has no job, traced as idle_why.
 enum dimc_idle_why_t : uint8_t {
     DIMC_IDLE_WHY_BUSY        = 0,
-    DIMC_IDLE_WHY_WAIT_COMMIT = 1,    // nothing queued: waiting for software
+    DIMC_IDLE_WHY_WAIT_COMMIT = 1,    // nothing queued
     DIMC_IDLE_WHY_START       = 2     // a job is queued, its start event is one cycle away
 };
 
@@ -154,7 +154,7 @@ class Dimc_Tracer {
         vp::Trace state_event;       // FSM state, one byte
         vp::Trace busy_event;        // 1 while a job runs
         vp::Trace job_event;         // id of the running job
-        vp::Trace commit_event;      // id of each job as software commits it
+        vp::Trace commit_event;      // id of each tile product as the sequencer commits it
         vp::Trace idle_why_event;    // dimc_idle_why_t
         vp::Trace outer_grant_event; // which inner block booked a port this cycle, 255 = none
         uint8_t   outer_grant = DIMC_GRANT_NONE;

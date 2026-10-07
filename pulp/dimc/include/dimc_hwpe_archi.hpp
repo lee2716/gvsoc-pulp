@@ -17,123 +17,51 @@
 #ifndef __DIMC_HWPE_ARCHI__
 #define __DIMC_HWPE_ARCHI__
 
-#define N_CFG_REGS 64
+/* Software interface: the hwpe-ctrl control block and the job registers of
+ * dual_DIMC/rtl/dimc_package.sv. One job is one matrix multiplication
+ * Result[weight_rows][input_cols] = Weights[weight_rows][weight_cols] x Inputs[input_rows][input_cols],
+ * all three row-major in memory, 8-bit operands, 32-bit results. */
+#define N_CFG_REGS 8
 
-#define DIMC_HWPE_BASE   0x0
+#define DIMC_HWPE_TRIG               0x00  /* commit the acquired job and start it        */
+#define DIMC_HWPE_ACQ                0x04  /* read: job id, or negative when no slot free */
+#define DIMC_HWPE_FIN_JOBS           0x08  /* jobs finished                               */
+#define DIMC_HWPE_STATUS             0x0C  /* 0 while a job runs, 1 after it              */
+#define DIMC_HWPE_RUN_TASK           0x10  /* id of the running job                       */
+#define DIMC_HWPE_SOFT_CLEAR         0x14  /* abort everything                            */
+#define DIMC_HWPE_EXT_STATUS         0x18  /* bit 0 busy, bit 1 the last job was rejected */
 
-/* ================= Mandatory control block @ 0x00 =================
- * Standard HWPE control interface (hwpe-ctrl), at the same offsets as the PCM
- * wrapper. The block split -- control @ 0x00, job-independent @ 0x20,
- * job-dependent @ 0x40 -- is the one hwpe_ctrl_regif_example.rdl defines. That
- * map leaves 0x08, 0x18 and 0x1C reserved; like PCM, this model puts
- * finished_jobs at 0x08, and neither 0x18 nor 0x1C carries a register.
- * 0x18 does serve as the dispatch boundary on hwpe_slave()'s WRITE path: an
- * address at or below it is a command decoded by a switch, an address above it
- * is a register write. Reads take no such split.
- */
-#define DIMC_HWPE_TRIG               (DIMC_HWPE_BASE + 0x00)  /* commit_trigger */
-#define DIMC_HWPE_ACQ                (DIMC_HWPE_BASE + 0x04)  /* acquire        */
-#define DIMC_HWPE_FIN_JOBS           (DIMC_HWPE_BASE + 0x08)  /* finished       */
-#define DIMC_HWPE_STATUS             (DIMC_HWPE_BASE + 0x0C)  /* status         */
-#define DIMC_HWPE_RUN_TASK           (DIMC_HWPE_BASE + 0x10)  /* running_job    */
-#define DIMC_HWPE_SOFT_CLEAR         (DIMC_HWPE_BASE + 0x14)  /* soft_clear     */
-#define DIMC_HWPE_CHK_STATE          (DIMC_HWPE_BASE + 0x18)  /* reserved + boundary */
+#define DIMC_NB_CONTEXT              2     /* jobs the queue holds, the running one included */
 
-/* ============ Generic / job-INDEPENDENT registers @ 0x20 ============
- * Compute configuration, not part of the per-job register bundle. CFG_CI,
- * SIGN_8B and COMPUTE_MASK are snapshotted at commit and travel with the job.
- * NUM_MACROS is read when a job's shape is latched; COMPE and SEL_DIMC are
- * stored, never read.
- */
-#define DIMC_HWPE_CFG_CI             (DIMC_HWPE_BASE + 0x20)  /* INT1/2/4/8      */
-#define DIMC_HWPE_SIGN_8B            (DIMC_HWPE_BASE + 0x24)  /* INT8 sign combo */
-#define DIMC_HWPE_COMPE              (DIMC_HWPE_BASE + 0x28)  /* memory/compute  */
-#define DIMC_HWPE_COMPUTE_MASK       (DIMC_HWPE_BASE + 0x2C)  /* bits masked off */
-#define DIMC_HWPE_NUM_MACROS         (DIMC_HWPE_BASE + 0x30)  /* not read */
-#define DIMC_HWPE_SEL_DIMC           (DIMC_HWPE_BASE + 0x34)
-/* autotrigger_n, this model's own register -- hwpe-ctrl defines no equivalent:
- *   0 (default) = automatically start the next queued job when one finishes
- *   1           = wait for an explicit trigger (commit_trigger 0x0 / 0x2)
- * Job-INDEPENDENT, so it is not part of the bundle a commit snapshots. */
-#define DIMC_HWPE_AUTOTRIGGER_N      (DIMC_HWPE_BASE + 0x38)
+/* Job registers at DIMC_IO_BASE + 4 * index. */
+#define DIMC_IO_BASE                 0x20
+#define DIMC_REG_INPUT_ADDR          0
+#define DIMC_REG_KERNEL_ADDR         1
+#define DIMC_REG_OUTPUT_ADDR         2
+#define DIMC_REG_WEIGHT_ROWS         3     /* multiple of 32            */
+#define DIMC_REG_WEIGHT_COLS         4     /* multiple of 128           */
+#define DIMC_REG_INPUT_ROWS          5     /* = weight_cols             */
+#define DIMC_REG_INPUT_COLS          6     /* multiple of 8             */
+#define DIMC_REG_FORMAT              7     /* [1:0] mode (3 = INT8), [3:2] sign_8b */
+#define DIMC_REG_BIAS                8     /* ADDIN, added once per 128-column tile */
+#define DIMC_REG_COMPUTE_MASK        9
+#define DIMC_REG_WRITE_MASK          10    /* eight words; stored, not modelled */
+#define DIMC_NB_REGS                 18
+#define DIMC_HWPE_REG_MAX            (DIMC_IO_BASE + 4 * DIMC_NB_REGS - 4)
 
-/* Output accumulator, one per inner block (rtl/accumulator.sv via cleopatra.sv).
- * Sums every result the block emits, across rows and across jobs.
- * Job-INDEPENDENT: ACC_CTRL must stay below JOB_BASE, or a commit would
- * snapshot it and the accumulator would turn per-job. */
-#define DIMC_HWPE_ACC_CTRL           (DIMC_HWPE_BASE + 0x3C)  /* b0=enable b1=clear */
-#define DIMC_HWPE_ACC_CTRL_EN_BIT    (1 << 0)
-#define DIMC_HWPE_ACC_CTRL_CLR_BIT   (1 << 1)
-#define DIMC_HWPE_ACC_VAL_0          (DIMC_HWPE_BASE + 0x8C)  /* read-only acc_o, block 0 */
-#define DIMC_HWPE_ACC_VAL_1          (DIMC_HWPE_BASE + 0x90)  /* read-only acc_o, block 1 */
-
-/* ============== Job-DEPENDENT registers @ 0x40 ==============
- * Per-job context: data pointers, stream geometry, per-job scalars.
- * This block is ONE live bundle. Software writes it and COMMIT snapshots the
- * whole thing into a job FIFO of depth DIMC_NB_CONTEXT, so several jobs can be
- * offloaded while one runs and a value only has to be rewritten when it
- * changes. A queue slot is not addressable: ACQUIRE returns a job id, never a
- * slot index (hwpe_ctrl_target.sv).
- */
-#define DIMC_NB_CONTEXT              2
-#define DIMC_HWPE_JOB_BASE           (DIMC_HWPE_BASE + 0x40)
-#define DIMC_HWPE_NB_JOB_REGS        35   /* 0x40 .. 0xC8 inclusive; 0x8C/0x90 are
-                                          * intercepted as ACC_VAL and leave holes */
-#define DIMC_HWPE_JOB_KB_SRC_ADDR    (DIMC_HWPE_BASE + 0x40)
-#define DIMC_HWPE_JOB_FB_SRC_ADDR    (DIMC_HWPE_BASE + 0x44)
-#define DIMC_HWPE_JOB_DST_ADDR       (DIMC_HWPE_BASE + 0x48)
-/* One job carries NB_VEC input vectors of the same chunk, at most 8 (the dual's accumulators).
- * Vector b reads its feature at FB_SRC + b * FB_VEC_STRIDE. 0 or 1: one vector. */
-#define DIMC_HWPE_NB_VEC             (DIMC_HWPE_BASE + 0x4C)
-
-#define DIMC_HWPE_KB_D0_LENGTH       (DIMC_HWPE_BASE + 0x50)
-#define DIMC_HWPE_KB_D0_STRIDE       (DIMC_HWPE_BASE + 0x54)
-#define DIMC_HWPE_KB_D1_LENGTH       (DIMC_HWPE_BASE + 0x58)
-#define DIMC_HWPE_KB_D1_STRIDE       (DIMC_HWPE_BASE + 0x5C)
-#define DIMC_HWPE_FB_VEC_STRIDE      (DIMC_HWPE_BASE + 0x60)
-
-#define DIMC_HWPE_FB_D0_LENGTH       (DIMC_HWPE_BASE + 0x64)
-#define DIMC_HWPE_FB_D0_STRIDE       (DIMC_HWPE_BASE + 0x68)
-#define DIMC_HWPE_PSIN_VEC_STRIDE    (DIMC_HWPE_BASE + 0x6C)  /* not read */
-
-#define DIMC_HWPE_OUT_D0_LENGTH      (DIMC_HWPE_BASE + 0x70)
-#define DIMC_HWPE_OUT_D0_STRIDE      (DIMC_HWPE_BASE + 0x74)
-
-#define DIMC_HWPE_ROW_SEL_BASE       (DIMC_HWPE_BASE + 0x78)
-#define DIMC_HWPE_ROW_COUNT          (DIMC_HWPE_BASE + 0x7C)
-#define DIMC_HWPE_CFG_BIAS           (DIMC_HWPE_BASE + 0x80)
-/* The job's constant on ADDIN, added to every row's dot product. */
-#define DIMC_HWPE_PSIN               (DIMC_HWPE_BASE + 0x84)
-
-/* A TILE_LAST job writes its outputs row-major, one row of NB_VEC results per port word:
- * row r of dual b, vector v, at DST + (b * row_count + r) * OUT_ROW_STRIDE + 4 * v. */
-#define DIMC_HWPE_OUT_ROW_STRIDE     (DIMC_HWPE_BASE + 0x88)
-
-/* Not read: results accumulate in the dual between jobs (see TILE_LAST), and every job
- * loads its kernel rows. */
-#define DIMC_HWPE_PSIN_EN            (DIMC_HWPE_BASE + 0x94)
-#define DIMC_HWPE_JOB_PSIN_SRC_ADDR  (DIMC_HWPE_BASE + 0x98)
-#define DIMC_HWPE_KB_REUSE           (DIMC_HWPE_BASE + 0x9C)
-#define DIMC_HWPE_PSIN_DEP           (DIMC_HWPE_BASE + 0xA0)
-
-/* Where dual b reads and writes: its kernel rows at KB_SRC + b * row_count * 128 B, whichever
- * of its macros runs the job; the one feature block at FB_SRC; its output rows as
- * OUT_ROW_STRIDE says. ADDR_MODE and the MSTRIDE / BSTRIDE registers are not read. */
-#define DIMC_HWPE_ADDR_MODE          (DIMC_HWPE_BASE + 0xA4)
-#define DIMC_HWPE_KB_MSTRIDE         (DIMC_HWPE_BASE + 0xA8)
-#define DIMC_HWPE_KB_BSTRIDE         (DIMC_HWPE_BASE + 0xAC)
-#define DIMC_HWPE_FB_MSTRIDE         (DIMC_HWPE_BASE + 0xB0)
-#define DIMC_HWPE_FB_BSTRIDE         (DIMC_HWPE_BASE + 0xB4)
-#define DIMC_HWPE_PSIN_MSTRIDE       (DIMC_HWPE_BASE + 0xB8)
-#define DIMC_HWPE_PSIN_BSTRIDE       (DIMC_HWPE_BASE + 0xBC)
-#define DIMC_HWPE_OUT_MSTRIDE        (DIMC_HWPE_BASE + 0xC0)
-#define DIMC_HWPE_OUT_BSTRIDE        (DIMC_HWPE_BASE + 0xC4)
-/* 1: the job is the last one of an output tile. After its last row the dual writes its
- * accumulators to DST and clears them; 0: the results stay in the accumulators. */
-#define DIMC_HWPE_TILE_LAST          (DIMC_HWPE_BASE + 0xC8)
-
-/* Streamer bandwidth is not MMIO: it is fixed in the systree. */
-
-#define DIMC_HWPE_REG_MAX            (DIMC_HWPE_BASE + 0xC8)
+/* One tile product (32 output rows x 128 columns x 8 vectors) as the engine runs it: the
+ * descriptor the job sequencer writes into an engine context. Not software-visible. */
+enum {
+    DIMC_TP_KB_SRC,          /* first kernel row of inner block 0             */
+    DIMC_TP_KB_ROW_STRIDE,   /* bytes from one kernel row to the next         */
+    DIMC_TP_FB_SRC,          /* first input row of the tile                   */
+    DIMC_TP_FB_ROW_STRIDE,
+    DIMC_TP_DST,             /* first output row of inner block 0             */
+    DIMC_TP_OUT_ROW_STRIDE,
+    DIMC_TP_BIAS,
+    DIMC_TP_TILE_LAST,       /* last tile product of its output tile: write the accumulators out */
+    DIMC_TP_NB_BLOCKS,       /* inner blocks that take part                   */
+    DIMC_TP_NB_REGS
+};
 
 #endif

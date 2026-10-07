@@ -100,28 +100,6 @@ class Dimc_Port {
         uint32_t bandwidth_bytes = 1;
 };
 
-// ---- rtl/accumulator.sv, instantiated by rtl/cleopatra.sv ----
-// One register summing every result that enters the block's out_fifo (ACC_CTRL, ACC_VAL).
-class Dimc_OutAccum {
-    public:
-        void push(int32_t psout)
-        {
-            if (!this->enable) return;
-            this->acc += psout;
-            this->count++;
-        }
-
-        void clear()
-        {
-            this->acc = 0;
-            this->count = 0;
-        }
-
-        int32_t  acc    = 0;   // acc_q
-        uint32_t count  = 0;   // values summed, trace only
-        uint8_t  enable = 0;   // acc_enable_i
-};
-
 // ---- Inner block: num_macros macros on one inner (L1) port ----
 // A plain class, not a vp::Component. One control plane drives N of these.
 class Dimc_InnerBlock {
@@ -189,23 +167,29 @@ class Dimc_InnerBlock {
         std::deque<OutEntry> out_fifo;
         int32_t  acc[DIMC_ACC_VECTORS * DIMC_MACRO_KB_LEN] = {0};
         int64_t  last_acc_cycle = -1000;   // cycle of the last result accumulated
+        int64_t  present_ack_cycle = -1000; // cycle the last output word was acknowledged
+        // The input tile being read: 128 rows of 8 bytes, one row per port beat, which the
+        // streamer transposes into the job's 8 vectors (dimc_streamer.sv, input_tile_q).
+        uint32_t tile_job = 0xFFFFFFFFu;
+        uint32_t tile_rows = 0;
+        uint64_t tile_ready = 0;           // first cycle after the last row's response
+        uint8_t  tile[DIMC_MACRO_FB_EW][DIMC_ACC_VECTORS];
         // Rows of the running job's tile written to L1 so far.
         uint32_t out_written = 0;
         // In DIMC_STORING: every result of the running job written and acknowledged, as of
         // the last cycle; the block then stops writing back.
         bool phase_done;
 
-        // Accumulates across jobs, so reset_job_state() must not touch it.
-        Dimc_OutAccum out_accum;
-
         // Clear what the engine tracks for one job, at every job start. keep_fill leaves the
         // fill cursor, the in-flight beats and the input FIFO alone: the fill runs ahead into
-        // the next job. The weight FIFO may hold a held job's kernel and is not cleared here.
+        // the next job. The weight FIFO is not cleared here.
         void reset_job_state(bool keep_fill)
         {
             if (!keep_fill) {
                 this->fill.reset(this->macros.size());
                 this->inp_fifo.clear();
+                this->tile_job = 0xFFFFFFFFu;
+                this->tile_rows = 0;
                 while (!this->port_pending.empty()) this->port_pending.pop();
                 while (!this->kb_pending.empty()) this->kb_pending.pop();
                 while (!this->in_pending.empty()) this->in_pending.pop();
@@ -259,34 +243,46 @@ class Dimc_HWPE : public vp::Component {
         // Internal state
         vp::reg_32 state;
 
-        // ---- Standard HWPE offload/context bookkeeping ----
-        uint32_t running_job;   // id of the job currently executing (RUNNING_JOB reg)
-        uint32_t next_job_id;   // id handed out by the next ACQUIRE
-        uint32_t finished_jobs; // count of completed jobs (FINISHED reg)
-        bool     job_running;   // the engine is executing a committed job
+        // ---- Jobs, as software queues them (hwpe-ctrl, 2 contexts) ----
+        struct Gemm {
+            uint32_t id;
+            uint32_t reg[DIMC_NB_REGS];
+        };
+        uint32_t gemm_live[DIMC_NB_REGS];   // the registers software writes
+        std::deque<Gemm> gemm_queue;        // committed, not started
+        Gemm     gemm;                      // the running job
+        bool     gemm_running;
+        bool     gemm_acquired;             // ACQUIRE read, commit pending
+        bool     gemm_error;                // the last job was rejected
+        uint32_t next_gemm_id;
+        uint32_t finished_jobs;
+        // Tile products of the running job: the next one's tile indices, how many are
+        // committed to the engine, and how many it has.
+        uint32_t gemm_k, gemm_q, gemm_l, gemm_issued, gemm_total;
+        bool     gemm_valid(const Gemm &g) const;
+        void     gemm_step();               // start jobs, commit tile products, end jobs
+        void     gemm_commit_tile(int ctx);
+        void     gemm_finish(bool error);
 
-        // Job queue (hwpe_ctrl_target.sv): ONE live bundle of job-dependent registers, which
-        // COMMIT snapshots into a job FIFO of depth NB_CONTEXT. ACQUIRE hands back a job id,
-        // never a slot index. ctx_regs is that FIFO's storage; live_regs is what software writes.
-        uint32_t live_regs[DIMC_HWPE_NB_JOB_REGS];
-        uint32_t ctx_regs[DIMC_NB_CONTEXT][DIMC_HWPE_NB_JOB_REGS];
-        bool     ctx_busy[DIMC_NB_CONTEXT];    // acquired or committed, not yet retired
-        uint32_t ctx_job_id[DIMC_NB_CONTEXT];  // job id stamped at commit
-        // CFG_CI, SIGN_8B and COMPUTE_MASK as they stood at commit. A macro takes them with
-        // the job's operands, since it may trigger that job's rows while an earlier job
-        // still runs.
+        // ---- The engine's own queue of tile products ----
+        uint32_t running_job;   // id of the tile product the engine runs
+        uint32_t next_job_id;
+        bool     job_running;
+        uint32_t ctx_regs[DIMC_NB_CONTEXT][DIMC_TP_NB_REGS];
+        bool     ctx_busy[DIMC_NB_CONTEXT];
+        uint32_t ctx_job_id[DIMC_NB_CONTEXT];
+        // Mode, sign and compute mask of the job a tile product belongs to: a macro takes
+        // them with the operands, since it may trigger while an earlier job's last tile runs.
         uint8_t  ctx_ci[DIMC_NB_CONTEXT];
         uint8_t  ctx_sign_8b[DIMC_NB_CONTEXT];
         uint16_t ctx_compute_mask[DIMC_NB_CONTEXT];
-        int      acquired_ctx;                 // context SW is currently filling (-1 none)
         int      running_ctx;                  // context the engine executes (-1 none)
         // Committed-but-not-yet-running contexts, in commit order.
         std::deque<int> ctx_queue;
 
         int      ctx_alloc();                  // reserve a free context, -1 if none
-        uint32_t job_reg(uint32_t addr) const; // read a job-dep reg of the RUNNING ctx
         void     start_next_job();             // launch the pending context, if any
-        // The engine as a reset leaves it (reset, and soft_clear scopes 0 and 1).
+        // The engine and the job queue as a reset leaves them.
         void     clear_engine();
 
         // One cycle of fill, compute and write-back on every block; `phase` is the FSM
@@ -303,11 +299,11 @@ class Dimc_HWPE : public vp::Component {
         // survives until the engine reaches it.
         struct JobGeom {
             uint32_t row_count, row_base, compute_cyc;
-            uint32_t tile_last;   // TILE_LAST: write the accumulators out after this job
+            uint32_t tile_last;   // write the accumulators out after this tile product
             uint32_t beats_per_macro, kb_beats_per_row;
             uint32_t fb_beats_per_macro, out_beats;
             // Batched descriptor: vectors per job and their strides (1 / 0 = one vector).
-            uint32_t nb_vec, fb_vec_stride, out_row_stride;
+            uint32_t nb_vec, out_row_stride, kb_row_stride, nb_blocks;
             uint32_t kb_sections() const { return row_count * kb_beats_per_row; }
         };
         // The job id whose geometry job_geom[ctx] holds, so a job is latched once
@@ -319,11 +315,8 @@ class Dimc_HWPE : public vp::Component {
         BeatPos  beat_pos(const JobGeom &g, uint32_t within) const;
         void     size_fill(int ctx);
         void     plan_macro_fill(uint32_t blk_id, uint32_t m, int ctx);
-        void     configure_macro_streams(uint32_t blk_id, uint32_t m, int ctx, uint32_t run,
-                                         bool kernel, bool feature);
+        void     configure_kernel_stream(uint32_t blk_id, uint32_t m, int ctx);
         void     configure_out_stream(uint32_t blk_id, uint32_t row, uint32_t ctx);
-        // Byte offset of dual blk_id's block inside the kernel or the feature operand.
-        uint32_t slot_offset(const JobGeom &g, uint32_t blk_id, uint8_t kind) const;
         JobGeom job_geom[DIMC_NB_CONTEXT];
         // The running job's context.
         uint32_t exec_slot = 0;
@@ -336,11 +329,12 @@ class Dimc_HWPE : public vp::Component {
         void     retire_block(Dimc_InnerBlock &blk);
         uint64_t out_dropped = 0;   // results the out_fifo lost (as the RTL would)
         void     fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id, bool kernel_feed);
-        bool     program_next(const Dimc_InnerBlock &blk, uint32_t m, BeatPos &pos) const;
+        // Macro m's fill program still has kernel / feature sections to fetch.
+        bool     kernel_owed(const Dimc_InnerBlock &blk, uint32_t m) const;
+        bool     feature_owed(const Dimc_InnerBlock &blk, uint32_t m) const;
         uint32_t pick_kernel(const Dimc_InnerBlock &blk, uint8_t &why) const;
         uint32_t pick_input(const Dimc_InnerBlock &blk, uint8_t &why) const;
         uint8_t  refusal(const std::queue<uint64_t> &pending, const Dimc_Port &port) const;
-        bool     fetch_kernel_ahead(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, int ctx);
         void     fetch_kernel_section(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, int ctx,
                                       uint32_t job, uint32_t sub);
         void     push_section(Dimc_InnerBlock &blk, uint32_t blk_id, Dimc_HWPE_Streamer &st,
@@ -348,7 +342,7 @@ class Dimc_HWPE : public vp::Component {
                               std::deque<Dimc_InnerBlock::FeedEntry> &fifo,
                               std::queue<uint64_t> &pending, uint8_t kind);
         uint32_t kernel_in_progress(const Dimc_InnerBlock &blk) const;
-        void     fill_beat(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro);
+        void     feed_input(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro);
 
         uint32_t rows_before_turn(const Dimc_InnerBlock &blk, uint32_t m, uint32_t job) const;
         // The macro of a dual that runs `job`: the two take turns.
@@ -357,7 +351,7 @@ class Dimc_HWPE : public vp::Component {
         // Latch one context's job shape into its geometry slot.
         void latch_geom(int ctx);
         void ensure_geom(int ctx);
-        uint32_t job_reg_ctx(int ctx, uint32_t addr) const;
+        uint32_t job_reg_ctx(int ctx, uint32_t idx) const;
         // Accumulate, move retired rows into the out_fifo, trigger the macro whose turn it is.
         void compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id);
         void store_block(Dimc_InnerBlock &blk, uint32_t blk_id);
@@ -375,15 +369,12 @@ class Dimc_HWPE : public vp::Component {
         static void fsm_start_handler(vp::Block *__this, vp::ClockEvent *event);
         static void fsm_handler(vp::Block *__this, vp::ClockEvent *event);
         static void fsm_end_handler(vp::Block *__this, vp::ClockEvent *event);
-        static void held_handler(vp::Block *__this, vp::ClockEvent *event);
-        bool held_kernel_step(Dimc_InnerBlock &blk, uint32_t blk_id, int ctx);
 
         void fsm_loop();
 
         vp::ClockEvent *fsm_start_event;
         vp::ClockEvent *fsm_event;
         vp::ClockEvent *fsm_end_event;
-        vp::ClockEvent *held_event;   // one cycle of the idle kernel preload
 };
 
 #endif

@@ -280,9 +280,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
     if (this->cur_state == DIMC_STARTING && !blk.wgt_fifo.empty() && blk.wgt_fifo.front().macro != m) {
         bool own = false;
         for (const Dimc_InnerBlock::FeedEntry &q : blk.wgt_fifo) if (q.macro == m) { own = true; break; }
-        const Dimc_InnerBlock::FillCursor &f = blk.fill;
-        if (!own && m < f.macro_beat_index.size() && f.macro_beat_index[m] < f.macro_beat_total[m])
-            own = this->dimc.beat_pos(this->dimc.job_geom[mac.fill_slot], f.macro_beat_index[m]).kind == DIMC_LOAD_KB;
+        if (!own) own = this->dimc.kernel_owed(blk, m);
         if (own) return DIMC_WHY_WAIT_WGT_FIFO;
     }
     // Owes a feature section: its first one in the input FIFO says
@@ -290,9 +288,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
     // FIFO is in order. At the head: beat_writable refused it. Not fetched: this cycle's
     // input-feed refusal, else the heuristic below.
     if (this->cur_state == DIMC_STARTING) {
-        const Dimc_InnerBlock::FillCursor &f = blk.fill;
-        if (m < f.macro_beat_index.size() && f.macro_beat_index[m] < f.macro_beat_total[m]
-            && this->dimc.beat_pos(this->dimc.job_geom[mac.fill_slot], f.macro_beat_index[m]).kind != DIMC_LOAD_KB) {
+        if (this->dimc.feature_owed(blk, m)) {
             const std::deque<Dimc_InnerBlock::FeedEntry> &q = blk.inp_fifo;
             for (size_t i = 0; i < q.size(); i++) {
                 if (q[i].macro != m) continue;
@@ -351,11 +347,6 @@ void Dimc_Tracer::job_closed(uint64_t now_cycle)
                 mac.fill_start, mac.fill_done, mac.compute_start, mac.compute_end,
                 blk.fill.macro_beat_total[m],
                 mac.load_done, g.compute_cyc, tb.out_beat_lat_est, finish);
-        }
-        if (blk.out_accum.enable) {
-            this->text->msg(vp::TraceLevel::WARNING,
-                "block[%u] out_accum: acc=%d n=%u\n",
-                b, blk.out_accum.acc, blk.out_accum.count);
         }
     }
 

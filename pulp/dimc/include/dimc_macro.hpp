@@ -38,13 +38,18 @@
 // The dual's accumulators, as in cleopatra.sv: one 32-bit register per (vector, row), so a job
 // carries at most DIMC_ACC_VECTORS vectors.
 #define DIMC_ACC_VECTORS    8
-// The two macros of a dual take turns on the same output rows: job j runs on macro j % 2 while
-// the other macro is loaded with job j + 1's kernel and first vector. A macro starts its job
-// once the other one has triggered every row of the job before and every result of it is in
-// the accumulators. A job's results stay in the accumulators; a job with TILE_LAST set writes
-// them to its destination after its last row and clears them, and nothing computes meanwhile.
-// While the engine is idle with committed jobs held (commit-only), each dual fetches the first
-// held job's kernel into the weight FIFO; it is written into the macro once the job runs.
+// The engine runs one tile product at a time (32 output rows x 128 columns x 8 vectors); in its
+// code a "job" is a tile product. The two macros of a dual take turns on the same output rows:
+// tile product j runs on macro j % 2 while the other macro is loaded with the next one's kernel
+// and first vector. A macro starts once the other has triggered every row of the tile product
+// before and every result of it is in the accumulators. Results stay in the accumulators until
+// the last tile product of an output tile (TILE_LAST), which writes them out and clears them;
+// nothing computes meanwhile.
+// A TILE_LAST tile product is written out two cycles after its last result is accumulated
+// (PRESENT, then the write request), and the next one starts DIMC_PRESENT_END_CYCLES after the
+// last word is acknowledged (sink done, result handshake, accumulator clear, tile advance, run).
+#define DIMC_PRESENT_START_CYCLES 2
+#define DIMC_PRESENT_END_CYCLES   5
 // Macro write rules: no section is written into a macro in a cycle in which it computes
 // (each waits for the cycle after the row trigger it depends on), and a macro takes one
 // kernel or feature section per cycle, the feature section first.
@@ -120,7 +125,7 @@ class Dimc_Macro {
         uint8_t  sign_8b      = DIMC_SIGN_UU;
         uint16_t compute_mask = 0;   // bits masked off the 1024-bit row
         // ADDIN, which spatz_dimc.sv samples with the row address on each trigger: the job's
-        // constant (PSIN register).
+        // bias.
         int32_t  addin = 0;
 
         // Buffers
@@ -160,12 +165,13 @@ class Dimc_Macro {
         uint32_t write_slot = 0;
         // Sections written for write_job.
         uint32_t written = 0;
-        // Kernel being fetched into the weight FIFO, by the program or ahead of it: job kpf_job,
+        // Kernel being fetched into the weight FIFO: job kpf_job,
         // kfetched sections so far. For write_job: kw kernel sections written, f0 = vector 0's
         // feature written, stamped = handed to compute as filled_job.
         uint32_t kpf_job  = JOB_NONE;
         uint32_t kpf_slot = 0;
         uint32_t kfetched = 0;
+        uint32_t ffetched = 0;       // feature sections of fill_job fetched
         uint32_t kw = 0;
         bool     f0 = false;
         bool     stamped = false;
