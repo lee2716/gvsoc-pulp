@@ -48,21 +48,20 @@
 // Macro write rules: no section is written into a macro in a cycle in which it computes
 // (each waits for the cycle after the row trigger it depends on), and a macro takes one
 // kernel or feature section per cycle, the feature section first.
-// The dual's weight and input FIFOs: 256 b sections, one kernel and two feature vectors
+// The dual's weight and input FIFOs: 256 b sections, one kernel and eight feature vectors
 // deep, written into a macro one section per cycle when its write port is open. One input
-// FIFO per dual shared by both macros, in fetch order, one pop per cycle; a head section its
-// macro cannot take yet holds the ones behind it.
+// FIFO per dual shared by both macros, in job order, one pop per cycle; a job's vectors are
+// all fetched before its macro starts.
 #define DIMC_WGT_FIFO_DEPTH 128
-#define DIMC_INP_FIFO_DEPTH 8
+#define DIMC_INP_FIFO_DEPTH 32
 // Each dual's three ports to L1, bytes per cycle, as dimc_top.sv: features, kernel, results.
 // A feature section is one L1 request that holds the input port for 4 cycles.
 #define DIMC_INPUT_PORT_BYTES  8
 #define DIMC_KERNEL_PORT_BYTES 32
 #define DIMC_OUTPUT_PORT_BYTES 32
-// Shared input FIFO: rows a feature section may be fetched ahead of the triggers it waits for.
-#ifndef DIMC_INP_FETCH_LEAD
-#define DIMC_INP_FETCH_LEAD 32
-#endif
+// Cycles the dual takes to switch macros after the last result of a job is accumulated: the
+// result count is compared a cycle later, then one cycle swaps the macros (dimc_datapath.sv).
+#define DIMC_SWITCH_CYCLES 2
 // Kernel and feature storage is single-banked, as in the macro: spatz_dimc.sv
 // declares one kernel_mem [31:0] and one feature_buf, and the two low bits of
 // RA/WA/FA select one of a row's four 256-bit sections rather than a bank. A

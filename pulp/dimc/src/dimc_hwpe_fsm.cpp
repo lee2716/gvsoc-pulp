@@ -321,22 +321,6 @@ bool Dimc_HWPE::rows_done() const
     return true;
 }
 
-// Rows the macro still triggers before vector `run` of `job` may enter its feature buffer.
-uint32_t Dimc_HWPE::rows_before_feature(const Dimc_Macro &mc, uint32_t job, uint32_t run) const
-{
-    // Nothing triggered yet: the first job's vector 0 is next; anything later waits for rows
-    // that have not started (the macro's kernel may still be going in).
-    if (mc.issue_job == Dimc_Macro::JOB_NONE)
-        return !run && (mc.write_job == Dimc_Macro::JOB_NONE || mc.write_job == job) ? 0 : 0xFFFFFFFFu;
-    uint32_t target;
-    if (mc.issue_job == job)                    target = run;
-    else if (mc.issue_job + this->num_macros == job && !run) target = mc.job_nb_vec;   // its previous job
-    else                                        return 0xFFFFFFFFu;
-    if (mc.runs_issued >= target) return 0;
-    const uint32_t cur = mc.rows_issued < mc.job_rows ? mc.rows_issued : 0;
-    return (target - mc.runs_issued) * mc.job_rows - cur;
-}
-
 // May this section be written into the macro now? Triggering shuts the kernel write port, and
 // a new feature would change the rows still to come: a feature of vector b >= 1 waits until
 // vector b - 1 is fully triggered (one feature buffer).
@@ -395,35 +379,17 @@ uint32_t Dimc_HWPE::pick_kernel(const Dimc_InnerBlock &blk, uint8_t &why) const
     return pick;
 }
 
-// Input feed, into the dual's shared FIFO while it has room: among the macros that may fetch,
-// the one whose section is needed first (fewest rows before its vector may enter, plus kernel
-// sections its job still writes).
+// Input feed, into the dual's shared FIFO while it has room: the next feature section of the
+// earlier job, so the FIFO holds the jobs' vectors in order.
 uint32_t Dimc_HWPE::pick_input(const Dimc_InnerBlock &blk, uint8_t &why) const
 {
     const uint32_t nb = (uint32_t)blk.macros.size();
     if (blk.inp_fifo.size() >= DIMC_INP_FIFO_DEPTH) return nb;
-    uint64_t best_u = ~(uint64_t)0;
     uint32_t pick = nb;
     for (uint32_t m = 0; m < nb; m++) {
         BeatPos pos;
         if (!this->program_next(blk, m, pos) || pos.kind == DIMC_LOAD_KB) continue;
-        const Dimc_Macro &t = blk.macros[m];
-        const JobGeom &fg = this->job_geom[t.fill_slot];
-        // The shared FIFO pops in order: a feature section is fetched once the rows it waits
-        // for (the previous vector, the macro's previous job, and for a vector after the first
-        // the other macro's turn) are at most DIMC_INP_FETCH_LEAD from triggered, so a head its
-        // macro cannot take yet holds the other macro's sections for at most that long.
-        const uint64_t turn = pos.run ? this->rows_before_turn(blk, m, t.fill_job) : 0;
-        if (!this->beat_writable(t, t.fill_job, pos)
-            && this->rows_before_feature(t, t.fill_job, pos.run) + turn > DIMC_INP_FETCH_LEAD) {
-            why = DIMC_WHY_WAIT_COMPUTE;
-            continue;
-        }
-        uint64_t u = this->rows_before_feature(t, t.fill_job, pos.run);
-        const uint32_t kb_all = fg.kb_sections();
-        const uint32_t kw = t.write_job == t.fill_job ? t.kw : 0;
-        if (kw < kb_all) u += kb_all - kw;
-        if (u < best_u) { best_u = u; pick = m; }
+        if (pick == nb || (int32_t)(blk.macros[m].fill_job - blk.macros[pick].fill_job) < 0) pick = m;
     }
     return pick;
 }
@@ -705,6 +671,7 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
         const Dimc_InnerBlock::OutEntry &e = blk.out_fifo.front();
         blk.acc[e.run * DIMC_MACRO_KB_LEN + e.row] += e.psout;
         blk.out_fifo.pop_front();
+        blk.last_acc_cycle = (int64_t)this->fsm_timestamp;
     }
     // A macro is never stalled for the out_fifo: a result it cannot take is lost, as in the
     // RTL. The model also warns; force_warning exits under werror.
@@ -740,7 +707,11 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
                 mac.rows_retired_set[s] = 0;
             }
             const uint32_t b = mac.runs_issued;   // the vector it issues next
+            // A job starts once all its vectors are fetched and the macros have switched.
+            const bool starting = !mac.rows_issued && !mac.runs_issued;
+            const bool loaded = !(mac.fill_job == jj && blk.fill.macro_beat_index[m] < blk.fill.macro_beat_total[m]);
             if (b < mac.job_nb_vec && mac.fb_run == b
+                && (!starting || (loaded && (int64_t)this->fsm_timestamp >= blk.last_acc_cycle + DIMC_SWITCH_CYCLES))
                 && !this->rows_before_turn(blk, m, jj)
                 && this->fsm_timestamp >= mac.fb_ready_cycle
                 && this->fsm_timestamp >= mac.fill_done_cycle && mac.can_accept()) {

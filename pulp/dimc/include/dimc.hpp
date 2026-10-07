@@ -188,6 +188,7 @@ class Dimc_InnerBlock {
         struct OutEntry { int32_t psout; uint16_t row; uint16_t run; };
         std::deque<OutEntry> out_fifo;
         int32_t  acc[DIMC_ACC_VECTORS * DIMC_MACRO_KB_LEN] = {0};
+        int64_t  last_acc_cycle = -1000;   // cycle of the last result accumulated
         // Rows of the running job's tile written to L1 so far.
         uint32_t out_written = 0;
         // In DIMC_STORING: every result of the running job written and acknowledged, as of
@@ -349,7 +350,6 @@ class Dimc_HWPE : public vp::Component {
         uint32_t kernel_in_progress(const Dimc_InnerBlock &blk) const;
         void     fill_beat(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro);
 
-        uint32_t rows_before_feature(const Dimc_Macro &mc, uint32_t job, uint32_t run) const;
         uint32_t rows_before_turn(const Dimc_InnerBlock &blk, uint32_t m, uint32_t job) const;
         // The macro of a dual that runs `job`: the two take turns.
         uint32_t job_macro(uint32_t job) const { return job % this->num_macros; }
