@@ -30,32 +30,25 @@
 // The dual's out_fifo is not fall-through: a result pushed in the cycle READYN goes low
 // can be popped one cycle later.
 #define DIMC_OUT_FIFO_DELAY 1
-// Bytes one 32-bit result occupies in L1, for the results and for the partial sums
-// read back. 4: packed, 8 results per 32 B port word (output packer, not in the RTL).
-// 32: one sign-extended result per port word, as in the RTL. Result r sits at dst + SLOT * r.
+// Bytes one 32-bit result occupies in L1. 4: packed, 8 results per 32 B port word.
+// 32: one sign-extended result per port word. Result r sits at dst + SLOT * r.
 #define DIMC_OUT_SLOT_BYTES 4
-// The dual's out_fifo storage (64 x 32 b), split evenly into one FIFO per macro; a port
-// word leaves straight from the head entries. The RTL has one FIFO, pushed from the macro
-// `sel` picks, and one pop.
+// The dual's out_fifo (64 x 32 b): results of the macro that computes, popped one per cycle
+// into the dual's accumulators.
 #define DIMC_OUT_FIFO_DEPTH 64
-// Kernel sections are also fetched ahead of a macro's program (kernel_prefetch) on outer-port
-// cycles the programs leave free: the kernel under way first, else the lowest-index macro's
-// kernel of its current job (program not yet at the kernel) or of its next job. One macro's
-// kernel is fetched at a time; the program then skips the sections already fetched.
-// A macro holding the next job's operands issues that job's rows before the running job
-// closes. Their results wait in its out_fifo until the write-back reaches that job, and it
-// issues only while out_fifo plus pipe stay below its out_fifo's depth, since a full out_fifo
-// drops results. A macro is at most one job ahead of the running one. A macro that has written
-// back every result of the running job writes its next job's results to that job's destination
-// at once (a second address generator per macro, on the next job's context), so its out_fifo
-// drains before the running job closes.
+// The dual's accumulators, as in cleopatra.sv: one 32-bit register per (vector, row), so a job
+// carries at most DIMC_ACC_VECTORS vectors.
+#define DIMC_ACC_VECTORS    8
+// The two macros of a dual take turns on the same output rows: job j runs on macro j % 2 while
+// the other macro is loaded with job j + 1's kernel and first vector. A macro starts its job
+// once the other one has triggered every row of the job before and every result of it is in
+// the accumulators. A job's results stay in the accumulators; a job with TILE_LAST set writes
+// them to its destination after its last row and clears them, and nothing computes meanwhile.
 // While the engine is idle with committed jobs held (commit-only), each dual fetches the first
-// held job's kernel for its first macro into the weight FIFO; it is written into the macro
-// once the job runs. Features and partial sums are fetched once the job starts.
+// held job's kernel into the weight FIFO; it is written into the macro once the job runs.
 // Macro write rules: no section is written into a macro in a cycle in which it computes
 // (each waits for the cycle after the row trigger it depends on), and a macro takes one
-// kernel or feature section per cycle, the feature section first. Partial sums go to the
-// ADDIN sets outside the macro and are not counted.
+// kernel or feature section per cycle, the feature section first.
 // The dual's weight and input FIFOs: 256 b sections, one kernel and two feature vectors
 // deep, written into a macro one section per cycle when its write port is open. One input
 // FIFO per dual shared by both macros, in fetch order, one pop per cycle; a head section its
@@ -76,12 +69,6 @@
 // Shared input FIFO: rows a feature section may be fetched ahead of the triggers it waits for.
 #ifndef DIMC_INP_FETCH_LEAD
 #define DIMC_INP_FETCH_LEAD 32
-#endif
-// 1: one macro of a dual computes at a time, as in the RTL (one out_fifo behind the `sel` mux).
-// A macro starts a job once the dual's other macros have triggered every row of the earlier
-// jobs and of a job they have started, and their pipes are empty. 0: no such wait.
-#ifndef DIMC_ONE_COMPUTE_PER_BLOCK
-#define DIMC_ONE_COMPUTE_PER_BLOCK 0
 #endif
 // Kernel and feature storage is single-banked, as in the macro: spatz_dimc.sv
 // declares one kernel_mem [31:0] and one feature_buf, and the two low bits of
@@ -123,7 +110,6 @@ class Dimc_Macro {
         void write_row(int row, const uint8_t *src);
         void read_row(int row, uint8_t *dst) const;
         void write_fb(const uint8_t *src);
-        void write_psin_row(int row, const uint8_t *src, int set = 0);
 
         // Compute mode (COMPE = 1)
         int32_t compute_PP(int row_sel);
@@ -141,17 +127,9 @@ class Dimc_Macro {
         uint8_t  ci           = DIMC_CI_8BIT;
         uint8_t  sign_8b      = DIMC_SIGN_UU;
         uint16_t compute_mask = 0;   // bits masked off the 1024-bit row
-        // ADDIN, which spatz_dimc.sv samples with the row address on each trigger.
-        // psin_scalar is the per-job constant compute_PP adds while psin_rows is 0.
-        int32_t  psin_scalar = 0;
-        uint8_t  psin_rows   = 0;                        // 1 = take the row's psin from psin_buf_set
-        // Two partial-sum sets, alternating per run across jobs: set (run_base + run) & 1, run_base
-        // counting the runs of every job committed before.
-        // They stand for what arrives on ADDIN from outside the macro, so the next
-        // run's can be queued while this run's rows still use theirs; psin_sel picks
-        // the set of the row being issued.
-        int32_t  psin_buf_set[2][DIMC_MACRO_KB_LEN] = {{0}};
-        uint8_t  psin_sel = 0;
+        // ADDIN, which spatz_dimc.sv samples with the row address on each trigger: the job's
+        // constant (PSIN register).
+        int32_t  addin = 0;
 
         // Buffers
         uint8_t  KB[DIMC_MACRO_KB_LEN][DIMC_MACRO_KB_EW];
@@ -171,7 +149,6 @@ class Dimc_Macro {
         // macro can issue it before the engine has made it the running job.
         uint32_t job_rows = 0, job_row_base = 0;
         uint32_t job_nb_vec = 1;     // vectors (runs) of the job in filled_job
-        uint32_t job_run_base = 0;   // runs of the jobs committed before filled_job
         // Runs of issue_job whose rows are all triggered; rows_issued counts inside the
         // current run.
         uint32_t runs_issued = 0;
@@ -180,7 +157,7 @@ class Dimc_Macro {
         uint64_t fb_ready_cycle = 0;
         // This macro's own fill program: the job it is filling and that job's context.
         // Per macro, so a macro whose program is spent can start the next job's while
-        // its sibling still fills or runs the current one.
+        // the other macro runs the current one.
         uint32_t fill_job = JOB_NONE;
         uint32_t fill_slot = 0;
         // Fill programs started for this macro whose job it has not finished triggering.
@@ -189,8 +166,6 @@ class Dimc_Macro {
         // dual's FIFOs into this macro, and its context.
         uint32_t write_job = JOB_NONE;
         uint32_t write_slot = 0;
-        // Contexts of filled_job and issue_job.
-        uint32_t filled_slot = 0, issue_slot = 0;
         // Sections written for write_job.
         uint32_t written = 0;
         // Kernel being fetched into the weight FIFO, by the program or ahead of it: job kpf_job,
@@ -202,11 +177,8 @@ class Dimc_Macro {
         uint32_t kw = 0;
         bool     f0 = false;
         bool     stamped = false;
-        // Cycle each row's partial sum lands; a row waits only for its own beat, since
-        // ADDIN is taken with the row trigger.
-        uint64_t psin_row_ready[2][DIMC_MACRO_KB_LEN] = {{0}};
         // Cycle after the kernel rows and vector 0's feature are written. No row issues
-        // before it; the partial sums are gated per row (psin_row_ready).
+        // before it.
         uint64_t fill_done_cycle = 0;
         // Rows of the current run of issue_job pushed into this macro's pipe.
         uint32_t rows_issued = 0;

@@ -179,31 +179,28 @@ int Dimc_HWPE_Streamer::issue_beat(int width, void* buf) {
 }
 
 // ---- Stream address setup, per macro ----
-uint32_t Dimc_HWPE::slot_offset(const JobGeom &g, uint32_t blk_id, uint32_t m, uint8_t kind) const
+uint32_t Dimc_HWPE::slot_offset(const JobGeom &g, uint32_t blk_id, uint8_t kind) const
 {
-    // Slot slicing: one kernel block and one output block per slot, one feature block for all.
-    const uint32_t slot = blk_id * g.num_active + m;
+    // One kernel block and one output block per dual, whichever macro runs the job; one
+    // feature block for all.
     switch (kind) {
-    case DIMC_LOAD_KB: return slot * g.row_count * DIMC_MACRO_KB_EW;
+    case DIMC_LOAD_KB: return blk_id * g.row_count * DIMC_MACRO_KB_EW;
     case DIMC_LOAD_FB: return 0;
-    default:           return slot * g.row_count * DIMC_OUT_SLOT_BYTES;
+    default:           return blk_id * g.row_count * DIMC_OUT_SLOT_BYTES;
     }
 }
 
 // Point macro m's input streamers at the operands of vector `run` of the job in context ctx,
 // which is the job being filled, not necessarily the running one.
 void Dimc_HWPE::configure_macro_streams(uint32_t blk_id, uint32_t m, int ctx, uint32_t run,
-                                        bool kernel, bool feature, bool psum)
+                                        bool kernel, bool feature)
 {
     const JobGeom &g = this->job_geom[ctx];
     Dimc_InnerBlock &blk = this->inner_blocks[blk_id];
-    const uint32_t kb_one  = g.row_count * DIMC_MACRO_KB_EW;
-    const uint32_t fb_one  = DIMC_MACRO_FB_EW;
-    const uint32_t out_one = g.row_count * DIMC_OUT_SLOT_BYTES;   // psin reads output slots
     if (kernel)
         blk.weight_stream[m].configure(
             this->job_reg_ctx(ctx, DIMC_HWPE_JOB_KB_SRC_ADDR)
-                + this->slot_offset(g, blk_id, m, DIMC_LOAD_KB), kb_one,
+                + this->slot_offset(g, blk_id, DIMC_LOAD_KB), g.row_count * DIMC_MACRO_KB_EW,
             this->job_reg_ctx(ctx, DIMC_HWPE_KB_D0_LENGTH),
             this->job_reg_ctx(ctx, DIMC_HWPE_KB_D0_STRIDE),
             this->job_reg_ctx(ctx, DIMC_HWPE_KB_D1_LENGTH),
@@ -211,25 +208,19 @@ void Dimc_HWPE::configure_macro_streams(uint32_t blk_id, uint32_t m, int ctx, ui
     if (feature)
         blk.input_stream[m].configure(
             this->job_reg_ctx(ctx, DIMC_HWPE_JOB_FB_SRC_ADDR) + run * g.fb_vec_stride
-                + this->slot_offset(g, blk_id, m, DIMC_LOAD_FB), fb_one,
+                + this->slot_offset(g, blk_id, DIMC_LOAD_FB), DIMC_MACRO_FB_EW,
             this->job_reg_ctx(ctx, DIMC_HWPE_FB_D0_LENGTH),
             this->job_reg_ctx(ctx, DIMC_HWPE_FB_D0_STRIDE), 0, 0, 0, 0, 0);
-    // Per-row partial sums, laid out like the outputs they came from.
-    if (psum)
-        blk.psin_stream[m].configure(
-            this->job_reg_ctx(ctx, DIMC_HWPE_JOB_PSIN_SRC_ADDR) + run * g.ps_vec_stride
-                + this->slot_offset(g, blk_id, m, DIMC_LOAD_PSIN), out_one, 0, 0, 0, 0, 0, 0, 0);
 }
 
-// Point macro m's output streamer at vector `run` of the job in context ctx.
-void Dimc_HWPE::configure_out_stream(uint32_t blk_id, uint32_t m, uint32_t run, uint32_t ctx)
+// Point the dual's output streamer at vector `run` of the job in context ctx.
+void Dimc_HWPE::configure_out_stream(uint32_t blk_id, uint32_t run, uint32_t ctx)
 {
     const JobGeom &g = this->job_geom[ctx];
-    const uint32_t out_one = g.row_count * DIMC_OUT_SLOT_BYTES;
-    this->inner_blocks[blk_id].out_stream[m].configure(
+    this->inner_blocks[blk_id].out_stream[0].configure(
         this->job_reg_ctx((int)ctx, DIMC_HWPE_JOB_DST_ADDR) + run * g.out_vec_stride
-            + this->slot_offset(g, blk_id, m, DIMC_LOAD_NONE),
-        out_one, this->job_reg_ctx((int)ctx, DIMC_HWPE_OUT_D0_LENGTH),
+            + this->slot_offset(g, blk_id, DIMC_LOAD_NONE),
+        g.row_count * DIMC_OUT_SLOT_BYTES, this->job_reg_ctx((int)ctx, DIMC_HWPE_OUT_D0_LENGTH),
         this->job_reg_ctx((int)ctx, DIMC_HWPE_OUT_D0_STRIDE), 0, 0, 0, 0, 0);
 }
 

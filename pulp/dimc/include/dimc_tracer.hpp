@@ -30,7 +30,6 @@ enum dimc_why_t : uint8_t {
     // A section of that kind was written into the macro this cycle.
     DIMC_WHY_LOAD_KB          = 1,    // filling the kernel buffer: the weights
     DIMC_WHY_LOAD_FB          = 2,    // filling the feature buffer: the inputs
-    DIMC_WHY_LOAD_PSIN        = 3,    // filling the partial sums
     DIMC_WHY_COMPUTE          = 4,
     DIMC_WHY_WRITE_BACK       = 5,
     DIMC_WHY_WAIT_INNER_PORT  = 6,    // behind another macro's input section; heuristic: a lower macro owes sections
@@ -43,7 +42,6 @@ enum dimc_why_t : uint8_t {
     DIMC_WHY_DONE_WAIT_JOB    = 13,   // this macro is finished, the job waits for another macro or block
     DIMC_WHY_FSM_STEP         = 14,   // a phase cycle with no work
     DIMC_WHY_WAIT_COMPUTE     = 15,   // a section fetch or write held: beat_writable refused it
-    DIMC_WHY_WAIT_PSUM        = 16,   // the partial sums' producer run is not written back yet
     DIMC_WHY_WAIT_WGT_FIFO    = 17,   // its kernel sections wait behind another macro's in the dual's weight FIFO
     DIMC_WHY_UNKNOWN          = 255   // must never appear
 };
@@ -56,14 +54,10 @@ enum dimc_why_t : uint8_t {
 enum dimc_load_kind_t : uint8_t {
     DIMC_LOAD_NONE = 0,
     DIMC_LOAD_KB   = 1,               // weights
-    DIMC_LOAD_FB   = 2,               // inputs
-    DIMC_LOAD_PSIN = 3,
-    // A kernel section went into the macro that cycle while partial sums went into its
-    // ADDIN sets.
-    DIMC_LOAD_KB_PSIN = 4
+    DIMC_LOAD_FB   = 2                // inputs
 };
 // Kind passed to outer_port_booked for a write-back. outer_port/use counts one cycle's
-// bookings, two bits per kind: kernel in bits 1:0, feature 3:2, partial sums 5:4, write-back 7:6.
+// bookings, two bits per kind: kernel in bits 1:0, feature 3:2, write-back 7:6.
 #define DIMC_PORT_WB 6
 
 // Why the engine has no job, traced as idle_why.
@@ -112,12 +106,12 @@ class Dimc_Tracer {
         void store_beat(uint32_t blk, uint32_t macro, int lat, uint32_t out_beats);
         void store_skip(uint32_t blk, uint8_t why);
         // `who` is the inner block that got the outer port this cycle; `kind` is what the
-        // beat carries: DIMC_LOAD_KB / _FB / _PSIN for a fetch, DIMC_PORT_WB for a write-back.
+        // beat carries: DIMC_LOAD_KB / _FB for a fetch, DIMC_PORT_WB for a write-back.
         void outer_port_booked(uint32_t who, uint8_t kind);
         // Publish one block's levels and wait causes for this cycle, then clear.
         void end_cycle(uint32_t blk);
         // Publish what the outer port carried this cycle, then clear: after the cycle's
-        // last booking, the next jobs' kernel prefetch included.
+        // last booking.
         void port_cycle();
         void job_closed(uint64_t now_cycle);      // the per-job report
         void job_end();                           // busy falls

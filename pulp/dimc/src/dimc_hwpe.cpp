@@ -49,16 +49,11 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     this->inner_blocks.resize(this->nb_inner_blocks);
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
         blk.macros.resize(this->num_macros);
-        blk.retired.resize(this->num_macros);
-        blk.out_fifo.resize(this->num_macros);
-        blk.out_results.assign(this->num_macros, 0);
-        blk.out_results_next.assign(this->num_macros, 0);
         for (uint32_t m = 0; m < this->num_macros; m++) {
             blk.weight_stream.emplace_back(this, false);
             blk.input_stream .emplace_back(this, false);
-            blk.out_stream   .emplace_back(this, true);
-            blk.psin_stream  .emplace_back(this, false);
         }
+        blk.out_stream.emplace_back(this, true);
         blk.reset_all();
     }
 
@@ -76,7 +71,6 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     // Initial state of the controller FSM + standard HWPE offload bookkeeping
     this->running_job   = 0;
     this->next_job_id   = 0;
-    this->next_run_base = 0;
     this->finished_jobs = 0;
     this->job_running   = false;
     this->acquired_ctx  = -1;
@@ -86,7 +80,6 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
         this->ctx_busy[ctx]   = false;
         this->ctx_job_id[ctx] = 0;
-        this->ctx_run_base[ctx] = 0;
         this->geom_job[ctx]   = Dimc_Macro::JOB_NONE;
         for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
     }
@@ -97,8 +90,6 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
     this->job_geom[0].fb_beats_per_macro= 1;
     this->job_geom[0].beats_per_macro   = 1;
     this->fill_active = false;
-    this->job_geom[0].psin_beats_per_macro = 0;
-    this->job_geom[0].psin_rows        = 0;
     this->state.set(DIMC_IDLE);
 
     this->outer_port_in.configure(this->outer_port_bytes);
@@ -135,12 +126,10 @@ void Dimc_HWPE::reset(bool active)
         for (Dimc_InnerBlock &blk : this->inner_blocks) blk.out_accum.enable = 0;
         this->running_job   = 0;
         this->next_job_id   = 0;
-        this->next_run_base = 0;
-        this->finished_jobs = 0;
+            this->finished_jobs = 0;
         std::memset(this->live_regs, 0, sizeof(this->live_regs));
         for (int ctx = 0; ctx < DIMC_NB_CONTEXT; ctx++) {
             this->ctx_job_id[ctx] = 0;
-            this->ctx_run_base[ctx] = 0;
             for (uint32_t i = 0; i < DIMC_HWPE_NB_JOB_REGS; i++) this->ctx_regs[ctx][i] = 0;
         }
         this->outstanding_depth = 4;    // max in-flight requests per feed (kernel, input, store) per block
@@ -178,13 +167,9 @@ void Dimc_HWPE::clear_engine()
             mc.set_job[0]  = mc.set_job[1] = Dimc_Macro::JOB_NONE;
         }
         blk.out_accum.clear();      // accumulator.sv clear_i
-        blk.run_pending.clear();
-        for (Dimc_InnerBlock::Retired &r : blk.retired) r = Dimc_InnerBlock::Retired();
         blk.reset_all();
-        for (auto &q : blk.out_fifo) q.clear();
-        for (uint32_t &n : blk.out_results_next) n = 0;
-        blk.store_next_beats = 0;
-        while (!blk.store_next_pending.empty()) blk.store_next_pending.pop();
+        blk.out_fifo.clear();
+        for (int32_t &a : blk.acc) a = 0;
     }
     this->job_running   = false;
     this->acquired_ctx  = -1;
@@ -195,8 +180,6 @@ void Dimc_HWPE::clear_engine()
     this->job_geom[0].kb_beats_per_row     = 1;
     this->job_geom[0].fb_beats_per_macro   = 1;
     this->job_geom[0].beats_per_macro      = 1;
-    this->job_geom[0].psin_beats_per_macro = 0;
-    this->job_geom[0].psin_rows            = 0;
     this->fill_active = false;
     this->out_dropped = 0;
     this->state.set(DIMC_IDLE);
@@ -292,11 +275,6 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
                     // bundle, so a committed job carries a complete descriptor.
                     std::memcpy(_this->ctx_regs[ctx], _this->live_regs,
                                 sizeof(_this->live_regs));
-                    // Runs are numbered across jobs: this job's first run follows the
-                    // last run of the job committed before it.
-                    const uint32_t nb_vec = _this->job_reg_ctx(ctx, DIMC_HWPE_NB_VEC);
-                    _this->ctx_run_base[ctx] = _this->next_run_base;
-                    _this->next_run_base += nb_vec ? nb_vec : 1;
                     _this->ctx_ci[ctx] =
                         (uint8_t)(_this->register_file[DIMC_HWPE_CFG_CI >> 2] & 0x3);
                     _this->ctx_sign_8b[ctx] =

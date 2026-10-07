@@ -49,7 +49,7 @@
 #define DIMC_HWPE_SIGN_8B            (DIMC_HWPE_BASE + 0x24)  /* INT8 sign combo */
 #define DIMC_HWPE_COMPE              (DIMC_HWPE_BASE + 0x28)  /* memory/compute  */
 #define DIMC_HWPE_COMPUTE_MASK       (DIMC_HWPE_BASE + 0x2C)  /* bits masked off */
-#define DIMC_HWPE_NUM_MACROS         (DIMC_HWPE_BASE + 0x30)
+#define DIMC_HWPE_NUM_MACROS         (DIMC_HWPE_BASE + 0x30)  /* not read */
 #define DIMC_HWPE_SEL_DIMC           (DIMC_HWPE_BASE + 0x34)
 /* autotrigger_n, this model's own register -- hwpe-ctrl defines no equivalent:
  *   0 (default) = automatically start the next queued job when one finishes
@@ -82,9 +82,9 @@
 #define DIMC_HWPE_JOB_KB_SRC_ADDR    (DIMC_HWPE_BASE + 0x40)
 #define DIMC_HWPE_JOB_FB_SRC_ADDR    (DIMC_HWPE_BASE + 0x44)
 #define DIMC_HWPE_JOB_DST_ADDR       (DIMC_HWPE_BASE + 0x48)
-/* Batched descriptor, not in the RTL: one job carries NB_VEC input vectors of the same
- * chunk step. Vector b reads its feature at FB_SRC + b * FB_VEC_STRIDE, its partial sums at
- * PSIN_SRC + b * PSIN_VEC_STRIDE, and writes at DST + b * OUT_VEC_STRIDE. 0 or 1: one vector. */
+/* One job carries NB_VEC input vectors of the same chunk, at most 8 (the dual's accumulators).
+ * Vector b reads its feature at FB_SRC + b * FB_VEC_STRIDE and, in a TILE_LAST job, is
+ * written at DST + b * OUT_VEC_STRIDE. 0 or 1: one vector. */
 #define DIMC_HWPE_NB_VEC             (DIMC_HWPE_BASE + 0x4C)
 
 #define DIMC_HWPE_KB_D0_LENGTH       (DIMC_HWPE_BASE + 0x50)
@@ -95,7 +95,7 @@
 
 #define DIMC_HWPE_FB_D0_LENGTH       (DIMC_HWPE_BASE + 0x64)
 #define DIMC_HWPE_FB_D0_STRIDE       (DIMC_HWPE_BASE + 0x68)
-#define DIMC_HWPE_PSIN_VEC_STRIDE    (DIMC_HWPE_BASE + 0x6C)
+#define DIMC_HWPE_PSIN_VEC_STRIDE    (DIMC_HWPE_BASE + 0x6C)  /* not read */
 
 #define DIMC_HWPE_OUT_D0_LENGTH      (DIMC_HWPE_BASE + 0x70)
 #define DIMC_HWPE_OUT_D0_STRIDE      (DIMC_HWPE_BASE + 0x74)
@@ -103,28 +103,23 @@
 #define DIMC_HWPE_ROW_SEL_BASE       (DIMC_HWPE_BASE + 0x78)
 #define DIMC_HWPE_ROW_COUNT          (DIMC_HWPE_BASE + 0x7C)
 #define DIMC_HWPE_CFG_BIAS           (DIMC_HWPE_BASE + 0x80)
+/* The job's constant on ADDIN, added to every row's dot product. */
 #define DIMC_HWPE_PSIN               (DIMC_HWPE_BASE + 0x84)
 
 /* Batched descriptor: output stride per vector (see NB_VEC). */
 #define DIMC_HWPE_OUT_VEC_STRIDE     (DIMC_HWPE_BASE + 0x88)
 
-/* Per-row partial-sum input, the model of the RTL's ADDIN. With PSIN_EN set the
- * engine streams one 32-bit psum per kernel row from PSIN_SRC_ADDR and adds it to
- * that row's dot product; with it clear the per-job PSIN scalar is added instead. */
+/* Not read: results accumulate in the dual between jobs (see TILE_LAST), and every job
+ * loads its kernel rows. */
 #define DIMC_HWPE_PSIN_EN            (DIMC_HWPE_BASE + 0x94)
 #define DIMC_HWPE_JOB_PSIN_SRC_ADDR  (DIMC_HWPE_BASE + 0x98)
-
-/* Not read: every job loads its kernel rows. */
 #define DIMC_HWPE_KB_REUSE           (DIMC_HWPE_BASE + 0x9C)
-/* The job whose results this job reads as partial sums, counted back in jobs; each
- * run's partial-sum fetch waits until the same run of that job is written back.
- * 0: no producer. */
 #define DIMC_HWPE_PSIN_DEP           (DIMC_HWPE_BASE + 0xA0)
 
-/* Where macro slot (block b, macro m) reads and writes: slot s = b * NUM_MACROS + m
- * holds kernel rows at KB_SRC + s * row_count * 128 B, reads the one feature block at
- * FB_SRC, and its partial sums and outputs sit at s * row_count * 4 B. The per-vector
- * strides add on top. ADDR_MODE and the MSTRIDE / BSTRIDE registers are not read. */
+/* Where dual b reads and writes: its kernel rows at KB_SRC + b * row_count * 128 B, whichever
+ * of its macros runs the job; the one feature block at FB_SRC; its outputs at
+ * DST + b * row_count * 4 B. The per-vector strides add on top. ADDR_MODE and the MSTRIDE /
+ * BSTRIDE registers are not read. */
 #define DIMC_HWPE_ADDR_MODE          (DIMC_HWPE_BASE + 0xA4)
 #define DIMC_HWPE_KB_MSTRIDE         (DIMC_HWPE_BASE + 0xA8)
 #define DIMC_HWPE_KB_BSTRIDE         (DIMC_HWPE_BASE + 0xAC)
@@ -134,9 +129,9 @@
 #define DIMC_HWPE_PSIN_BSTRIDE       (DIMC_HWPE_BASE + 0xBC)
 #define DIMC_HWPE_OUT_MSTRIDE        (DIMC_HWPE_BASE + 0xC0)
 #define DIMC_HWPE_OUT_BSTRIDE        (DIMC_HWPE_BASE + 0xC4)
-/* Not read: a run's partial-sum fetch waits for the same (macro, vector) of the job
- * PSIN_DEP back. */
-#define DIMC_HWPE_PSIN_CHAIN         (DIMC_HWPE_BASE + 0xC8)
+/* 1: the job is the last one of an output tile. After its last row the dual writes its
+ * accumulators to DST and clears them; 0: the results stay in the accumulators. */
+#define DIMC_HWPE_TILE_LAST          (DIMC_HWPE_BASE + 0xC8)
 
 /* Streamer bandwidth is not MMIO: it is fixed in the systree. */
 

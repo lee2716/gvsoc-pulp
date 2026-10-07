@@ -114,9 +114,7 @@ class Dimc_OuterPort {
 };
 
 // ---- rtl/accumulator.sv, instantiated by rtl/cleopatra.sv ----
-// One register summing every result that enters the block's out_fifo. cleopatra.sv has 256
-// accumulators, cleopatra_ctrl.sv selecting the next one per out_fifo pop; not modelled.
-// The out_fifo is 32 bits wide, the same as PSOUT, so nothing is truncated.
+// One register summing every result that enters the block's out_fifo (ACC_CTRL, ACC_VAL).
 class Dimc_OutAccum {
     public:
         void push(int32_t psout)
@@ -141,12 +139,12 @@ class Dimc_OutAccum {
 // A plain class, not a vp::Component. One control plane drives N of these.
 class Dimc_InnerBlock {
     public:
-        // One streamer per operand and per macro, so the macros of a block can be on
-        // different jobs. Fill and write-back book separate outer-port directions.
+        // One kernel and one feature streamer per macro, so the two macros of a block can be on
+        // different jobs; the output streamer is the first entry of out_stream. Fill and
+        // write-back book separate outer-port directions.
         std::vector<Dimc_HWPE_Streamer> weight_stream;
         std::vector<Dimc_HWPE_Streamer> input_stream;
         std::vector<Dimc_HWPE_Streamer> out_stream;
-        std::vector<Dimc_HWPE_Streamer> psin_stream;   // per-row psums, when PSIN_EN
         std::vector<Dimc_Macro> macros;
 
         // Fill and store run concurrently, each with its own cursor. The fill keeps each
@@ -183,7 +181,7 @@ class Dimc_InnerBlock {
         std::queue<uint64_t> port_pending;
         // The running job's store beats: the job closes when these are acknowledged.
         std::queue<uint64_t> store_pending;
-        // Per-feed budgets: kernel sections, and the input feed (feature and partial sums).
+        // Per-feed budgets: kernel sections, and the input feed (feature vectors).
         std::queue<uint64_t> kb_pending;
         std::queue<uint64_t> in_pending;
         // The dual's weight and input FIFOs: sections fetched from L1, each bound for one
@@ -198,23 +196,13 @@ class Dimc_InnerBlock {
         bool kb_fed_first = false;   // DIMC_KB_FEED_FIRST: this cycle's kernel feed already ran
         // The dual's one input FIFO: both macros' sections in fetch order.
         std::deque<FeedEntry> inp_fifo;
-        // Per-macro out_fifo: results in push order. A port word leaves from the head
-        // entries; out_results counts the running job's results that have left.
+        // The dual's out_fifo: results of the computing macro in push order, one popped per
+        // cycle into acc[run * DIMC_MACRO_KB_LEN + row].
         struct OutEntry { int32_t psout; uint16_t row; uint16_t run; };
-        std::vector<std::deque<OutEntry>> out_fifo;
-        std::vector<uint32_t> out_results;
-        // The next job's results that already left, per macro, their port words and their
-        // acknowledgements; taken over when that job starts.
-        std::vector<uint32_t> out_results_next;
-        uint32_t store_next_beats = 0;
-        std::queue<uint64_t> store_next_pending;
-        // Write-back position per macro: a macro's runs leave in vector order, and a run
-        // counts once its last beat is acknowledged.
-        struct RunDone { uint64_t due; uint32_t job, macro, run; };
-        std::deque<RunDone> run_pending;
-        struct Retired { int64_t job = -1; uint32_t runs = 0; };
-        std::vector<Retired> retired;    // per macro
-
+        std::deque<OutEntry> out_fifo;
+        int32_t  acc[DIMC_ACC_VECTORS * DIMC_MACRO_KB_LEN] = {0};
+        // Results of the running job's tile written to L1 so far.
+        uint32_t out_written = 0;
         // In DIMC_STORING: every result of the running job written and acknowledged, as of
         // the last cycle; the block then stops writing back.
         bool phase_done;
@@ -236,7 +224,7 @@ class Dimc_InnerBlock {
             }
             while (!this->store_pending.empty()) this->store_pending.pop();
             this->store.reset();
-            for (uint32_t &n : this->out_results) n = 0;
+            this->out_written = 0;
             this->phase_done = false;
         }
         // Construction and reset(): the weight FIFO too.
@@ -275,7 +263,7 @@ class Dimc_HWPE : public vp::Component {
         uint32_t outer_port_bytes;    // the tile's shared outer port, bytes/cycle
         // One outer-port budget per direction, each shared by all inner blocks: stream-in
         // (the three source streams) and stream-out (the sink) never block one another.
-        Dimc_OuterPort outer_port_in;   // fills: feature, partial sums, kernel rows
+        Dimc_OuterPort outer_port_in;   // fills: feature vectors, kernel rows
         Dimc_OuterPort outer_port_out;  // write-back
         // An outer block is nb_inner_blocks inner blocks whose beats all pass through the shared
         // outer port. An access costs what L1 returns, plus the wait for that port.
@@ -303,10 +291,6 @@ class Dimc_HWPE : public vp::Component {
         uint32_t ctx_regs[DIMC_NB_CONTEXT][DIMC_HWPE_NB_JOB_REGS];
         bool     ctx_busy[DIMC_NB_CONTEXT];    // acquired or committed, not yet retired
         uint32_t ctx_job_id[DIMC_NB_CONTEXT];  // job id stamped at commit
-        // Runs (vectors) of every job committed before the context's job, stamped at commit;
-        // next_run_base advances by each committed job's NB_VEC (0 counts as 1).
-        uint32_t ctx_run_base[DIMC_NB_CONTEXT];
-        uint32_t next_run_base;
         // CFG_CI, SIGN_8B and COMPUTE_MASK as they stood at commit. A macro takes them with
         // the job's operands, since it may trigger that job's rows while an earlier job
         // still runs.
@@ -337,15 +321,12 @@ class Dimc_HWPE : public vp::Component {
         // One job's shape, the same on every block; one per context, so a queued job's shape
         // survives until the engine reaches it.
         struct JobGeom {
-            uint32_t num_active, row_count, row_base, compute_cyc;
-            uint32_t psin_dep;    // PSIN_DEP: jobs back to the partial sums' producer
-            uint32_t psin_rows;
+            uint32_t row_count, row_base, compute_cyc;
+            uint32_t tile_last;   // TILE_LAST: write the accumulators out after this job
             uint32_t beats_per_macro, kb_beats_per_row;
-            uint32_t fb_beats_per_macro, psin_beats_per_macro, out_beats;
+            uint32_t fb_beats_per_macro, out_beats;
             // Batched descriptor: vectors per job and their strides (1 / 0 = one vector).
-            uint32_t nb_vec, fb_vec_stride, ps_vec_stride, out_vec_stride;
-            // Runs of the jobs committed before this one: run r uses ADDIN set (run_base + r) & 1.
-            uint32_t run_base;
+            uint32_t nb_vec, fb_vec_stride, out_vec_stride;
             uint32_t kb_sections() const { return row_count * kb_beats_per_row; }
         };
         // The job id whose geometry job_geom[ctx] holds, so a job is latched once
@@ -358,12 +339,10 @@ class Dimc_HWPE : public vp::Component {
         void     size_fill(int ctx);
         void     plan_macro_fill(uint32_t blk_id, uint32_t m, int ctx);
         void     configure_macro_streams(uint32_t blk_id, uint32_t m, int ctx, uint32_t run,
-                                         bool kernel, bool feature, bool psum);
-        void     configure_out_stream(uint32_t blk_id, uint32_t m, uint32_t run, uint32_t ctx);
-        bool     psum_ready(const Dimc_InnerBlock &blk, uint32_t m, const JobGeom &g,
-                            uint32_t job, uint32_t run) const;
-        // Byte offset of macro slot (blk_id, m) inside one operand's block.
-        uint32_t slot_offset(const JobGeom &g, uint32_t blk_id, uint32_t m, uint8_t kind) const;
+                                         bool kernel, bool feature);
+        void     configure_out_stream(uint32_t blk_id, uint32_t run, uint32_t ctx);
+        // Byte offset of dual blk_id's block inside one operand.
+        uint32_t slot_offset(const JobGeom &g, uint32_t blk_id, uint8_t kind) const;
         JobGeom job_geom[DIMC_NB_CONTEXT];
         // The running job's context.
         uint32_t exec_slot = 0;
@@ -372,7 +351,6 @@ class Dimc_HWPE : public vp::Component {
         bool     holds_unissued(const Dimc_Macro &m) const;
         void     write_feed(Dimc_InnerBlock &blk, uint32_t blk_id, std::deque<Dimc_InnerBlock::FeedEntry> &fifo);
         bool     beat_writable(const Dimc_Macro &mc, uint32_t job, const BeatPos &pos) const;
-        bool     psin_set_free(const Dimc_Macro &mc, uint32_t job, uint32_t run) const;
         void     advance_fill();
         uint32_t block_order(uint32_t i) const;
         void     retire_block(Dimc_InnerBlock &blk);
@@ -382,9 +360,7 @@ class Dimc_HWPE : public vp::Component {
         uint32_t pick_kernel(const Dimc_InnerBlock &blk, uint8_t &why) const;
         uint32_t pick_input(const Dimc_InnerBlock &blk, uint8_t &why) const;
         uint8_t  refusal(const std::queue<uint64_t> &pending, const Dimc_OuterPort &port) const;
-        bool     kernel_prefetch(Dimc_InnerBlock &blk, uint32_t blk_id);
-        bool     fetch_kernel_ahead(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, int ctx,
-                                    bool trace_refusal);
+        bool     fetch_kernel_ahead(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, int ctx);
         void     fetch_kernel_section(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, int ctx,
                                       uint32_t job, uint32_t sub);
         void     push_section(Dimc_InnerBlock &blk, uint32_t blk_id, Dimc_HWPE_Streamer &st,
@@ -392,21 +368,23 @@ class Dimc_HWPE : public vp::Component {
                               std::deque<Dimc_InnerBlock::FeedEntry> &fifo,
                               std::queue<uint64_t> &pending, uint8_t kind);
         uint32_t kernel_in_progress(const Dimc_InnerBlock &blk) const;
-        bool     kernels_fetched_before(Dimc_InnerBlock &blk, uint32_t job);
         void     fill_beat(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro);
 
         void fetch_kernels_first();
         uint32_t rows_before_feature(const Dimc_Macro &mc, uint32_t job, uint32_t run) const;
         uint32_t rows_before_turn(const Dimc_InnerBlock &blk, uint32_t m, uint32_t job) const;
+        // The macro of a dual that runs `job`: the two take turns.
+        uint32_t job_macro(uint32_t job) const { return job % this->num_macros; }
+        bool     tile_computed(const Dimc_InnerBlock &blk) const;
         bool input_urgent() const;
         // Latch one context's job shape into its geometry slot.
         void latch_geom(int ctx);
         void ensure_geom(int ctx);
         uint32_t job_reg_ctx(int ctx, uint32_t addr) const;
-        // Move retired rows into the out_fifos, then trigger the macros whose operands have landed.
+        // Accumulate, move retired rows into the out_fifo, trigger the macro whose turn it is.
         void compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id);
         void store_block(Dimc_InnerBlock &blk, uint32_t blk_id);
-        int  store_word(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, bool next);
+        int  store_word(Dimc_InnerBlock &blk, uint32_t blk_id);
 
         // One cycle per fsm_event. An L1 access records when its response is due; each cycle
         // retires the ones that came back. outstanding_depth caps the requests in flight.

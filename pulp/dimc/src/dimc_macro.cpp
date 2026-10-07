@@ -33,12 +33,8 @@ void Dimc_Macro::reset()
     this->ci        = DIMC_CI_8BIT;
     this->sign_8b   = DIMC_SIGN_UU;
     this->compute_mask = 0;
-    this->psin_scalar = 0;
-    this->psin_rows   = 0;
+    this->addin     = 0;
     this->psout     = 0;
-    for (int s = 0; s < 2; s++)
-        for (int r = 0; r < DIMC_MACRO_KB_LEN; r++) this->psin_buf_set[s][r] = 0;
-    this->psin_sel = 0;
     this->sout      = 0;
 
     this->kb_ready = false;
@@ -100,14 +96,6 @@ void Dimc_Macro::write_fb(const uint8_t *src)
     std::memcpy(this->FB, src, DIMC_MACRO_FB_EW);
 }
 
-// One 32-bit partial sum, stored against the row it belongs to. compute_PP()
-// picks it up when that row is selected, and only while PSIN_EN is set.
-void Dimc_Macro::write_psin_row(int row, const uint8_t *src, int set)
-{
-    if (row < 0 || row >= DIMC_MACRO_KB_LEN) return;
-    std::memcpy(&this->psin_buf_set[set & 1][row], src, 4);
-}
-
 // Bit-level model of the macro datapath. Stage 1 zeroes every bit i >= 1024 - compute_mask
 // of both operands, so an element straddling that boundary keeps its low bits; stage 2
 // sums per MODE; stage 3 adds ADDIN. Bit i of the row is bit (i % 8) of byte i / 8.
@@ -150,8 +138,7 @@ int32_t Dimc_Macro::compute_PP(int row_sel)
         break;
     }
 
-    // ADDIN: the row's partial sum, or the job's constant when PSIN_EN is off.
-    comp += this->psin_rows ? this->psin_buf_set[this->psin_sel][row_sel] : this->psin_scalar;
+    comp += this->addin;
 
     this->psout = comp;
     return comp;
