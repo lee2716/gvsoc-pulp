@@ -255,15 +255,16 @@ void Dimc_HWPE::engine_cycle(uint32_t phase)
 
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         Dimc_InnerBlock &blk = this->inner_blocks[b];
-        // One fetch per feed, seeing the FIFOs before this cycle's pops; one pop per FIFO
-        // into the macros, before the triggers, so no section enters a macro in a cycle in
-        // which it computes; the macros' rows; then the write-back.
+        // One request per dual per cycle, in this order: a result word, an input row, a kernel
+        // section. The fetches see the FIFOs before this cycle's pops; one pop per FIFO into
+        // the macros, before the triggers, so no section enters a macro in a cycle in which it
+        // computes; then the macros' rows.
+        if (job_open && !(storing && blk.phase_done)) this->store_block(blk, b);
         this->fill_feed(blk, b, false);   // feature vectors
         this->fill_feed(blk, b, true);    // kernel rows
         this->write_feed(blk, b, blk.inp_fifo);
         this->write_feed(blk, b, blk.wgt_fifo);
         this->compute_indep(blk, b);
-        if (job_open && !(storing && blk.phase_done)) this->store_block(blk, b);
     }
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) this->tracer.end_cycle(b);
     this->tracer.port_cycle();
@@ -388,10 +389,16 @@ void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id, bool kernel_fee
         return;
     }
     if (!kernel_feed) {
+        // The earlier tile product's kernel goes before a later one's input rows.
+        uint8_t kwhy = 0;
+        const uint32_t km = this->pick_kernel(blk, kwhy);
+        if (km != blk.macros.size() && blk.wgt_fifo.size() < DIMC_WGT_FIFO_DEPTH
+            && (blk.tile_job != blk.macros[macro].fill_job || blk.tile_rows < DIMC_MACRO_FB_EW)
+            && (int32_t)(blk.macros[km].fill_job - blk.macros[macro].fill_job) < 0) return;
         this->feed_input(blk, blk_id, macro);
         return;
     }
-    if ((why = this->refusal(blk.kb_pending, blk.kernel_port))) {
+    if ((why = this->refusal(blk.kb_pending, blk.port))) {
         this->tracer.feed_skip(blk_id, true, why);
         return;
     }
@@ -411,7 +418,7 @@ void Dimc_HWPE::feed_input(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro
         blk.tile_rows = 0;
     }
     if (blk.tile_rows < DIMC_MACRO_FB_EW) {
-        if (const uint8_t why = this->refusal(blk.in_pending, blk.input_port)) {
+        if (const uint8_t why = this->refusal(blk.in_pending, blk.port)) {
             this->tracer.feed_skip(blk_id, false, why);
             return;
         }
@@ -422,7 +429,7 @@ void Dimc_HWPE::feed_input(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro
         int lat = st.issue_beat(DIMC_ACC_VECTORS, blk.tile[blk.tile_rows]);
         if (lat < 1) lat = 1;
         const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
-        blk.input_port.request((int64_t)this->fsm_timestamp, DIMC_INPUT_PORT_BYTES);
+        blk.port.request((int64_t)this->fsm_timestamp, DIMC_DUAL_PORT_BYTES);
         this->tracer.outer_port_booked(blk_id, DIMC_LOAD_FB);
         blk.in_pending.push(due);
         blk.port_pending.push(due);
@@ -487,7 +494,7 @@ void Dimc_HWPE::push_section(Dimc_InnerBlock &blk, uint32_t blk_id, Dimc_HWPE_St
 {
     int lat = st.issue_beat((int)e.bytes, e.data);
     if (lat < 1) lat = 1;
-    blk.kernel_port.request((int64_t)this->fsm_timestamp, DIMC_KERNEL_PORT_BYTES);
+    blk.port.request((int64_t)this->fsm_timestamp, DIMC_DUAL_PORT_BYTES);
     const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
     e.ready = due + 1;
     fifo.push_back(e);
@@ -695,7 +702,7 @@ int Dimc_HWPE::store_word(Dimc_InnerBlock &blk, uint32_t blk_id)
     const uint32_t ctx = this->exec_slot;
     const JobGeom &g   = this->job_geom[ctx];
     uint32_t &row      = blk.out_written;
-    if (const uint8_t why = this->refusal(blk.store_pending, blk.output_port)) {
+    if (const uint8_t why = this->refusal(blk.store_pending, blk.port)) {
         this->tracer.store_skip(blk_id, why);
         return 0;
     }
@@ -709,7 +716,7 @@ int Dimc_HWPE::store_word(Dimc_InnerBlock &blk, uint32_t blk_id)
     const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
     blk.port_pending.push(due);
     blk.store_pending.push(due);
-    blk.output_port.request((int64_t)this->fsm_timestamp, DIMC_OUTPUT_PORT_BYTES);
+    blk.port.request((int64_t)this->fsm_timestamp, DIMC_DUAL_PORT_BYTES);
     this->tracer.outer_port_booked(blk_id, DIMC_PORT_WB);
     row++;
     blk.store.beat_index++;

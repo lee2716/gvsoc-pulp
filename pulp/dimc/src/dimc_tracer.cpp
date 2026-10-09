@@ -194,7 +194,7 @@ void Dimc_Tracer::outer_port_booked(uint32_t who, uint8_t kind)
     // 16,17 = block 0,1 writing back.
     this->outer_grant = (uint8_t)(who + (is_store ? 16u : 0u));
     const Dimc_InnerBlock &blk = this->dimc.inner_blocks[who];
-    const Dimc_Port &port = is_store ? blk.output_port : kind == DIMC_LOAD_FB ? blk.input_port : blk.kernel_port;
+    const Dimc_Port &port = blk.port;
     uint32_t nf = (uint32_t)((port.cursor_bytes + port.bandwidth_bytes - 1) / port.bandwidth_bytes);
     this->next_free_event.event((uint8_t *)&nf);
 }

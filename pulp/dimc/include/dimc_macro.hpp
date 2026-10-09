@@ -59,11 +59,11 @@
 // all fetched before its macro starts.
 #define DIMC_WGT_FIFO_DEPTH 128
 #define DIMC_INP_FIFO_DEPTH 32
-// Each dual's three ports to L1, bytes per cycle, as dimc_top.sv: features, kernel, results.
-// A feature section is one L1 request that holds the input port for 4 cycles.
-#define DIMC_INPUT_PORT_BYTES  8
-#define DIMC_KERNEL_PORT_BYTES 32
-#define DIMC_OUTPUT_PORT_BYTES 32
+// The outer block has one 512-bit port to L1 for reads and writes. A mux gives each dual 256 b
+// of it, and a dual puts one request on its half per cycle: a result word, else an input row,
+// else a kernel section.
+#define DIMC_PORT_BYTES      64
+#define DIMC_DUAL_PORT_BYTES (DIMC_PORT_BYTES / 2)
 // Cycles the dual takes to switch macros after the last result of a job is accumulated: the
 // result count is compared a cycle later, then one cycle swaps the macros (dimc_datapath.sv).
 #define DIMC_SWITCH_CYCLES 2
