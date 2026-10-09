@@ -452,6 +452,7 @@ void Dimc_HWPE::feed_input(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro
     fm.ffetched++;
     e.ready = this->fsm_timestamp + 1;
     blk.inp_fifo.push_back(e);
+    this->tracer.input_pushed(blk_id);
     cursor.macro_beat_index[macro]++;
 }
 
