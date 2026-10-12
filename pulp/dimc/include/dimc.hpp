@@ -86,7 +86,8 @@ class Dimc_HWPE_Streamer {
 };
 
 
-// ---- A dual's half of the port towards L1: a bandwidth limiter that remembers when it is free ----
+// ---- One channel (read or write) of a dual's RW port towards L1: a bandwidth limiter that remembers
+// when it is free ----
 class Dimc_Port {
     public:
         void    configure(uint32_t bandwidth);
@@ -105,12 +106,12 @@ class Dimc_Port {
 class Dimc_InnerBlock {
     public:
         // One kernel and one feature streamer per macro, so the two macros of a block can be on
-        // different jobs; the output streamer is the first entry of out_stream. Fill and
-        // write-back share the dual's half of the port.
+        // different jobs; the output streamer is the first entry of out_stream. The dual
+        // has one RW port; its read and write channels (HCI) each take one request per cycle.
         std::vector<Dimc_HWPE_Streamer> weight_stream;
         std::vector<Dimc_HWPE_Streamer> input_stream;
         std::vector<Dimc_HWPE_Streamer> out_stream;
-        Dimc_Port port;
+        Dimc_Port r_channel, w_channel;
         std::vector<Dimc_Macro> macros;
 
         // Fill and store run concurrently, each with its own cursor. The fill keeps each

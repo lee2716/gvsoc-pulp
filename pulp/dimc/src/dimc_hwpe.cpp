@@ -53,7 +53,8 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
             blk.input_stream .emplace_back(this, false);
         }
         blk.out_stream.emplace_back(this, true);
-        blk.port.configure(DIMC_DUAL_PORT_BYTES);
+        blk.r_channel.configure(DIMC_DUAL_PORT_BYTES);
+        blk.w_channel.configure(DIMC_DUAL_PORT_BYTES);
         blk.reset_all();
     }
 
@@ -127,7 +128,8 @@ void Dimc_HWPE::clear_engine()
     for (vp::ClockEvent *ev : {this->fsm_start_event, this->fsm_event, this->fsm_end_event})
         if (ev->is_enqueued()) this->event_cancel(ev);
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
-        blk.port.reset();
+        blk.r_channel.reset();
+        blk.w_channel.reset();
         for (Dimc_Macro &mc : blk.macros) {
             mc.reset();
             mc.filled_job  = Dimc_Macro::JOB_NONE;

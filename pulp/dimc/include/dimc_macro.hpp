@@ -59,9 +59,9 @@
 // all fetched before its macro starts.
 #define DIMC_WGT_FIFO_DEPTH 128
 #define DIMC_INP_FIFO_DEPTH 32
-// The outer block has one 512-bit port to L1 for reads and writes. A mux gives each dual 256 b
-// of it, and a dual puts one request on its half per cycle: a result word, else an input row,
-// else a kernel section.
+// The outer block has one 512-bit RW port to L1, 256 b per dual. A dual's two read streams
+// (input rows, kernel sections) are muxed onto the read channel of its half, one request per
+// cycle; its result words go on the write channel, which runs in parallel (HCI).
 #define DIMC_PORT_BYTES      64
 #define DIMC_DUAL_PORT_BYTES (DIMC_PORT_BYTES / 2)
 // 1: one request reads as many input rows as the dual's half holds (4) when the rows are
