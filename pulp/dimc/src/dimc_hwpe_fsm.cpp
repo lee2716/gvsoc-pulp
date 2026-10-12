@@ -408,8 +408,8 @@ void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id, bool kernel_fee
     cursor.macro_beat_index[macro]++;
 }
 
-// The input feed of macro `macro`'s tile product: read the tile's 128 input rows, one 64-bit
-// row per cycle; then, transposed, its 8 vectors as 32 sections, one per cycle.
+// The input feed of macro `macro`'s tile product: read the tile's 128 input rows, up to four
+// 8-byte rows per request; then, transposed, its 8 vectors as 32 sections, one per cycle.
 void Dimc_HWPE::feed_input(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro)
 {
     Dimc_Macro &fm = blk.macros[macro];
@@ -680,7 +680,7 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
     }
 }
 
-// The running job's results are accumulated on every block and, after a TILE_LAST job, written.
+// Every result word of the running job issued and acknowledged on every block.
 bool Dimc_HWPE::store_done() const
 {
     for (const Dimc_InnerBlock &blk : this->inner_blocks)

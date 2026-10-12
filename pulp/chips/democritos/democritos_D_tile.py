@@ -46,7 +46,7 @@ class Democritos_D_TileTcdm(gvsoc.systree.Component):
         nb_banks = DemocritosArch.N_MEM_BANKS
         bank_size = DemocritosArch.N_WORDS_BANK * DemocritosArch.BYTES_PER_WORD
 
-        # 1 master: OBI, iDMA0, iDMA1
+        # 3 inputs, only input 0 bound (OBI xbar)
         L1_masters = 3
         interleaver = L1_interleaver(self, 'interleaver', nb_slaves=nb_banks, nb_masters=L1_masters, interleaving_bits=2)
 

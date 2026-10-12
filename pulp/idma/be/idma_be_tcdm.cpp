@@ -45,11 +45,9 @@ IDmaBeTcdm::IDmaBeTcdm(vp::Component *idma, std::string itf_name, IdmaBeProducer
     this->burst_queue_maxsize = idma->get_js_config()->get_int("burst_queue_size");
 
     // Local memory base
-    // The address the TCDM interleaver expects is not the address the backend
-    // classifies on. loc_base answers "is this request local?" (idma_be.cpp:52)
-    // and is a slave-map base; tcdm_base is what the interleaver subtracts to
-    // land in a bank. They coincide only when the tile's L1 map starts at the
-    // same address the interleaver counts from, which is not the case here.
+    // loc_base is the base of the range idma_be.cpp classifies as local;
+    // tcdm_base is what this back-end subtracts from the address it sends to
+    // the TCDM.
     this->loc_base = idma->get_js_config()->get_int("loc_base");
     this->tcdm_base = idma->get_js_config()->get_int("tcdm_base");
 }

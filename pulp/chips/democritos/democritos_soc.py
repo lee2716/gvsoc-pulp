@@ -93,15 +93,13 @@ class DemocritosSoc(gvsoc.systree.Component):
             cluster[id].o_KILLER_OUTPUT(killer.i_INPUT())
 
         # L2 memory
-        # One L2 slice per tile, on a column at each side of the mesh. With a
-        # single column every tile on a row shares that column's network
-        # interface; two columns put every tile one hop from a slice of its
-        # own.
+        # One L2 slice per mesh row on a column at each side of the mesh; a row's
+        # tiles share its two slices.
         DEMOCRITOS_L2_SLICES = 2 * DemocritosArch.N_TILES_Y
         # L2_SIZE is a last offset, so the span is L2_SIZE + 1; round the slice
         # down to a page so that every slice base is page aligned, not just the
         # first. L2_SIZE itself is odd, so dividing it directly would leave
-        # every later base on an odd address.
+        # the later bases off a page boundary.
         DEMOCRITOS_L2_SLICE = ((DemocritosArch.L2_SIZE + 1) // DEMOCRITOS_L2_SLICES) & ~0xFFF
         l2_mem:List[memory.Memory] = []
         for id in range(0, DEMOCRITOS_L2_SLICES):

@@ -50,7 +50,7 @@ class Democritos_V_TileTcdm(gvsoc.systree.Component):
         nb_banks = DemocritosArch.N_MEM_BANKS
         bank_size = DemocritosArch.N_WORDS_BANK * DemocritosArch.BYTES_PER_WORD
 
-        # 1 master: OBI, iDMA0, iDMA1
+        # 3 inputs, only input 0 bound (OBI xbar)
         L1_masters = 3
         interleaver = L1_interleaver(self, 'interleaver', nb_slaves=nb_banks, nb_masters=L1_masters, interleaving_bits=2)
 
@@ -163,8 +163,8 @@ class Democritos_V_Tile(gvsoc.systree.Component):
         self.spatz = spatz
 
         # Event unit (mirrors pulp/chips/magia_v2/tile.py). The address window is
-        # already reserved in DemocritosArch; the HWPE raises done_irq into it so
-        # SW can wait on an event instead of polling STATUS.
+        # reserved in DemocritosArch; Spatz, FractalSync and the iDMAs raise their
+        # done events into it.
         self.add_properties({
             "event_unit": {
                 "version": "4",
@@ -174,7 +174,7 @@ class Democritos_V_Tile(gvsoc.systree.Component):
                     "remove_offset": DemocritosArch.EVENT_UNIT_ADDR_START,
                 },
                 "config": {
-                    "nb_core": 1,                      # D-tile has one CV32 core
+                    "nb_core": 1,                      # one CV32 core takes the events
                     "properties": {
                         "dispatch":  {"size": 8},
                         "mutex":     {"nb_mutexes": 0},
@@ -425,7 +425,7 @@ class Democritos_V_Tile(gvsoc.systree.Component):
     def i_SLAVE_NORTH_SOUTH_NEIGHBOUR_FRACTAL(self) -> gvsoc.systree.SlaveItf:
         return gvsoc.systree.SlaveItf(self, 'north_south_neighbour_fractal_2_xif', signature='wire<PortResp<uint32_t>*>')
 
-    # Output (master) port to off-tile L2 memory
+    # Output (master) port to the NoC
     def o_NARROW_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('narrow_output', itf, signature='io')
 
@@ -438,7 +438,7 @@ class Democritos_V_Tile(gvsoc.systree.Component):
     def __o_NARROW_INPUT(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('narrow_input', itf, signature='io', composite_bind=True)
 
-    # Output (master) wide port to off-tile L2 memory. DMA traffic only; core
+    # Output (master) wide port to the NoC. DMA traffic only; core
     # accesses use the narrow port.
     def o_WIDE_OUTPUT(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('wide_output', itf, signature='io')

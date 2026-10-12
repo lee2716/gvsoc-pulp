@@ -95,8 +95,7 @@ void Dimc_HWPE::reset(bool active)
     if (active) {
         // A zero means the property never reached the model. Abort rather than
         // substitute a default, which would run a different machine silently.
-        // trace_file is only valid once the trace engine has started, so this
-        // check cannot live in the constructor.
+        // Checked at reset, so the abort happens once the trace engine runs.
         if (this->num_macros == 0 || this->inner_port_bytes == 0 || this->nb_inner_blocks == 0) {
             // trace.fatal ends in abort(), which does not flush stdio, so its message
             // is lost when the trace goes to a pipe; stderr is unbuffered.

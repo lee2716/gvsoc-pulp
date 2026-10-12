@@ -269,7 +269,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
         return mac.filled_job == this->dimc.running_job + 1 ? DIMC_WHY_WAIT_COMPUTE : DIMC_WHY_IDLE;
 
     // Inside a kernel window (sections written, not all): the weight FIFO's head says why no
-    // section went in. In flight: late because the kernel port was busy within the
+    // section went in. In flight: late because the read channel was busy within the
     // fetch latency, else the response is still out. Another macro's section: the dual's FIFO
     // is in order. Landed: beat_writable refused it. Empty: this cycle's kernel-feed refusal.
     if (mac.write_job != Dimc_Macro::JOB_NONE && !mac.stamped) {
@@ -362,7 +362,7 @@ void Dimc_Tracer::job_closed(uint64_t now_cycle)
     }
 
     const uint64_t job_busy = now_cycle - this->job_entry_cycle;
-    // Analytic minimum: one section of the job's fill per cycle, plus the pipeline's drain.
+    // Fill sections plus the pipeline's drain; not a lower bound on job_busy.
     const uint64_t ideal = (uint64_t)g.beats_per_macro + DIMC_MACRO_LATENCY;
     this->acc_busy_cycles  += job_busy;
     this->acc_ideal_cycles += ideal;

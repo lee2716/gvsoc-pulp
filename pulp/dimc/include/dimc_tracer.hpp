@@ -37,7 +37,7 @@ enum dimc_why_t : uint8_t {
     DIMC_WHY_WAIT_DEPTH       = 8,    // outstanding_depth beats in flight, or the weight FIFO full
     DIMC_WHY_WAIT_FILL_ACK    = 9,    // a fetched section's response not in yet
     DIMC_WHY_PIPE_DRAIN       = 10,   // rows issued, results still inside the macro pipeline
-    DIMC_WHY_WAIT_STORE_ORDER = 11,   // results ready, the block writes an earlier macro back first
+    DIMC_WHY_WAIT_STORE_ORDER = 11,   // never emitted
     DIMC_WHY_WAIT_BEAT_ACK    = 12,   // every beat issued, a response still in flight
     DIMC_WHY_DONE_WAIT_JOB    = 13,   // this macro is finished, the job waits for another macro or block
     DIMC_WHY_FSM_STEP         = 14,   // a phase cycle with no work

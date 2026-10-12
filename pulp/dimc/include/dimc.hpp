@@ -101,13 +101,13 @@ class Dimc_Port {
         uint32_t bandwidth_bytes = 1;
 };
 
-// ---- Inner block: num_macros macros on one inner (L1) port ----
+// ---- Inner block: num_macros macros on one RW port to L1 ----
 // A plain class, not a vp::Component. One control plane drives N of these.
 class Dimc_InnerBlock {
     public:
-        // One kernel and one feature streamer per macro, so the two macros of a block can be on
-        // different jobs; the output streamer is the first entry of out_stream. The dual
-        // has one RW port; its read and write channels (HCI) each take one request per cycle.
+        // One kernel streamer per macro, so the two macros of a block can be on different jobs;
+        // input_stream[0] reads the block's input tile, out_stream[0] writes its results. The
+        // dual has one RW port; its read and write channels (HCI) take one request per cycle.
         std::vector<Dimc_HWPE_Streamer> weight_stream;
         std::vector<Dimc_HWPE_Streamer> input_stream;
         std::vector<Dimc_HWPE_Streamer> out_stream;
@@ -148,7 +148,7 @@ class Dimc_InnerBlock {
         std::queue<uint64_t> port_pending;
         // The running job's store beats: the job closes when these are acknowledged.
         std::queue<uint64_t> store_pending;
-        // Per-feed budgets: kernel sections, and the input feed (feature vectors).
+        // Per-feed budgets: kernel sections, and the input feed (input-row requests).
         std::queue<uint64_t> kb_pending;
         std::queue<uint64_t> in_pending;
         // The dual's weight and input FIFOs: sections fetched from L1, each bound for one
@@ -227,13 +227,13 @@ class Dimc_HWPE : public vp::Component {
         // Completion interrupt line (standard HWPE done_irq)
         vp::WireMaster<bool> irq;
 
-        // Each owns its streamers and macros, and reaches L1 through its own inner port.
+        // Each owns its streamers and macros, and reaches L1 through its own RW port.
         std::vector<Dimc_InnerBlock> inner_blocks;
 
         // Configuration
         uint32_t num_macros;
         uint32_t inner_port_bytes;    // one 256-bit section, bytes
-        // An access costs what L1 returns, plus the wait for the inner block's port.
+        // A block's access costs what L1 returns plus the wait for its channel.
         uint32_t nb_inner_blocks;     // inner blocks in the outer block (2 on the D-tile)
 
         // Text trace, for diagnostics and the tracer's reports.
@@ -304,7 +304,7 @@ class Dimc_HWPE : public vp::Component {
             uint32_t tile_last;   // write the accumulators out after this tile product
             uint32_t beats_per_macro, kb_beats_per_row;
             uint32_t fb_beats_per_macro, out_beats;
-            // Batched descriptor: vectors per job and their strides (1 / 0 = one vector).
+            // Vectors per tile product, the row strides, the inner blocks that take part.
             uint32_t nb_vec, out_row_stride, kb_row_stride, nb_blocks;
             uint32_t kb_sections() const { return row_count * kb_beats_per_row; }
         };

@@ -82,10 +82,9 @@ bool Dimc_HWPE_Streamer::is_done() { return this->pos >= this->tot_len; }
 // Where the next beat reads or writes. `pos` counts bytes consumed, which is
 // also the address offset while the walk is linear (d0_len == 0).
 // A non-zero d0_len selects a strided walk: d0_len contiguous bytes, then a jump
-// by d0_stride to the next run, and after d1_len runs a jump by d1_stride; the
-// *_D0_* / *_D1_* job registers set it. Not the RTL's addressing:
-// dual_DIMC/rtl/dimc_streamer.sv derives its strides from the matrix shape in
-// dimc_config_t and has no stride registers.
+// by d0_stride to the next run, and after d1_len runs a jump by d1_stride. Only
+// the kernel streamer uses it, with strides from the job's matrix shape as in
+// dual_DIMC/rtl/dimc_streamer.sv.
 uint32_t Dimc_HWPE_Streamer::walk_addr() const {
     if (this->d0_len == 0) {
         return this->base_addr + this->pos;

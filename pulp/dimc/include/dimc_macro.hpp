@@ -89,7 +89,7 @@ struct DimcPipeEntry {
     int      job_row;
     int      cycles_remaining;
     int      set;              // result set of the job the row belongs to (job id & 1)
-    int      run;              // the job's vector (batched descriptor) the row belongs to
+    int      run;              // the tile product's vector (0..7) the row belongs to
 };
 
 // Compute mode
@@ -196,12 +196,12 @@ class Dimc_Macro {
         // Cycle of the last kernel or feature section written into the macro.
         int64_t  last_write_cycle = -1;
         // Rows retired from the pipe per result set (job id & 1), with the set's job: two jobs
-        // can be in flight on one macro. rows_done() closes the job on these counts.
+        // can be in flight on one macro. rows_retired_set is written, never read.
         uint32_t rows_retired_set[2] = {0, 0};
         uint32_t set_job[2]          = {0xFFFFFFFFu, 0xFFFFFFFFu};
 
         // Staging for a feature vector assembled from its sections. Per macro: the dual's
-        // input FIFO interleaves both macros' sections.
+        // input FIFO holds both macros' sections in job order.
         uint8_t  row_buffer[DIMC_MACRO_KB_EW] = {0};
         // Kernel rows are assembled apart from features: the two FIFOs pop independently,
         // so a feature's sections can arrive between a kernel row's.
