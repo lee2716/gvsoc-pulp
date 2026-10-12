@@ -423,10 +423,13 @@ void Dimc_HWPE::feed_input(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro
             return;
         }
         Dimc_HWPE_Streamer &st = blk.input_stream[0];
-        st.configure(this->job_reg_ctx(ctx, DIMC_TP_FB_SRC)
-                         + blk.tile_rows * this->job_reg_ctx(ctx, DIMC_TP_FB_ROW_STRIDE),
-                     DIMC_ACC_VECTORS, 0, 0, 0, 0, 0, 0, 0);
-        int lat = st.issue_beat(DIMC_ACC_VECTORS, blk.tile[blk.tile_rows]);
+        const uint32_t stride = this->job_reg_ctx(ctx, DIMC_TP_FB_ROW_STRIDE);
+        uint32_t rows = 1;
+        if (DIMC_WIDE_INPUT_READ && stride == DIMC_ACC_VECTORS)
+            rows = std::min<uint32_t>(DIMC_DUAL_PORT_BYTES / DIMC_ACC_VECTORS, DIMC_MACRO_FB_EW - blk.tile_rows);
+        st.configure(this->job_reg_ctx(ctx, DIMC_TP_FB_SRC) + blk.tile_rows * stride,
+                     rows * DIMC_ACC_VECTORS, 0, 0, 0, 0, 0, 0, 0);
+        int lat = st.issue_beat((int)(rows * DIMC_ACC_VECTORS), blk.tile[blk.tile_rows]);
         if (lat < 1) lat = 1;
         const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
         blk.port.request((int64_t)this->fsm_timestamp, DIMC_DUAL_PORT_BYTES);
@@ -434,7 +437,7 @@ void Dimc_HWPE::feed_input(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro
         blk.in_pending.push(due);
         blk.port_pending.push(due);
         blk.tile_ready = due + 1;
-        blk.tile_rows++;
+        blk.tile_rows += rows;
         return;
     }
     if (this->fsm_timestamp < blk.tile_ready) return;

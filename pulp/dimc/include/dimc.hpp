@@ -169,8 +169,8 @@ class Dimc_InnerBlock {
         int64_t  last_acc_cycle = -1000;   // cycle of the last result accumulated
         uint32_t acc_results[2] = {0, 0};  // results accumulated per result set (job id & 1)
         int64_t  present_ack_cycle = -1000; // cycle the last output word was acknowledged
-        // The input tile being read: 128 rows of 8 bytes, one row per port beat, which the
-        // streamer transposes into the job's 8 vectors (dimc_streamer.sv, input_tile_q).
+        // The input tile being read: 128 rows of 8 bytes, up to four rows per read request,
+        // which the streamer transposes into the job's 8 vectors (dimc_streamer.sv, input_tile_q).
         uint32_t tile_job = 0xFFFFFFFFu;
         uint32_t tile_rows = 0;
         uint64_t tile_ready = 0;           // first cycle after the last row's response

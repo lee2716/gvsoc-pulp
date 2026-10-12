@@ -64,6 +64,11 @@
 // else a kernel section.
 #define DIMC_PORT_BYTES      64
 #define DIMC_DUAL_PORT_BYTES (DIMC_PORT_BYTES / 2)
+// 1: one request reads as many input rows as the dual's half holds (4) when the rows are
+// contiguous in L1 (row stride = one row). 0: one row per request.
+#ifndef DIMC_WIDE_INPUT_READ
+#define DIMC_WIDE_INPUT_READ 1
+#endif
 // Cycles the dual takes to switch macros after the last result of a job is accumulated: the
 // result count is compared a cycle later, then one cycle swaps the macros (dimc_datapath.sv).
 #define DIMC_SWITCH_CYCLES 2
