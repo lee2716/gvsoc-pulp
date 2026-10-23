@@ -538,9 +538,15 @@ void Dimc_HWPE::write_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
         mc.kw++;
         const uint32_t row = pos.sub / g.kb_beats_per_row;
         const uint32_t sub = pos.sub % g.kb_beats_per_row;
-        std::memcpy(mc.kb_row_buffer + sub * port_bytes, e.data, e.bytes);
+        const int kr = (int)((g.row_base + row) % DIMC_MACRO_KB_LEN);
+        // Write mask: a bit the mask clears keeps the row's old bit, as kernel_mem in spatz_dimc.sv.
+        const uint8_t *wm = this->ctx_write_mask[e.slot];
+        for (uint32_t b = 0; b < e.bytes; b++) {
+            const uint32_t o = sub * port_bytes + b;
+            mc.kb_row_buffer[o] = (uint8_t)((e.data[b] & wm[b]) | (mc.KB[kr][o] & ~wm[b]));
+        }
         if (sub == g.kb_beats_per_row - 1)   // row complete -> commit
-            mc.write_row((int)((g.row_base + row) % DIMC_MACRO_KB_LEN), mc.kb_row_buffer);
+            mc.write_row(kr, mc.kb_row_buffer);
     } else {
         std::memcpy(mc.row_buffer + pos.sub * port_bytes, e.data, e.bytes);
         if (pos.sub == g.fb_beats_per_macro - 1) {   // feature complete

@@ -278,6 +278,7 @@ class Dimc_HWPE : public vp::Component {
         uint8_t  ctx_ci[DIMC_NB_CONTEXT];
         uint8_t  ctx_sign_8b[DIMC_NB_CONTEXT];
         uint16_t ctx_compute_mask[DIMC_NB_CONTEXT];
+        uint8_t  ctx_write_mask[DIMC_NB_CONTEXT][DIMC_DUAL_PORT_BYTES];   // per byte of a section
         int      running_ctx;                  // context the engine executes (-1 none)
         // Committed-but-not-yet-running contexts, in commit order.
         std::deque<int> ctx_queue;

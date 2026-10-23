@@ -238,6 +238,8 @@ void Dimc_HWPE::gemm_commit_tile(int ctx)
     this->ctx_ci[ctx]           = (uint8_t)(r[DIMC_REG_FORMAT] & 0x3);
     this->ctx_sign_8b[ctx]      = (uint8_t)((r[DIMC_REG_FORMAT] >> 2) & 0x3);
     this->ctx_compute_mask[ctx] = (uint16_t)(r[DIMC_REG_COMPUTE_MASK] & 0x3FF);
+    for (uint32_t i = 0; i < DIMC_DUAL_PORT_BYTES; i++)
+        this->ctx_write_mask[ctx][i] = (uint8_t)(r[DIMC_REG_WRITE_MASK + i / 4] >> (8 * (i % 4)));
     this->ctx_busy[ctx]   = true;
     this->ctx_job_id[ctx] = this->next_job_id++;
     this->tracer.commit(this->ctx_job_id[ctx]);

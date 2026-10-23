@@ -45,7 +45,7 @@
 #define DIMC_REG_FORMAT              7     /* [1:0] mode (3 = INT8), [3:2] sign_8b */
 #define DIMC_REG_BIAS                8     /* ADDIN, added once per 128-column tile */
 #define DIMC_REG_COMPUTE_MASK        9
-#define DIMC_REG_WRITE_MASK          10    /* eight words; stored, not modelled */
+#define DIMC_REG_WRITE_MASK          10    /* eight words: bit i writes bit i of a kernel section */
 #define DIMC_NB_REGS                 18
 #define DIMC_HWPE_REG_MAX            (DIMC_IO_BASE + 4 * DIMC_NB_REGS - 4)
 
