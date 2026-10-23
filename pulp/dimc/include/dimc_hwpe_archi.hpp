@@ -43,24 +43,29 @@
 #define DIMC_REG_INPUT_ROWS          5     /* = weight_cols             */
 #define DIMC_REG_INPUT_COLS          6     /* multiple of 8             */
 #define DIMC_REG_FORMAT              7     /* [1:0] mode (3 = INT8), [3:2] sign_8b */
-#define DIMC_REG_BIAS                8     /* ADDIN, added once per 128-column tile */
+#define DIMC_REG_BIAS                8     /* ADDIN, added once per output tile (l = 0) */
 #define DIMC_REG_COMPUTE_MASK        9
 #define DIMC_REG_WRITE_MASK          10    /* eight words: bit i writes bit i of a kernel section */
-#define DIMC_NB_REGS                 18
+#define DIMC_REG_INPUT_ADDR_2        18    /* module 2; the shape registers are shared */
+#define DIMC_REG_KERNEL_ADDR_2       19
+#define DIMC_REG_OUTPUT_ADDR_2       20
+#define DIMC_NB_REGS                 21
 #define DIMC_HWPE_REG_MAX            (DIMC_IO_BASE + 4 * DIMC_NB_REGS - 4)
 
 /* One tile product (32 output rows x 128 columns x 8 vectors) as the engine runs it: the
  * descriptor the job sequencer writes into an engine context. Not software-visible. */
 enum {
-    DIMC_TP_KB_SRC,          /* first kernel row of inner block 0             */
+    DIMC_TP_KB_SRC,          /* first kernel row, module 1 (inner block 0)    */
     DIMC_TP_KB_ROW_STRIDE,   /* bytes from one kernel row to the next         */
-    DIMC_TP_FB_SRC,          /* first input row of the tile                   */
-    DIMC_TP_FB_ROW_STRIDE,
-    DIMC_TP_DST,             /* first output row of inner block 0             */
+    DIMC_TP_FB_SRC,          /* the packed input tile, 1024 bytes, module 1   */
+    DIMC_TP_DST,             /* first output row, module 1                    */
     DIMC_TP_OUT_ROW_STRIDE,
     DIMC_TP_BIAS,
     DIMC_TP_TILE_LAST,       /* last tile product of its output tile: write the accumulators out */
     DIMC_TP_NB_BLOCKS,       /* inner blocks that take part                   */
+    DIMC_TP_KB_SRC_2,        /* the same three for module 2 (inner block 1)   */
+    DIMC_TP_FB_SRC_2,
+    DIMC_TP_DST_2,
     DIMC_TP_NB_REGS
 };
 

@@ -108,8 +108,6 @@ class Dimc_Tracer {
         // `who` is the inner block that booked a channel of its port this cycle; `kind` is what
         // the beat carries: DIMC_LOAD_KB / _FB for a fetch, DIMC_PORT_WB for a write-back.
         void outer_port_booked(uint32_t who, uint8_t kind);
-        // A section left the block's input tile for its input FIFO this cycle.
-        void input_pushed(uint32_t blk);
         // Publish one block's levels and wait causes for this cycle, then clear.
         void end_cycle(uint32_t blk);
         // Publish what the ports carried this cycle, then clear.
@@ -142,8 +140,6 @@ class Dimc_Tracer {
             // and a result word fall in the same cycle.
             vp::Trace port_kind_event;
             uint8_t   port_kind = 0;
-            vp::Trace inp_push_event;   // a section from the input tile into the input FIFO
-            uint8_t   inp_push = 0;
             bool      loaded = false, computed = false, wrote_back = false;
         uint8_t   fill_grant = DIMC_GRANT_NONE;  // macro a FIFO section was written into this cycle
         vp::Trace fill_grant_event;

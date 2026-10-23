@@ -98,13 +98,15 @@ void Dimc_Macro::write_fb(const uint8_t *src)
 
 // Bit-level model of the macro datapath. Stage 1 zeroes every bit i >= 1024 - compute_mask
 // of both operands, so an element straddling that boundary keeps its low bits; stage 2
-// sums per MODE; stage 3 adds ADDIN. Bit i of the row is bit (i % 8) of byte i / 8.
+// sums per MODE; stage 3 adds ADDIN. The streamer reverses the bytes of each 256-bit section
+// (dimc_streamer.sv), so row bits 8j.. of section s hold byte 31 - j of that section.
 int32_t Dimc_Macro::compute_PP(int row_sel)
 {
     uint32_t valid_bits = 1024u - ((uint32_t)this->compute_mask & 0x3FFu);
     uint8_t k[DIMC_MACRO_KB_EW], f[DIMC_MACRO_FB_EW];
     for (uint32_t i = 0; i < DIMC_MACRO_KB_EW; i++) {
-        uint32_t keep = valid_bits <= 8 * i ? 0 : valid_bits - 8 * i;
+        const uint32_t bit0 = 256 * (i / 32) + 8 * (31 - i % 32);
+        uint32_t keep = valid_bits <= bit0 ? 0 : valid_bits - bit0;
         uint8_t  m    = keep >= 8 ? 0xFF : (uint8_t)((1u << keep) - 1u);
         k[i] = this->KB[row_sel][i] & m;
         f[i] = this->FB[i] & m;

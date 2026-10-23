@@ -130,9 +130,8 @@ class Democritos_D_Tile(gvsoc.systree.Component):
         idma0 = SnitchDma(self,f'tile-{tid}-idma0',loc_base=DemocritosArch.L1_ADDR_START,loc_size=DemocritosArch.L1_SIZE,tcdm_base=0,tcdm_width=32,transfer_queue_size=DemocritosDSE.TILE_IDMA0_JOBFIFO_SIZE,burst_queue_size=DemocritosDSE.TILE_IDMA0_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA0_B_SIZE)
         idma1 = SnitchDma(self,f'tile-{tid}-idma1',loc_base=DemocritosArch.L1_ADDR_START,loc_size=DemocritosArch.L1_SIZE,tcdm_base=0,tcdm_width=32,transfer_queue_size=DemocritosDSE.TILE_IDMA1_JOBFIFO_SIZE,burst_queue_size=DemocritosDSE.TILE_IDMA1_BQUEUE_SIZE,burst_size=DemocritosDSE.TILE_IDMA1_B_SIZE)
 
-        # DIMC HWPE: 2 inner blocks x 2 macros on one 512-bit RW port to L1, 256 bit per
-        # inner block (read channel: input rows and kernel sections muxed; write channel:
-        # results); the banks above serialise same-cycle accesses to one bank.
+        # DIMC HWPE: 2 inner blocks x 2 macros, one 256-bit read/write port per inner block;
+        # the banks above serialise same-cycle accesses to one bank.
         dimc = Dimc(self, 'dimc',
                     macros_per_block  = 2,
                     nb_inner_blocks   = 2,

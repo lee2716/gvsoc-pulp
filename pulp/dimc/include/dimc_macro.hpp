@@ -59,16 +59,10 @@
 // all fetched before its macro starts.
 #define DIMC_WGT_FIFO_DEPTH 128
 #define DIMC_INP_FIFO_DEPTH 32
-// The outer block has one 512-bit RW port to L1, 256 b per dual. A dual's two read streams
-// (input rows, kernel sections) are muxed onto the read channel of its half, one request per
-// cycle; its result words go on the write channel, which runs in parallel (HCI).
+// One 256-bit HCI port per dual (dimc_module.sv), reads and writes: one request per cycle,
+// round robin between the read stream and the result words (dimc_hci_mux.sv).
 #define DIMC_PORT_BYTES      64
 #define DIMC_DUAL_PORT_BYTES (DIMC_PORT_BYTES / 2)
-// 1: one request reads as many input rows as the dual's half holds (4) when the rows are
-// contiguous in L1 (row stride = one row). 0: one row per request.
-#ifndef DIMC_WIDE_INPUT_READ
-#define DIMC_WIDE_INPUT_READ 1
-#endif
 // Cycles the dual takes to switch macros after the last result of a job is accumulated: the
 // result count is compared a cycle later, then one cycle swaps the macros (dimc_datapath.sv).
 #define DIMC_SWITCH_CYCLES 2

@@ -20,7 +20,7 @@ import gvsoc.systree
 class Dimc(gvsoc.systree.Component):
 
     # One D-tile DIMC: nb_inner_blocks inner blocks of macros_per_block macros.
-    # Each block reaches L1 through one RW port half: a read and a write channel.
+    # Each block reaches L1 through its own 256-bit port, one request per cycle.
     # inner_port_bytes is one 256-bit section. Access latency belongs to the L1
     # bank and the crossbar.
     # The three parameters that decide the geometry carry no default: the tile

@@ -53,8 +53,7 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
             blk.input_stream .emplace_back(this, false);
         }
         blk.out_stream.emplace_back(this, true);
-        blk.r_channel.configure(DIMC_DUAL_PORT_BYTES);
-        blk.w_channel.configure(DIMC_DUAL_PORT_BYTES);
+        blk.port.configure(DIMC_DUAL_PORT_BYTES);
         blk.reset_all();
     }
 
@@ -127,8 +126,8 @@ void Dimc_HWPE::clear_engine()
     for (vp::ClockEvent *ev : {this->fsm_start_event, this->fsm_event, this->fsm_end_event})
         if (ev->is_enqueued()) this->event_cancel(ev);
     for (Dimc_InnerBlock &blk : this->inner_blocks) {
-        blk.r_channel.reset();
-        blk.w_channel.reset();
+        blk.port.reset();
+        blk.store_first = false;
         for (Dimc_Macro &mc : blk.macros) {
             mc.reset();
             mc.filled_job  = Dimc_Macro::JOB_NONE;
@@ -155,6 +154,7 @@ void Dimc_HWPE::clear_engine()
     this->gemm_running  = false;
     this->gemm_acquired = false;
     this->gemm_error    = false;
+    this->gemm_done     = false;
     this->job_running   = false;
     this->running_job   = 0;
     this->running_ctx   = -1;
@@ -208,14 +208,18 @@ bool Dimc_HWPE::gemm_valid(const Gemm &g) const
         && (g.reg[DIMC_REG_FORMAT] & 0x3) == DIMC_CI_8BIT
         && g.reg[DIMC_REG_INPUT_ADDR] % 8 == 0 && g.reg[DIMC_REG_KERNEL_ADDR] % 32 == 0
         && g.reg[DIMC_REG_OUTPUT_ADDR] % 32 == 0
+        && g.reg[DIMC_REG_INPUT_ADDR_2] % 8 == 0 && g.reg[DIMC_REG_KERNEL_ADDR_2] % 32 == 0
+        && g.reg[DIMC_REG_OUTPUT_ADDR_2] % 32 == 0
         && g.reg[DIMC_REG_KERNEL_ADDR] + wr * wc <= end
         && g.reg[DIMC_REG_INPUT_ADDR] + ir * ic <= end
-        && g.reg[DIMC_REG_OUTPUT_ADDR] + wr * ic * 4 <= end;
+        && g.reg[DIMC_REG_OUTPUT_ADDR] + wr * ic * 4 <= end
+        && g.reg[DIMC_REG_KERNEL_ADDR_2] + wr * wc <= end
+        && g.reg[DIMC_REG_INPUT_ADDR_2] + ir * ic <= end
+        && g.reg[DIMC_REG_OUTPUT_ADDR_2] + wr * ic * 4 <= end;
 }
 
-// Describe the next tile product of the running job in engine context ctx and queue it:
-// output tiles gemm_k.. (one per inner block), vectors 8 * gemm_q.., columns 128 * gemm_l...
-// The tile products of one output tile run on consecutive l; then the next q, then the next k.
+// Queue tile product (gemm_k, gemm_l, gemm_q) of the running job in context ctx, on both modules,
+// each on its own addresses; l fastest, then q, then k (dimc_streamer.sv).
 void Dimc_HWPE::gemm_commit_tile(int ctx)
 {
     const uint32_t *r = this->gemm.reg;
@@ -223,23 +227,28 @@ void Dimc_HWPE::gemm_commit_tile(int ctx)
     const uint32_t tiles_k = r[DIMC_REG_WEIGHT_ROWS] / DIMC_MACRO_KB_LEN;
     const uint32_t tiles_l = wc / DIMC_MACRO_KB_EW, tiles_q = ic / DIMC_ACC_VECTORS;
     const uint32_t k = this->gemm_k, q = this->gemm_q, l = this->gemm_l;
-    const uint32_t blocks = std::min((uint32_t)this->inner_blocks.size(), tiles_k - k);
+    const uint32_t blocks = (uint32_t)this->inner_blocks.size();
+    const uint32_t kb  = k * DIMC_MACRO_KB_LEN * wc + l * DIMC_MACRO_KB_EW;
+    const uint32_t fb  = (q * tiles_l + l) * DIMC_MACRO_FB_EW * DIMC_ACC_VECTORS;
+    const uint32_t dst = (k * DIMC_MACRO_KB_LEN * ic + q * DIMC_ACC_VECTORS) * DIMC_OUT_SLOT_BYTES;
     uint32_t *d = this->ctx_regs[ctx];
-    d[DIMC_TP_KB_SRC]         = r[DIMC_REG_KERNEL_ADDR] + k * DIMC_MACRO_KB_LEN * wc + l * DIMC_MACRO_KB_EW;
+    d[DIMC_TP_KB_SRC]         = r[DIMC_REG_KERNEL_ADDR] + kb;
+    d[DIMC_TP_KB_SRC_2]       = r[DIMC_REG_KERNEL_ADDR_2] + kb;
     d[DIMC_TP_KB_ROW_STRIDE]  = wc;
-    d[DIMC_TP_FB_SRC]         = r[DIMC_REG_INPUT_ADDR] + l * DIMC_MACRO_FB_EW * ic + q * DIMC_ACC_VECTORS;
-    d[DIMC_TP_FB_ROW_STRIDE]  = ic;
-    d[DIMC_TP_DST]            = r[DIMC_REG_OUTPUT_ADDR]
-                              + (k * DIMC_MACRO_KB_LEN * ic + q * DIMC_ACC_VECTORS) * DIMC_OUT_SLOT_BYTES;
+    d[DIMC_TP_FB_SRC]         = r[DIMC_REG_INPUT_ADDR] + fb;
+    d[DIMC_TP_FB_SRC_2]       = r[DIMC_REG_INPUT_ADDR_2] + fb;
+    d[DIMC_TP_DST]            = r[DIMC_REG_OUTPUT_ADDR] + dst;
+    d[DIMC_TP_DST_2]          = r[DIMC_REG_OUTPUT_ADDR_2] + dst;
     d[DIMC_TP_OUT_ROW_STRIDE] = ic * DIMC_OUT_SLOT_BYTES;
-    d[DIMC_TP_BIAS]           = r[DIMC_REG_BIAS];
+    d[DIMC_TP_BIAS]           = l == 0 ? r[DIMC_REG_BIAS] : 0;   // dimc_datapath.sv: ADDIN on l = 0
     d[DIMC_TP_TILE_LAST]      = l + 1 == tiles_l;
     d[DIMC_TP_NB_BLOCKS]      = blocks;
     this->ctx_ci[ctx]           = (uint8_t)(r[DIMC_REG_FORMAT] & 0x3);
     this->ctx_sign_8b[ctx]      = (uint8_t)((r[DIMC_REG_FORMAT] >> 2) & 0x3);
     this->ctx_compute_mask[ctx] = (uint16_t)(r[DIMC_REG_COMPUTE_MASK] & 0x3FF);
     for (uint32_t i = 0; i < DIMC_DUAL_PORT_BYTES; i++)
-        this->ctx_write_mask[ctx][i] = (uint8_t)(r[DIMC_REG_WRITE_MASK + i / 4] >> (8 * (i % 4)));
+        // Section byte i is mask bits [255 - 8i -: 8] (dimc_streamer.sv reverses the bytes).
+        this->ctx_write_mask[ctx][i] = (uint8_t)(r[DIMC_REG_WRITE_MASK + (31 - i) / 4] >> (8 * ((31 - i) % 4)));
     this->ctx_busy[ctx]   = true;
     this->ctx_job_id[ctx] = this->next_job_id++;
     this->tracer.commit(this->ctx_job_id[ctx]);
@@ -249,7 +258,7 @@ void Dimc_HWPE::gemm_commit_tile(int ctx)
         this->gemm_l = 0;
         if (++this->gemm_q == tiles_q) {
             this->gemm_q = 0;
-            this->gemm_k += blocks;
+            this->gemm_k++;
         }
     }
 }
@@ -258,6 +267,7 @@ void Dimc_HWPE::gemm_commit_tile(int ctx)
 void Dimc_HWPE::gemm_finish(bool error)
 {
     this->gemm_running = false;
+    this->gemm_done    = !error;
     this->gemm_error   = error;
     this->finished_jobs++;
     this->register_file[DIMC_HWPE_STATUS   >> 2] = 0x1;
@@ -282,17 +292,17 @@ void Dimc_HWPE::gemm_step()
         this->gemm_queue.pop_front();
         this->register_file[DIMC_HWPE_RUN_TASK >> 2] = this->gemm.id;
         this->register_file[DIMC_HWPE_STATUS   >> 2] = 0x0;
+        this->gemm_done = false;
         if (!this->gemm_valid(this->gemm)) {
             this->gemm_finish(true);
             continue;
         }
         const uint32_t *r = this->gemm.reg;
-        const uint32_t nb = (uint32_t)this->inner_blocks.size();
         this->gemm_running = true;
         this->gemm_error   = false;
         this->gemm_k = this->gemm_q = this->gemm_l = 0;
         this->gemm_issued = 0;
-        this->gemm_total  = ((r[DIMC_REG_WEIGHT_ROWS] / DIMC_MACRO_KB_LEN + nb - 1) / nb)
+        this->gemm_total  = (r[DIMC_REG_WEIGHT_ROWS] / DIMC_MACRO_KB_LEN)
                           * (r[DIMC_REG_INPUT_COLS] / DIMC_ACC_VECTORS)
                           * (r[DIMC_REG_WEIGHT_COLS] / DIMC_MACRO_KB_EW);
     }
@@ -323,7 +333,11 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
             else if (pending >= DIMC_NB_CONTEXT) *data = 0xFFFFFFFFu;
             else { _this->gemm_acquired = true;  *data = _this->next_gemm_id; }
         } else if (address == DIMC_HWPE_EXT_STATUS) {
-            *data = (_this->gemm_error ? 0x2u : 0x0u) | (pending ? 0x1u : 0x0u);
+            // Bit 0 busy, 1 error, 3:2 module busy, 5:4 module done (dimc_ctrl.sv); the modules
+            // run in step, so both bits of a pair are equal.
+            const bool running = _this->gemm_running && !_this->gemm_error;
+            *data = (_this->gemm_error ? 0x2u : 0x0u) | (pending ? 0x1u : 0x0u)
+                  | (running ? 0xCu : 0x0u) | (_this->gemm_done ? 0x30u : 0x0u);
         } else if (address >= DIMC_IO_BASE) {
             *data = _this->gemm_live[(address - DIMC_IO_BASE) >> 2];
         } else {

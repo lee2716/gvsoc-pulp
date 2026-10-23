@@ -47,7 +47,6 @@ void Dimc_Tracer::build(vp::Component &owner, vp::Trace &text,
         owner.traces.new_trace_event(pfx + "comp_active", &blk.comp_event, 1);
         owner.traces.new_trace_event(pfx + "wb_active",   &blk.wb_event,   1);
         owner.traces.new_trace_event(pfx + "port_kind",   &blk.port_kind_event, 8);
-        owner.traces.new_trace_event(pfx + "inp_push",    &blk.inp_push_event, 1);
         for (uint32_t m = 0; m < nb_macros; m++) {
             Macro &mac = blk.macros[m];
             std::string mpfx = pfx + "macro_" + std::to_string(m) + "/";
@@ -197,22 +196,16 @@ void Dimc_Tracer::outer_port_booked(uint32_t who, uint8_t kind)
     this->outer_grant = (uint8_t)(who + (is_store ? 16u : 0u));
     this->blocks[who].port_kind = kind;
     const Dimc_InnerBlock &blk = this->dimc.inner_blocks[who];
-    const Dimc_Port &port = is_store ? blk.w_channel : blk.r_channel;
+    const Dimc_Port &port = blk.port;
     uint32_t nf = (uint32_t)((port.cursor_bytes + port.bandwidth_bytes - 1) / port.bandwidth_bytes);
     this->next_free_event.event((uint8_t *)&nf);
-}
-
-void Dimc_Tracer::input_pushed(uint32_t b)
-{
-    this->blocks[b].inp_push = 1;
 }
 
 void Dimc_Tracer::end_cycle(uint32_t b)
 {
     Block &blk = this->blocks[b];
     blk.port_kind_event.event(&blk.port_kind);
-    blk.inp_push_event.event(&blk.inp_push);
-    blk.port_kind = blk.inp_push = 0;
+    blk.port_kind = 0;
     uint8_t ld = blk.loaded ? 1 : 0;
     uint8_t cp = blk.computed ? 1 : 0;
     uint8_t wb = blk.wrote_back ? 1 : 0;
@@ -269,7 +262,7 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
         return mac.filled_job == this->dimc.running_job + 1 ? DIMC_WHY_WAIT_COMPUTE : DIMC_WHY_IDLE;
 
     // Inside a kernel window (sections written, not all): the weight FIFO's head says why no
-    // section went in. In flight: late because the read channel was busy within the
+    // section went in. In flight: late because the block's port was busy within the
     // fetch latency, else the response is still out. Another macro's section: the dual's FIFO
     // is in order. Landed: beat_writable refused it. Empty: this cycle's kernel-feed refusal.
     if (mac.write_job != Dimc_Macro::JOB_NONE && !mac.stamped) {

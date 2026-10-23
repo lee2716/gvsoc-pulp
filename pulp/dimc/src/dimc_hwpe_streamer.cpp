@@ -155,7 +155,7 @@ void Dimc_HWPE::configure_kernel_stream(uint32_t blk_id, uint32_t m, int ctx)
 {
     const JobGeom &g = this->job_geom[ctx];
     this->inner_blocks[blk_id].weight_stream[m].configure(
-        this->job_reg_ctx(ctx, DIMC_TP_KB_SRC) + blk_id * g.row_count * g.kb_row_stride,
+        this->job_reg_ctx(ctx, blk_id ? DIMC_TP_KB_SRC_2 : DIMC_TP_KB_SRC),
         g.row_count * DIMC_MACRO_KB_EW, DIMC_MACRO_KB_EW, g.kb_row_stride, g.row_count, 0, 0, 0, 0);
 }
 
@@ -165,7 +165,7 @@ void Dimc_HWPE::configure_out_stream(uint32_t blk_id, uint32_t row, uint32_t ctx
 {
     const JobGeom &g = this->job_geom[ctx];
     this->inner_blocks[blk_id].out_stream[0].configure(
-        this->job_reg_ctx((int)ctx, DIMC_TP_DST) + (blk_id * g.row_count + row) * g.out_row_stride,
+        this->job_reg_ctx((int)ctx, blk_id ? DIMC_TP_DST_2 : DIMC_TP_DST) + row * g.out_row_stride,
         g.nb_vec * DIMC_OUT_SLOT_BYTES, 0, 0, 0, 0, 0, 0, 0);
 }
 

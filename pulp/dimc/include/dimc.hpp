@@ -106,12 +106,12 @@ class Dimc_Port {
 class Dimc_InnerBlock {
     public:
         // One kernel streamer per macro, so the two macros of a block can be on different jobs;
-        // input_stream[0] reads the block's input tile, out_stream[0] writes its results. The
-        // dual has one RW port; its read and write channels (HCI) take one request per cycle.
+        // input_stream[0] reads the block's input tiles, out_stream[0] writes its results.
         std::vector<Dimc_HWPE_Streamer> weight_stream;
         std::vector<Dimc_HWPE_Streamer> input_stream;
         std::vector<Dimc_HWPE_Streamer> out_stream;
-        Dimc_Port r_channel, w_channel;
+        Dimc_Port port;
+        bool      store_first = false;   // round robin: the result words had the port last
         std::vector<Dimc_Macro> macros;
 
         // Fill and store run concurrently, each with its own cursor. The fill keeps each
@@ -170,12 +170,6 @@ class Dimc_InnerBlock {
         int64_t  last_acc_cycle = -1000;   // cycle of the last result accumulated
         uint32_t acc_results[2] = {0, 0};  // results accumulated per result set (job id & 1)
         int64_t  present_ack_cycle = -1000; // cycle the last output word was acknowledged
-        // The input tile being read: 128 rows of 8 bytes, up to four rows per read request,
-        // which the streamer transposes into the job's 8 vectors (dimc_streamer.sv, input_tile_q).
-        uint32_t tile_job = 0xFFFFFFFFu;
-        uint32_t tile_rows = 0;
-        uint64_t tile_ready = 0;           // first cycle after the last row's response
-        uint8_t  tile[DIMC_MACRO_FB_EW][DIMC_ACC_VECTORS];
         // Rows of the running job's tile written to L1 so far.
         uint32_t out_written = 0;
         // In DIMC_STORING: every result of the running job written and acknowledged, as of
@@ -190,8 +184,6 @@ class Dimc_InnerBlock {
             if (!keep_fill) {
                 this->fill.reset(this->macros.size());
                 this->inp_fifo.clear();
-                this->tile_job = 0xFFFFFFFFu;
-                this->tile_rows = 0;
                 while (!this->port_pending.empty()) this->port_pending.pop();
                 while (!this->kb_pending.empty()) this->kb_pending.pop();
                 while (!this->in_pending.empty()) this->in_pending.pop();
@@ -256,6 +248,7 @@ class Dimc_HWPE : public vp::Component {
         bool     gemm_running;
         bool     gemm_acquired;             // ACQUIRE read, commit pending
         bool     gemm_error;                // the last job was rejected
+        bool     gemm_done = false;         // the last job completed, until the next one starts
         uint32_t next_gemm_id;
         uint32_t finished_jobs;
         // Tile products of the running job: the next one's tile indices, how many are
@@ -337,6 +330,7 @@ class Dimc_HWPE : public vp::Component {
         bool     feature_owed(const Dimc_InnerBlock &blk, uint32_t m) const;
         uint32_t pick_kernel(const Dimc_InnerBlock &blk, uint8_t &why) const;
         uint32_t pick_input(const Dimc_InnerBlock &blk, uint8_t &why) const;
+        uint32_t read_head(const Dimc_InnerBlock &blk) const;
         uint8_t  refusal(const std::queue<uint64_t> &pending, const Dimc_Port &port) const;
         void     fetch_kernel_section(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t m, int ctx,
                                       uint32_t job, uint32_t sub);

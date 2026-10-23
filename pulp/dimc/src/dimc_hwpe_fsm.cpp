@@ -255,14 +255,18 @@ void Dimc_HWPE::engine_cycle(uint32_t phase)
 
     for (uint32_t b = 0; b < this->inner_blocks.size(); b++) {
         Dimc_InnerBlock &blk = this->inner_blocks[b];
-        // Per dual per cycle: one result word on the write channel and one read: the earlier
-        // tile product's fetch first, else an input row before a kernel section. The fetches see
-        // the FIFOs before this cycle's pops; one pop per FIFO into the macros, before the
-        // triggers, so no section enters a macro in a cycle in which it computes; then the
-        // macros' rows.
-        if (job_open && !(storing && blk.phase_done)) this->store_block(blk, b);
+        // One request per dual per cycle, round robin between a read and a result word
+        // (dimc_hci_mux.sv). FIFO pops before the triggers: no write into a computing macro.
+        const bool store_on = job_open && !(storing && blk.phase_done);
+        const uint32_t before = blk.store.beat_index;
+        if (store_on && blk.store_first) this->store_block(blk, b);
+        const bool read_free = blk.port.busy_until() <= (int64_t)this->fsm_timestamp;
         this->fill_feed(blk, b, false);   // feature vectors
         this->fill_feed(blk, b, true);    // kernel rows
+        const bool read_went = read_free && blk.port.busy_until() > (int64_t)this->fsm_timestamp;
+        if (store_on && !blk.store_first) this->store_block(blk, b);
+        if (blk.store.beat_index != before) blk.store_first = false;
+        else if (read_went)                 blk.store_first = true;
         this->write_feed(blk, b, blk.inp_fifo);
         this->write_feed(blk, b, blk.wgt_fifo);
         this->compute_indep(blk, b);
@@ -373,8 +377,8 @@ uint32_t Dimc_HWPE::pick_input(const Dimc_InnerBlock &blk, uint8_t &why) const
     return pick;
 }
 
-// One step of a feed for the macro the feed's picker selects: a kernel section from L1 into
-// the weight FIFO, or the input tile's next row from L1, then its sections into the input FIFO.
+// One step of a feed for the macro the feed's picker selects: a kernel section or an input
+// section from L1 into the weight or the input FIFO.
 void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id, bool kernel_feed)
 {
     Dimc_InnerBlock::FillCursor &cursor = blk.fill;
@@ -389,17 +393,15 @@ void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id, bool kernel_fee
         if (why) this->tracer.fill_skip(blk_id, why);
         return;
     }
+    // One tile product at a time: its kernel, then, once answered, its input (dimc_streamer.sv).
+    if (blk.macros[macro].fill_job != this->read_head(blk)) return;
     if (!kernel_feed) {
-        // The earlier tile product's kernel goes before a later one's input rows.
-        uint8_t kwhy = 0;
-        const uint32_t km = this->pick_kernel(blk, kwhy);
-        if (km != blk.macros.size() && blk.wgt_fifo.size() < DIMC_WGT_FIFO_DEPTH
-            && (blk.tile_job != blk.macros[macro].fill_job || blk.tile_rows < DIMC_MACRO_FB_EW)
-            && (int32_t)(blk.macros[km].fill_job - blk.macros[macro].fill_job) < 0) return;
+        if (!blk.kb_pending.empty() || this->kernel_owed(blk, macro)) return;
         this->feed_input(blk, blk_id, macro);
         return;
     }
-    if ((why = this->refusal(blk.kb_pending, blk.r_channel))) {
+    if (!blk.in_pending.empty()) return;
+    if ((why = this->refusal(blk.kb_pending, blk.port))) {
         this->tracer.feed_skip(blk_id, true, why);
         return;
     }
@@ -408,56 +410,51 @@ void Dimc_HWPE::fill_feed(Dimc_InnerBlock &blk, uint32_t blk_id, bool kernel_fee
     cursor.macro_beat_index[macro]++;
 }
 
-// The input feed of macro `macro`'s tile product: read the tile's 128 input rows, up to four
-// 8-byte rows per request; then, transposed, its 8 vectors as 32 sections, one per cycle.
+// The tile product whose reads the dual's streamer is on: the earliest one still owing fetches.
+uint32_t Dimc_HWPE::read_head(const Dimc_InnerBlock &blk) const
+{
+    uint32_t head = Dimc_Macro::JOB_NONE;
+    for (uint32_t m = 0; m < blk.macros.size(); m++) {
+        if (m >= blk.fill.macro_beat_index.size()
+            || blk.fill.macro_beat_index[m] >= blk.fill.macro_beat_total[m]) continue;
+        const uint32_t j = blk.macros[m].fill_job;
+        if (head == Dimc_Macro::JOB_NONE || (int32_t)(j - head) < 0) head = j;
+    }
+    return head;
+}
+
+// The input feed of macro `macro`'s tile product: the packed input tile, one section per request
+// into the input FIFO.
 void Dimc_HWPE::feed_input(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro)
 {
-    Dimc_Macro &fm = blk.macros[macro];
-    const int ctx = (int)fm.fill_slot;
-    if (blk.tile_job != fm.fill_job) {
-        blk.tile_job  = fm.fill_job;
-        blk.tile_rows = 0;
-    }
-    if (blk.tile_rows < DIMC_MACRO_FB_EW) {
-        if (const uint8_t why = this->refusal(blk.in_pending, blk.r_channel)) {
-            this->tracer.feed_skip(blk_id, false, why);
-            return;
-        }
-        Dimc_HWPE_Streamer &st = blk.input_stream[0];
-        const uint32_t stride = this->job_reg_ctx(ctx, DIMC_TP_FB_ROW_STRIDE);
-        uint32_t rows = 1;
-        if (DIMC_WIDE_INPUT_READ && stride == DIMC_ACC_VECTORS)
-            rows = std::min<uint32_t>(DIMC_DUAL_PORT_BYTES / DIMC_ACC_VECTORS, DIMC_MACRO_FB_EW - blk.tile_rows);
-        st.configure(this->job_reg_ctx(ctx, DIMC_TP_FB_SRC) + blk.tile_rows * stride,
-                     rows * DIMC_ACC_VECTORS, 0, 0, 0, 0, 0, 0, 0);
-        int lat = st.issue_beat((int)(rows * DIMC_ACC_VECTORS), blk.tile[blk.tile_rows]);
-        if (lat < 1) lat = 1;
-        const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
-        blk.r_channel.request((int64_t)this->fsm_timestamp, DIMC_DUAL_PORT_BYTES);
-        this->tracer.outer_port_booked(blk_id, DIMC_LOAD_FB);
-        blk.in_pending.push(due);
-        blk.port_pending.push(due);
-        blk.tile_ready = due + 1;
-        blk.tile_rows += rows;
+    if (const uint8_t why = this->refusal(blk.in_pending, blk.port)) {
+        this->tracer.feed_skip(blk_id, false, why);
         return;
     }
-    if (this->fsm_timestamp < blk.tile_ready) return;
-    Dimc_InnerBlock::FillCursor &cursor = blk.fill;
-    const uint32_t port_bytes = this->inner_port_bytes;
-    // Section `sec` of vector `vec`; `within` is its place in the macro's write order
-    // (vector 0, the kernel, vectors 1..).
+    Dimc_Macro &fm = blk.macros[macro];
+    const int ctx = (int)fm.fill_slot;
     const JobGeom &g = this->job_geom[ctx];
-    const uint32_t vec = fm.ffetched / g.fb_beats_per_macro, sec = fm.ffetched % g.fb_beats_per_macro;
+    const uint32_t port_bytes = this->inner_port_bytes;
+    const uint32_t vec = fm.ffetched / g.fb_beats_per_macro;
+    // `within`: place in the macro's write order (vector 0, kernel, vectors 1..).
     Dimc_InnerBlock::FeedEntry e;
     e.macro = macro; e.slot = fm.fill_slot; e.job = fm.fill_job;
     e.within = vec ? g.kb_sections() + fm.ffetched : fm.ffetched;
     e.bytes = port_bytes;
-    for (uint32_t b = 0; b < port_bytes; b++) e.data[b] = blk.tile[sec * port_bytes + b][vec];
-    fm.ffetched++;
-    e.ready = this->fsm_timestamp + 1;
+    Dimc_HWPE_Streamer &st = blk.input_stream[0];
+    st.configure(this->job_reg_ctx(ctx, blk_id ? DIMC_TP_FB_SRC_2 : DIMC_TP_FB_SRC) + fm.ffetched * port_bytes,
+                 port_bytes, 0, 0, 0, 0, 0, 0, 0);
+    int lat = st.issue_beat((int)port_bytes, e.data);
+    if (lat < 1) lat = 1;
+    const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
+    blk.port.request((int64_t)this->fsm_timestamp, DIMC_DUAL_PORT_BYTES);
+    this->tracer.outer_port_booked(blk_id, DIMC_LOAD_FB);
+    blk.in_pending.push(due);
+    blk.port_pending.push(due);
+    e.ready = due + 1;
     blk.inp_fifo.push_back(e);
-    this->tracer.input_pushed(blk_id);
-    cursor.macro_beat_index[macro]++;
+    fm.ffetched++;
+    blk.fill.macro_beat_index[macro]++;
 }
 
 // The macro whose kernel is partly fetched (started, not finished), or nb.
@@ -499,7 +496,7 @@ void Dimc_HWPE::push_section(Dimc_InnerBlock &blk, uint32_t blk_id, Dimc_HWPE_St
 {
     int lat = st.issue_beat((int)e.bytes, e.data);
     if (lat < 1) lat = 1;
-    blk.r_channel.request((int64_t)this->fsm_timestamp, DIMC_DUAL_PORT_BYTES);
+    blk.port.request((int64_t)this->fsm_timestamp, DIMC_DUAL_PORT_BYTES);
     const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
     e.ready = due + 1;
     fifo.push_back(e);
@@ -539,7 +536,7 @@ void Dimc_HWPE::write_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
         const uint32_t row = pos.sub / g.kb_beats_per_row;
         const uint32_t sub = pos.sub % g.kb_beats_per_row;
         const int kr = (int)((g.row_base + row) % DIMC_MACRO_KB_LEN);
-        // Write mask: a bit the mask clears keeps the row's old bit, as kernel_mem in spatz_dimc.sv.
+        // A bit the write mask clears keeps its old value (spatz_dimc.sv kernel_mem).
         const uint8_t *wm = this->ctx_write_mask[e.slot];
         for (uint32_t b = 0; b < e.bytes; b++) {
             const uint32_t o = sub * port_bytes + b;
@@ -713,7 +710,7 @@ int Dimc_HWPE::store_word(Dimc_InnerBlock &blk, uint32_t blk_id)
     const uint32_t ctx = this->exec_slot;
     const JobGeom &g   = this->job_geom[ctx];
     uint32_t &row      = blk.out_written;
-    if (const uint8_t why = this->refusal(blk.store_pending, blk.w_channel)) {
+    if (const uint8_t why = this->refusal(blk.store_pending, blk.port)) {
         this->tracer.store_skip(blk_id, why);
         return 0;
     }
@@ -727,7 +724,7 @@ int Dimc_HWPE::store_word(Dimc_InnerBlock &blk, uint32_t blk_id)
     const uint64_t due = this->fsm_timestamp + (uint64_t)lat;
     blk.port_pending.push(due);
     blk.store_pending.push(due);
-    blk.w_channel.request((int64_t)this->fsm_timestamp, DIMC_DUAL_PORT_BYTES);
+    blk.port.request((int64_t)this->fsm_timestamp, DIMC_DUAL_PORT_BYTES);
     this->tracer.outer_port_booked(blk_id, DIMC_PORT_WB);
     row++;
     blk.store.beat_index++;
