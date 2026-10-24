@@ -83,8 +83,7 @@ void Dimc_Macro::write_row(int row, const uint8_t *src)
     std::memcpy(this->KB[row], src, DIMC_MACRO_KB_EW);
 }
 
-// The COMPE=0 memory-mode read-back path. No caller: the compute pipeline
-// never uses it. Kept for register/behaviour fidelity.
+// Memory-mode (COMPE = 0) read-back of a kernel row. No caller.
 void Dimc_Macro::read_row(int row, uint8_t *dst) const
 {
     if (row < 0 || row >= DIMC_MACRO_KB_LEN) return;

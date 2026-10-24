@@ -31,8 +31,7 @@ void Dimc_Tracer::build(vp::Component &owner, vp::Trace &text,
         blk.why.assign(nb_macros, 0);
     }
 
-    // Names become <component path>.<leaf> in the dump, which is what the
-    // --include filter of gvsoc2perfetto matches on; a "/" nests them.
+    // A "/" in an event name nests it in the dump.
     owner.traces.new_trace_event("state", &this->state_event, 8);
     owner.traces.new_trace_event("busy", &this->busy_event, 1);
     owner.traces.new_trace_event("job_id", &this->job_event, 32);
@@ -128,7 +127,7 @@ void Dimc_Tracer::fill_beat(uint32_t b, uint32_t macro, uint32_t within,
     blk.loaded = true;
     mac.loaded = 1;
     blk.fill_grant = (uint8_t)macro;   // a FIFO section was written into this macro
-    // Beat kind from the engine's own beat_pos.
+    // Kind of the section written, from the engine's beat_pos.
     {
         const uint32_t slot = this->dimc.inner_blocks[b].macros[macro].write_slot;
         const Dimc_HWPE::JobGeom &fg = this->dimc.job_geom[slot];
@@ -191,8 +190,7 @@ void Dimc_Tracer::outer_port_booked(uint32_t who, uint8_t kind)
     const bool is_store = kind == DIMC_PORT_WB;
     const uint32_t shift = is_store ? 6u : kind == DIMC_LOAD_FB ? 2u : 0u;
     this->port_use = (uint8_t)(this->port_use + (1u << shift));
-    // Stores are offset by 16 so one track shows both: 0,1 = block 0,1 filling;
-    // 16,17 = block 0,1 writing back.
+    // One track carries both: b = block b fetching, 16 + b = block b writing back.
     this->outer_grant = (uint8_t)(who + (is_store ? 16u : 0u));
     this->blocks[who].port_kind = kind;
     const Dimc_InnerBlock &blk = this->dimc.inner_blocks[who];
@@ -257,14 +255,14 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
     const Dimc_InnerBlock &blk = this->dimc.inner_blocks[b];
     const Dimc_HWPE::JobGeom &g = this->dimc.job_geom[this->dimc.exec_slot];
     const Dimc_Macro &mac = blk.macros[m];
-    // The dual's other macro: loaded with the next job, it waits for its turn.
+    // The dual's other macro, not being filled: WAIT_COMPUTE if it holds the next job's operands.
     if (m != this->dimc.job_macro(this->dimc.running_job) && (mac.write_job == Dimc_Macro::JOB_NONE || mac.stamped))
         return mac.filled_job == this->dimc.running_job + 1 ? DIMC_WHY_WAIT_COMPUTE : DIMC_WHY_IDLE;
 
-    // Inside a kernel window (sections written, not all): the weight FIFO's head says why no
-    // section went in. In flight: late because the block's port was busy within the
-    // fetch latency, else the response is still out. Another macro's section: the dual's FIFO
-    // is in order. Landed: beat_writable refused it. Empty: this cycle's kernel-feed refusal.
+    // Mid kernel (some sections written, not all): the weight FIFO's head gives the cause.
+    // Another macro's: WAIT_WGT_FIFO. Landed: beat_writable refused it. Not landed: the port if
+    // the kernel feed found it busy in the last 3 cycles, else the response. Empty: the
+    // kernel-feed refusal, else those two.
     if (mac.write_job != Dimc_Macro::JOB_NONE && !mac.stamped) {
         const Dimc_HWPE::JobGeom &wg = this->dimc.job_geom[mac.write_slot];
         const uint32_t kb_all = wg.row_count * wg.kb_beats_per_row;
@@ -279,18 +277,16 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
             return DIMC_WHY_WAIT_COMPUTE;
         }
     }
-    // Kernel not started: its sections (fetched, or next in its program) are behind another
-    // macro's in the dual's weight FIFO, which pops in order.
+    // Kernel not started: its sections wait behind another macro's in the weight FIFO.
     if (this->cur_state == DIMC_STARTING && !blk.wgt_fifo.empty() && blk.wgt_fifo.front().macro != m) {
         bool own = false;
         for (const Dimc_InnerBlock::FeedEntry &q : blk.wgt_fifo) if (q.macro == m) { own = true; break; }
         if (!own) own = this->dimc.kernel_owed(blk, m);
         if (own) return DIMC_WHY_WAIT_WGT_FIFO;
     }
-    // Owes a feature section: its first one in the input FIFO says
-    // why it is not in. In flight: the response is out. Behind another macro's section: the
-    // FIFO is in order. At the head: beat_writable refused it. Not fetched: this cycle's
-    // input-feed refusal, else the heuristic below.
+    // Owes a feature section: its first entry in the input FIFO gives the cause. Not landed:
+    // the response. Behind another entry: the FIFO is in order. At the head: beat_writable
+    // refused it. Not fetched: the input-feed refusal, else the heuristic below.
     if (this->cur_state == DIMC_STARTING) {
         if (this->dimc.feature_owed(blk, m)) {
             const std::deque<Dimc_InnerBlock::FeedEntry> &q = blk.inp_fifo;
@@ -302,30 +298,29 @@ uint8_t Dimc_Tracer::macro_why(uint32_t b, uint32_t m) const
             if (tb.input_skip) return tb.input_skip;
         }
     }
-    // Still owes fill sections. A heuristic: fill_feed picks a macro per feed, not by
-    // index, but a lower macro still owing is reported as holding the port.
+    // Still owes fill sections. Heuristic: a lower macro still owing is reported as holding
+    // the port, though fill_feed does not pick macros by index.
     if (this->cur_state == DIMC_STARTING) {
         const Dimc_InnerBlock::FillCursor &f = blk.fill;
         if (f.macro_beat_index[m] < f.macro_beat_total[m]) {
-            // A lower macro that still owes sections, or was written one this cycle.
             for (uint32_t k = 0; k < m; k++)
                 if (f.macro_beat_index[k] < f.macro_beat_total[k] || tb.macros[k].loaded)
                     return DIMC_WHY_WAIT_INNER_PORT;
             return tb.fill_skip ? tb.fill_skip : DIMC_WHY_UNKNOWN;
         }
-        // Filled but issued no row: compute waits for the fill's response.
+        // Filled, no row issued yet: compute starts at fill_done_cycle.
         if (mac.rows_issued < g.row_count)
             return this->dimc.fsm_timestamp < mac.fill_done_cycle ? DIMC_WHY_WAIT_FILL_ACK
                                                                    : DIMC_WHY_UNKNOWN;
     }
 
-    // Write-back of a TILE_LAST job: after the last result is accumulated, one word per cycle.
+    // TILE_LAST write-back: PIPE_DRAIN until the tile's results are accumulated, then the store refusal.
     if (g.tile_last && blk.out_written < g.row_count) {
         if (!this->dimc.tile_computed(blk)) return DIMC_WHY_PIPE_DRAIN;
         return tb.store_skip ? tb.store_skip : DIMC_WHY_UNKNOWN;
     }
 
-    // All of this macro's beats are issued.
+    // Nothing left to issue: wait for any block's stores, then for any outstanding response.
     for (const Dimc_InnerBlock &other : this->dimc.inner_blocks)
         if (other.store.beat_index < other.store.beat_total) return DIMC_WHY_DONE_WAIT_JOB;
     for (const Dimc_InnerBlock &other : this->dimc.inner_blocks)
@@ -355,7 +350,7 @@ void Dimc_Tracer::job_closed(uint64_t now_cycle)
     }
 
     const uint64_t job_busy = now_cycle - this->job_entry_cycle;
-    // Fill sections plus the pipeline's drain; not a lower bound on job_busy.
+    // beats_per_macro fill sections plus the macro pipeline depth.
     const uint64_t ideal = (uint64_t)g.beats_per_macro + DIMC_MACRO_LATENCY;
     this->acc_busy_cycles  += job_busy;
     this->acc_ideal_cycles += ideal;

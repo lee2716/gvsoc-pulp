@@ -92,12 +92,10 @@ Dimc_HWPE::Dimc_HWPE(vp::ComponentConf &config) : vp::Component(config), tracer(
 void Dimc_HWPE::reset(bool active)
 {
     if (active) {
-        // A zero means the property never reached the model. Abort rather than
-        // substitute a default, which would run a different machine silently.
-        // Checked at reset, so the abort happens once the trace engine runs.
+        // A zero means the property never reached the model: abort, no default.
         if (this->num_macros == 0 || this->inner_port_bytes == 0 || this->nb_inner_blocks == 0) {
-            // trace.fatal ends in abort(), which does not flush stdio, so its message
-            // is lost when the trace goes to a pipe; stderr is unbuffered.
+            // trace.fatal aborts without flushing stdio, so its message can be lost when the
+            // trace goes to a pipe; stderr is unbuffered.
             fprintf(stderr,
                     "DIMC systree incomplete: num_macros=%u inner_port_bytes=%u "
                     "nb_inner_blocks=%u (all must be non-zero)\n",
@@ -118,9 +116,9 @@ void Dimc_HWPE::reset(bool active)
     }
 }
 
-// The engine and the job queue as a reset leaves them: no FSM event pending, no job running or
-// queued, every context free, every FIFO, cursor and pending queue empty, the accumulators
-// zero. Job ids, the cycle count and the registers are left to the caller.
+// Return the engine and the job queue to the reset state: no FSM event pending, no job running
+// or queued, contexts free, FIFOs and accumulators empty. Job ids, the cycle count and the
+// registers are left to the caller.
 void Dimc_HWPE::clear_engine()
 {
     for (vp::ClockEvent *ev : {this->fsm_start_event, this->fsm_event, this->fsm_end_event})
@@ -218,8 +216,8 @@ bool Dimc_HWPE::gemm_valid(const Gemm &g) const
         && g.reg[DIMC_REG_OUTPUT_ADDR_2] + wr * ic * 4 <= end;
 }
 
-// Queue tile product (gemm_k, gemm_l, gemm_q) of the running job in context ctx, on both modules,
-// each on its own addresses; l fastest, then q, then k (dimc_streamer.sv).
+// Queue the next tile product of the running job in context ctx on both modules, each on its
+// own addresses; l advances fastest, then q, then k (dimc_streamer.sv).
 void Dimc_HWPE::gemm_commit_tile(int ctx)
 {
     const uint32_t *r = this->gemm.reg;
@@ -240,7 +238,7 @@ void Dimc_HWPE::gemm_commit_tile(int ctx)
     d[DIMC_TP_DST]            = r[DIMC_REG_OUTPUT_ADDR] + dst;
     d[DIMC_TP_DST_2]          = r[DIMC_REG_OUTPUT_ADDR_2] + dst;
     d[DIMC_TP_OUT_ROW_STRIDE] = ic * DIMC_OUT_SLOT_BYTES;
-    d[DIMC_TP_BIAS]           = l == 0 ? r[DIMC_REG_BIAS] : 0;   // dimc_datapath.sv: ADDIN on l = 0
+    d[DIMC_TP_BIAS]           = l == 0 ? r[DIMC_REG_BIAS] : 0;   // the bias enters with the first l tile only
     d[DIMC_TP_TILE_LAST]      = l + 1 == tiles_l;
     d[DIMC_TP_NB_BLOCKS]      = blocks;
     this->ctx_ci[ctx]           = (uint8_t)(r[DIMC_REG_FORMAT] & 0x3);
@@ -350,6 +348,7 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
         _this->gemm_live[(address - DIMC_IO_BASE) >> 2] = *data;
     } else if (address == DIMC_HWPE_TRIG) {
         // Commit the registers as one job and start it, or queue it behind the running one.
+        // Dropped when the queue is full.
         if (pending < DIMC_NB_CONTEXT) {
             Gemm g;
             g.id = _this->next_gemm_id++;
@@ -362,7 +361,7 @@ vp::IoReqStatus Dimc_HWPE::hwpe_slave(vp::Block *__this, vp::IoReq *req)
         const bool active = _this->job_running || _this->state.get() != DIMC_IDLE;
         _this->clear_engine();
         if (active) _this->tracer.idle();
-        // The aborted jobs count as finished: job id + 1 stays the FIN_JOBS value it ends at.
+        // The aborted jobs count as finished: FIN_JOBS becomes the number of jobs committed.
         _this->finished_jobs = _this->next_gemm_id;
         _this->register_file[DIMC_HWPE_FIN_JOBS >> 2] = _this->finished_jobs;
         _this->register_file[DIMC_HWPE_STATUS >> 2] = 0x1;

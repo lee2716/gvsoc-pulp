@@ -21,11 +21,9 @@ class Dimc(gvsoc.systree.Component):
 
     # One D-tile DIMC: nb_inner_blocks inner blocks of macros_per_block macros.
     # Each block reaches L1 through its own 256-bit port, one request per cycle.
-    # inner_port_bytes is one 256-bit section. Access latency belongs to the L1
-    # bank and the crossbar.
-    # The three parameters that decide the geometry carry no default: the tile
-    # that instantiates this model has to state them, the way magia_v2/tile.py
-    # states RedMulE's. A default here is a specification nobody wrote down.
+    # inner_port_bytes is one 256-bit section. Access latency is the L1 bank's
+    # and the crossbar's.
+    # The three geometry parameters have no default; the instantiating tile states them.
     def __init__(self,
                  parent: gvsoc.systree.Component,
                  name: str,
@@ -49,7 +47,7 @@ class Dimc(gvsoc.systree.Component):
     def o_stream_mst(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('stream_mst', itf, signature='io')
 
-    # Standard HWPE completion interrupt (done_irq). Optional to bind: the model
-    # guards irq.sync() with is_bound(), so leaving it unwired is harmless.
+    # Standard HWPE completion interrupt (done_irq). Optional: the model calls
+    # irq.sync() only when bound.
     def o_DONE_IRQ(self, itf: gvsoc.systree.SlaveItf):
         self.itf_bind('done_irq', itf, signature='wire<bool>')

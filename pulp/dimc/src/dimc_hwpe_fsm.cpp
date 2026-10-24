@@ -26,8 +26,7 @@ void Dimc_HWPE::fsm_start_handler(vp::Block *__this, vp::ClockEvent *event)
     _this->job_start_cycle = _this->fsm_timestamp;
     _this->exec_slot = (uint32_t)(_this->running_ctx >= 0 ? _this->running_ctx : 0);
 
-    // A macro already filled, filling or being written for this job keeps its buffers:
-    // clearing kb_ready/fb_ready under a fill still running would strand it.
+    // A macro already filled, filling or being written for this job keeps its buffers.
     for (Dimc_InnerBlock &blk : _this->inner_blocks)
         for (uint32_t m = 0; m < _this->num_macros; m++) {
             Dimc_Macro &mc = blk.macros[m];
@@ -148,7 +147,7 @@ void Dimc_HWPE::plan_macro_fill(uint32_t blk_id, uint32_t m, int ctx)
     mc.owed++;
     cur.macro_beat_index[m] = 0;
     cur.macro_beat_total[m] = g.beats_per_macro;
-    // A macro still holding the running job's operands has rows left to issue against them.
+    // A macro still holding the running job's operands keeps its fill_done_cycle.
     if (mc.filled_job != this->running_job) mc.fill_done_cycle = 0;
     mc.kpf_job = mc.fill_job; mc.kpf_slot = mc.fill_slot; mc.kfetched = 0; mc.ffetched = 0;
     this->configure_kernel_stream(blk_id, m, ctx);
@@ -184,7 +183,7 @@ void Dimc_HWPE::retire_block(Dimc_InnerBlock &blk)
 }
 
 // Start the next queued job's fill program on its macro once that macro's previous program is
-// spent, so it is loaded while the other macro computes; then note whether any fill is outstanding.
+// spent; then note whether any fill is outstanding.
 void Dimc_HWPE::advance_fill()
 {
     const int nxt = this->ctx_queue.empty() ? -1 : this->ctx_queue.front();
@@ -306,8 +305,8 @@ bool Dimc_HWPE::rows_done() const
 bool Dimc_HWPE::beat_writable(const Dimc_Macro &mc, uint32_t job, const BeatPos &pos) const
 {
     if (mc.filled_job != job && this->holds_unissued(mc)) return false;
-    // The kernel write port is shut in a trigger cycle (COMPE). A guard: the pops run before
-    // the triggers, so holds_unissued already keeps the last row's cycle out.
+    // The kernel write port is shut in a trigger cycle (COMPE in spatz_dimc.sv). A guard: the
+    // pops run before the triggers, so holds_unissued already keeps the last row's cycle out.
     if (pos.kind == DIMC_LOAD_KB && mc.last_trigger_cycle == (int64_t)this->fsm_timestamp)
         return false;
     // A kernel replaces the one every earlier job of the macro computes with, so the macro
@@ -457,9 +456,8 @@ void Dimc_HWPE::feed_input(Dimc_InnerBlock &blk, uint32_t blk_id, uint32_t macro
     blk.fill.macro_beat_index[macro]++;
 }
 
-// The macro whose kernel is partly fetched (started, not finished), or nb.
-// Its sections must all go in before any other macro's, or the FIFO holds two kernels
-// interleaved and the first macro waits behind the second's compute.
+// The macro whose kernel is partly fetched (started, not finished), or nb. Its sections
+// go in before any other macro's, so the weight FIFO never holds two kernels interleaved.
 uint32_t Dimc_HWPE::kernel_in_progress(const Dimc_InnerBlock &blk) const
 {
     for (uint32_t m = 0; m < blk.macros.size(); m++) {
@@ -487,8 +485,8 @@ void Dimc_HWPE::fetch_kernel_section(Dimc_InnerBlock &blk, uint32_t blk_id, uint
     blk.macros[m].kfetched++;
 }
 
-// Issue kernel section e from streamer st and queue it in the weight FIFO, landed the cycle
-// after its response (fifo_v3, not fall-through).
+// Issue section e from streamer st and queue it in fifo, landed the cycle after its response
+// (fifo_v3 with FALL_THROUGH 0 in spatz_dimc_dual.sv).
 void Dimc_HWPE::push_section(Dimc_InnerBlock &blk, uint32_t blk_id, Dimc_HWPE_Streamer &st,
                              Dimc_InnerBlock::FeedEntry &e,
                              std::deque<Dimc_InnerBlock::FeedEntry> &fifo,
@@ -575,9 +573,9 @@ void Dimc_HWPE::write_feed(Dimc_InnerBlock &blk, uint32_t blk_id,
     this->tracer.fill_beat(blk_id, macro, within, macro_filled, feature_done, 1);
 }
 
-// Rows the dual's other macro still triggers, plus the results in its pipe and in the out_fifo,
-// before macro m may start `job`. 0 once m has started it; 0xFFFFFFFF while the other macro
-// has not started the job before.
+// Rows the dual's other macro still triggers, plus (with DIMC_SWITCH_GAP) the results in its pipe
+// and in the out_fifo, before macro m may start `job`. 0 once m has started it; 0xFFFFFFFF while
+// the other macro has not started the job before.
 uint32_t Dimc_HWPE::rows_before_turn(const Dimc_InnerBlock &blk, uint32_t m, uint32_t job) const
 {
     const Dimc_Macro &mc = blk.macros[m];
@@ -623,8 +621,8 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
         blk.out_fifo.pop_front();
         blk.last_acc_cycle = (int64_t)this->fsm_timestamp;
     }
-    // A macro is never stalled for the out_fifo: a result it cannot take is lost, as in the
-    // RTL. The model also warns; force_warning exits under werror.
+    // A macro is never stalled for the out_fifo: a result it cannot take is lost, as in
+    // out_push of spatz_dimc_dual.sv. The model also warns; force_warning exits under werror.
     for (uint32_t m = 0; m < blk.macros.size(); m++) {
         if (!blk.macros[m].has_ready()) continue;
         DimcPipeEntry e = blk.macros[m].drain();
@@ -657,7 +655,8 @@ void Dimc_HWPE::compute_indep(Dimc_InnerBlock &blk, uint32_t blk_id)
                 blk.acc_results[s] = 0;
             }
             const uint32_t b = mac.runs_issued;   // the vector it issues next
-            // A job starts once all its vectors are fetched and the macros have switched.
+            // A job starts once its fill program is fetched and the switch and result-presentation
+            // delays have passed.
             const bool starting = !mac.rows_issued && !mac.runs_issued;
             const bool loaded = !(mac.fill_job == jj && blk.fill.macro_beat_index[m] < blk.fill.macro_beat_total[m]);
             if (b < mac.job_nb_vec && mac.fb_run == b

@@ -75,16 +75,14 @@ void Dimc_HWPE_Streamer::configure(
     );
 }
 
-// tot_len is a byte count. The engine's beats sum to exactly it, so this is only
-// the streamer's guard; the engine's own section counts end a program or a store.
+// tot_len is a byte count; the stream is done once pos has consumed all of it.
 bool Dimc_HWPE_Streamer::is_done() { return this->pos >= this->tot_len; }
 
 // Where the next beat reads or writes. `pos` counts bytes consumed, which is
 // also the address offset while the walk is linear (d0_len == 0).
-// A non-zero d0_len selects a strided walk: d0_len contiguous bytes, then a jump
-// by d0_stride to the next run, and after d1_len runs a jump by d1_stride. Only
-// the kernel streamer uses it, with strides from the job's matrix shape as in
-// dual_DIMC/rtl/dimc_streamer.sv.
+// A non-zero d0_len selects a strided walk: runs of d0_len contiguous bytes whose starts
+// are d0_stride apart, in groups of d1_len runs whose starts are d1_stride apart.
+// Only the kernel streamer uses it (kernel_ctrl in dual_DIMC/rtl/dimc_streamer.sv).
 uint32_t Dimc_HWPE_Streamer::walk_addr() const {
     if (this->d0_len == 0) {
         return this->base_addr + this->pos;
@@ -103,8 +101,7 @@ uint32_t Dimc_HWPE_Streamer::walk_addr() const {
 }
 
 // Issue one beat of at most inner_port_bytes and return the latency the memory
-// reported. The caller advances one beat per cycle and tracks the in-flight
-// response itself, which is what lets several accesses overlap.
+// reported. The caller tracks the in-flight response.
 int Dimc_HWPE_Streamer::issue_beat(int width, void* buf) {
     uint32_t base = this->walk_addr();
 

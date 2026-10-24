@@ -32,9 +32,8 @@
 
 typedef uint64_t strobe_t;
 
-// A job is offloaded with the acquire/commit protocol, then the FSM runs
-// STARTING (fill, compute and write-back together) and, only while results are
-// still unwritten once every row has retired, STORING. Value 2 is unused.
+// STARTING runs fill, compute and write-back together; STORING covers the results
+// still unwritten once every row has retired. Value 2 is unused.
 enum dimc_hwpe_state_t {
     DIMC_IDLE     = 0,
     DIMC_STARTING = 1,
@@ -60,10 +59,10 @@ class Dimc_HWPE_Streamer {
                 uint32_t d3_stride
         );
         bool is_done();
-        // Issue one beat of at most inner_port_bytes and return the cycles until its
-        // response; the caller queues the due cycle, so several beats can be in flight.
+        // Issue one beat of at most inner_port_bytes and return the latency of its response;
+        // the caller tracks the due cycle.
         int issue_beat(int width, void* buf);
-        // Address of the next beat, linear or strided; see the .cpp.
+        // Address of the next beat: linear, or strided when d0_len is non-zero.
         uint32_t walk_addr() const;
 
     private:
@@ -86,8 +85,8 @@ class Dimc_HWPE_Streamer {
 };
 
 
-// ---- One channel (read or write) of a dual's RW port towards L1: a bandwidth limiter that remembers
-// when it is free ----
+// ---- Bandwidth limiter of a dual's port towards L1; remembers when it is free. Reads and result
+// writes share it. ----
 class Dimc_Port {
     public:
         void    configure(uint32_t bandwidth);
@@ -105,17 +104,17 @@ class Dimc_Port {
 // A plain class, not a vp::Component. One control plane drives N of these.
 class Dimc_InnerBlock {
     public:
-        // One kernel streamer per macro, so the two macros of a block can be on different jobs;
-        // input_stream[0] reads the block's input tiles, out_stream[0] writes its results.
+        // One kernel streamer per macro. input_stream[0] reads the block's input tiles and
+        // out_stream[0] writes its results; the other input_stream entries are unused.
         std::vector<Dimc_HWPE_Streamer> weight_stream;
         std::vector<Dimc_HWPE_Streamer> input_stream;
         std::vector<Dimc_HWPE_Streamer> out_stream;
         Dimc_Port port;
-        bool      store_first = false;   // round robin: the result words had the port last
+        bool      store_first = false;   // round robin: the result words are offered the port first
         std::vector<Dimc_Macro> macros;
 
-        // Fill and store run concurrently, each with its own cursor. The fill keeps each
-        // macro's position in its own program; the store counts the block's port words.
+        // Fill and store have separate cursors: the fill holds each macro's position in its
+        // own program, the store counts the block's result port words.
         struct FillCursor {
             std::vector<uint32_t> macro_beat_index;
             std::vector<uint32_t> macro_beat_total;
@@ -148,37 +147,37 @@ class Dimc_InnerBlock {
         std::queue<uint64_t> port_pending;
         // The running job's store beats: the job closes when these are acknowledged.
         std::queue<uint64_t> store_pending;
-        // Per-feed budgets: kernel sections, and the input feed (input-row requests).
+        // In-flight kernel and input requests, each capped at outstanding_depth.
         std::queue<uint64_t> kb_pending;
         std::queue<uint64_t> in_pending;
-        // The dual's weight and input FIFOs: sections fetched from L1, each bound for one
-        // macro's program position, popped in order once landed (not fall-through: the
-        // cycle after) and once that macro's write port takes it.
+        // Weight and input FIFOs: sections fetched from L1, each bound for one macro's program
+        // position. The head is popped once landed (the cycle after its response) and taken
+        // by the macro's write port.
         struct FeedEntry {
             uint32_t macro, slot, job, within, bytes;
             uint64_t ready;
             uint8_t  data[32];
         };
         std::deque<FeedEntry> wgt_fifo;
-        // The dual's one input FIFO: both macros' sections in fetch order.
+        // The dual's one input FIFO holds both macros' sections in fetch order.
         std::deque<FeedEntry> inp_fifo;
-        // The dual's out_fifo: results of the computing macro in push order, one popped per
-        // cycle into acc[run * DIMC_MACRO_KB_LEN + row].
+        // Results of the macros in push order, one popped per cycle into
+        // acc[run * DIMC_MACRO_KB_LEN + row].
         struct OutEntry { int32_t psout; uint16_t row; uint16_t run; uint8_t set; };
         std::deque<OutEntry> out_fifo;
         int32_t  acc[DIMC_ACC_VECTORS * DIMC_MACRO_KB_LEN] = {0};
         int64_t  last_acc_cycle = -1000;   // cycle of the last result accumulated
         uint32_t acc_results[2] = {0, 0};  // results accumulated per result set (job id & 1)
         int64_t  present_ack_cycle = -1000; // cycle the last output word was acknowledged
-        // Rows of the running job's tile written to L1 so far.
+        // Result rows of the running job's tile issued to L1 so far.
         uint32_t out_written = 0;
         // In DIMC_STORING: every result of the running job written and acknowledged, as of
         // the last cycle; the block then stops writing back.
         bool phase_done;
 
-        // Clear what the engine tracks for one job, at every job start. keep_fill leaves the
-        // fill cursor, the in-flight beats and the input FIFO alone: the fill runs ahead into
-        // the next job. The weight FIFO is not cleared here.
+        // Clear the per-job state at every job start. keep_fill leaves the fill cursor, the
+        // in-flight request queues and the input FIFO alone, for a fill already running ahead.
+        // The weight FIFO is cleared only by reset_all.
         void reset_job_state(bool keep_fill)
         {
             if (!keep_fill) {
@@ -193,7 +192,7 @@ class Dimc_InnerBlock {
             this->out_written = 0;
             this->phase_done = false;
         }
-        // Construction and reset(): the weight FIFO too.
+        // Per-job state and the weight FIFO; used at construction and by clear_engine().
         void reset_all()
         {
             this->wgt_fifo.clear();
@@ -225,10 +224,9 @@ class Dimc_HWPE : public vp::Component {
         // Configuration
         uint32_t num_macros;
         uint32_t inner_port_bytes;    // one 256-bit section, bytes
-        // A block's access costs what L1 returns plus the wait for its channel.
         uint32_t nb_inner_blocks;     // inner blocks in the outer block (2 on the D-tile)
 
-        // Text trace, for diagnostics and the tracer's reports.
+        // Text trace.
         vp::Trace trace;
 
         // Every VCD signal and per-cycle observation; read-only towards the engine.
@@ -266,8 +264,7 @@ class Dimc_HWPE : public vp::Component {
         uint32_t ctx_regs[DIMC_NB_CONTEXT][DIMC_TP_NB_REGS];
         bool     ctx_busy[DIMC_NB_CONTEXT];
         uint32_t ctx_job_id[DIMC_NB_CONTEXT];
-        // Mode, sign and compute mask of the job a tile product belongs to: a macro takes
-        // them with the operands, since it may trigger while an earlier job's last tile runs.
+        // Mode, sign and compute mask of a tile product's job; a macro takes them with its operands.
         uint8_t  ctx_ci[DIMC_NB_CONTEXT];
         uint8_t  ctx_sign_8b[DIMC_NB_CONTEXT];
         uint16_t ctx_compute_mask[DIMC_NB_CONTEXT];
@@ -286,13 +283,12 @@ class Dimc_HWPE : public vp::Component {
         void engine_cycle(uint32_t phase);
         // First cycle of a job: its geometry, fill programs and store.
         void plan_job();
-        // Every row of the running job retired, on every block.
+        // Every result of the running job accumulated, on every participating block.
         bool rows_done() const;
         // Every result beat issued and acknowledged, on every block.
         bool store_done() const;
 
-        // One job's shape, the same on every block; one per context, so a queued job's shape
-        // survives until the engine reaches it.
+        // One job's shape, the same on every block; one per context.
         struct JobGeom {
             uint32_t row_count, row_base, compute_cyc;
             uint32_t tile_last;   // write the accumulators out after this tile product
